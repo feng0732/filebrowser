@@ -548,7 +548,7 @@ const handlePageChange = (event: BeforeUnloadEvent) => {
 };
 ```
 
-这个事件在 `onMounted` 中注册（`frontend/src/views/files/Editor.vue` 第 158–159 行），在 `onBeforeUnmount` 中移除（`frontend/src/views/files/Files.vue` 第 196–197 行），确保只在编辑器存活期间生效。
+这个事件在 `onMounted` 中注册（`frontend/src/views/files/Editor.vue` 第 157–159 行），在 `onBeforeUnmount` 中移除（`frontend/src/views/files/Editor.vue` 第 195–197 行），注册和移除都在 Editor.vue 内部完成，确保只在编辑器存活期间生效。
 
 **与 Vue Router 拦截的区别**：
 - `beforeunload`：浏览器级拦截，只能弹出浏览器原生确认框，无法自定义 UI
@@ -715,18 +715,37 @@ onBeforeUnmount(() => {
 });
 ```
 
-#### 4.6.5 Share.vue：请求清理
+#### 4.6.5 Share.vue：仅清理键盘监听，无 AbortController
 
-`frontend/src/views/Share.vue` 的 `fetchData` 函数同样使用 `AbortController` 来管理请求生命周期。虽然 Share 页面不像 Files 那样在组件卸载时显式调用 `abort()`，但路由切换时 Layout 的 `watch(route)` 会先关闭弹窗，且 Share 组件卸载后回调即使触发也不会有副作用（因为组件已销毁，状态更新无效）。
+`frontend/src/views/Share.vue` 的 `fetchData` 函数**没有使用 `AbortController`**（第 393–425 行）。它直接调用 `api.fetch(url, password.value)` 发起请求，不传入 signal，也没有任何请求中止机制。
+
+Share 页面只做了两项清理：
+- **键盘监听**：在 `onMounted` 注册 `keydown`（Esc 取消选择），在 `onBeforeUnmount` 中移除（第 513 行和第 519 行）
+- **路由切换状态重置**：`watch(route)` 触发 `fetchData()` 时重置 `selected`、`multiple`、关闭弹窗
+
+**与 Files.vue 的对比**：
+
+| 特性 | Files.vue | Share.vue |
+|------|-----------|-----------|
+| AbortController | ✅ 有（路由切换 + 组件卸载双重中止） | ❌ 无 |
+| 键盘监听清理 | ✅ 有（F1 帮助键） | ✅ 有（Esc 取消选择） |
+| onBeforeUnmount/onUnmounted | ✅ 两者都有 | ✅ 只有 onBeforeUnmount |
+| 卸载时清空 fileStore.req | ✅ 有 | ❌ 没有（依赖 Layout 外层清理） |
+
+**为什么 Share 不需要 AbortController？**
+- Share 页面是公开访问，数据量通常较小，请求较快完成
+- Share 组件卸载后，即使请求回调触发，由于响应式状态已与 DOM 解绑，不会造成视觉错误
+- 这是一个有意的简化设计：共享页功能较少，牺牲了少量竞态安全性换取代码简洁
 
 #### 4.6.6 各组件清理对照表
 
 | 组件 | 清理内容 | 清理时机 |
 |------|----------|----------|
-| **Files.vue** | `keydown` 监听、`isFiles` 重置、Shell 关闭、`fileStore.req` 清空、`AbortController` 中止 | `onBeforeUnmount` + `onUnmounted` |
-| **Editor.vue** | `keydown` 监听、`beforeunload` 监听、Ace Editor 实例销毁 | `onBeforeUnmount` |
-| **Preview.vue** | `keydown` 监听 | `onBeforeUnmount` |
+| **Files.vue** | `keydown` 监听、`isFiles` 重置、Shell 关闭、`fileStore.req` 清空、`fetchDataController.abort()` 中止请求 | `onBeforeUnmount` + `onUnmounted` |
+| **Editor.vue** | `keydown` 监听（Ctrl+S / Esc）、`beforeunload` 浏览器事件、Ace Editor 实例 `destroy()` | `onBeforeUnmount` |
+| **Preview.vue** | `keydown` 监听（方向键 / Esc） | `onBeforeUnmount` |
 | **FileListing.vue** | `keydown` + `scroll` + `resize` + 拖放系列监听 | `onBeforeUnmount` |
+| **Share.vue** | `keydown` 监听（Esc 取消选择） | `onBeforeUnmount` |
 | **Sidebar.vue** | `fetchUsage` 的 `AbortController` | `unmounted` |
 
 ---
@@ -962,9 +981,12 @@ Files.vue、Share.vue、Sidebar.vue 均使用 `watch(route)` 触发数据重新�
 
 编辑器通过 `onBeforeRouteUpdate` 拦截 Vue Router 导航（自定义弹窗），通过 `beforeunload` 拦截浏览器关闭/刷新（原生确认框），两层拦截互补，确保未保存修改在任何离开场景下都不会静默丢失。
 
-### 7.9 组件卸载时的完备清理
+### 7.9 组件卸载时的分级清理
 
-每个注册了 `window.addEventListener` 的组件都在 `onBeforeUnmount` / `onUnmounted` 中移除监听；每个发起网络请求的组件都使用 `AbortController` 在路由切换或组件卸载时中止请求。这避免了内存泄漏、幽灵回调和请求竞态。
+注册了 `window.addEventListener` 的组件都在 `onBeforeUnmount` / `onUnmounted` 中移除监听，避免内存泄漏和幽灵回调。网络请求中止则按页面重要性分级：
+- **Files 页**：使用 `AbortController`，路由切换 + 组件卸载双重中止，防止快速导航竞态
+- **Share 页**：不使用 `AbortController`，依赖组件卸载后响应式状态失效自然忽略回调
+- **Sidebar 用量**：使用 `AbortController`，只在文件页显示时请求
 
 ---
 

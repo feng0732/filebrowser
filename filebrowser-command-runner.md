@@ -47,7 +47,7 @@ FileBrowser 的命令运行机制分为**两大场景**：
 ┌──────────────────────────────────────────────────────────────────────┐
 │                         输出返回层（Output）                           │
 │                                                                      │
-│  事件钩子：Stdout/Stderr → 服务器日志 + 错误中断流程                  │
+│  事件钩子：Stdout/Stderr → 服务器日志 + 错误中断流程（TUS 除外，错误被忽略） │
 │  交互式：Stdout/Stderr → WebSocket TextMessage → 前端 Shell UI       │
 └──────────────────────────────────────────────────────────────────────┘
 ```
@@ -291,7 +291,7 @@ api.PathPrefix("/resources").Handler(monkey(resourceDeleteHandler(fileCache), "/
 | **RunHook 调用** | `d.RunHook(fn, "delete", r.URL.Path, "", d.user)` | [resource.go:113-115](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/http/resource.go#L113-L115) |
 | **包装的主操作** | `d.user.Fs.RemoveAll(r.URL.Path)` |  |
 | **环境变量** | `$FILE` = 被删文件完整路径<br>`$DESTINATION` = `""`（空）<br>`$TRIGGER` = `"before_delete"` / `"after_delete"` |  |
-| **错误影响** | `before_delete` 钩子失败 → 删除操作**不会执行**<br>`after_delete` 钩子失败 → 文件已删，但返回错误给前端 |  |
+| **错误影响** | `before_delete` 钩子失败 → 删除操作**不会执行**<br>`after_delete` 钩子失败 → 文件已删，但返回错误给前端<br>成功返回 `204 No Content`，失败 500 |  |
 | **输出返回** | Stdout/Stderr → 服务器日志<br>命令失败导致主操作失败时 → HTTP 状态码由 `errToStatus(err)` 映射 |  |
 
 ---
@@ -310,9 +310,9 @@ api.PathPrefix("/resources").Handler(monkey(resourcePostHandler(fileCache), "/ap
 | **前置检查** | 1. 用户需有 `Perm.Create` 权限<br>2. 路径规则检查通过<br>3. 若目标已存在且 `override=true`，需 `Perm.Modify` 权限 | [resource.go:127-159](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/http/resource.go#L127-L159) |
 | **RunHook 调用** | `d.RunHook(fn, "upload", r.URL.Path, "", d.user)` | [resource.go:161-170](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/http/resource.go#L161-L170) |
 | **包装的主操作** | `writeFile(d.user.Fs, r.URL.Path, r.Body, ...)` → 创建新文件<br>成功后设置 `ETag` 响应头 |  |
-| **失败回滚** | Hook 失败（含 before 钩子或主操作）→ 执行 `d.user.Fs.RemoveAll(r.URL.Path)` 清理半成文件 | [resource.go:172-174](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/http/resource.go#L172-L174) |
+| **失败回滚** | 任何阶段失败（before 钩子 / 主操作 / after 钩子），只要 `err != nil` → 执行 `d.user.Fs.RemoveAll(r.URL.Path)` 清理文件 | [resource.go:172-174](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/http/resource.go#L172-L174) |
 | **环境变量** | `$FILE` = 新建文件路径<br>`$TRIGGER` = `"before_upload"` / `"after_upload"` |  |
-| **输出返回** | Stdout/Stderr → 服务器日志<br>成功返回 `201 Created`（由后续逻辑），失败由 `errToStatus` 映射 |  |
+| **输出返回** | Stdout/Stderr → 服务器日志<br>成功返回 `200 OK`（`errToStatus(nil)`）+ ETag header，失败由 `errToStatus` 映射为 500 |  |
 
 **注意**：POST 用于**新建**文件，触发事件名为 `"upload"`。
 
@@ -333,7 +333,8 @@ api.PathPrefix("/resources").Handler(monkey(resourcePutHandler, "/api/resources"
 | **RunHook 调用** | `d.RunHook(fn, "save", r.URL.Path, "", d.user)` | [resource.go:198-207](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/http/resource.go#L198-L207) |
 | **包装的主操作** | `writeFile(d.user.Fs, r.URL.Path, r.Body, ...)` → 覆写文件<br>成功后设置 `ETag` 响应头 |  |
 | **环境变量** | `$FILE` = 被覆写文件路径<br>`$TRIGGER` = `"before_save"` / `"after_save"` |  |
-| **输出返回** | Stdout/Stderr → 服务器日志 |  |
+| **错误影响** | `before_save` 钩子失败 → 文件不写，返回 500<br>`after_save` 钩子失败 → 文件已写入，仍返回 500（无回滚） |  |
+| **输出返回** | Stdout/Stderr → 服务器日志<br>成功返回 `200 OK` + ETag header，失败 500 |  |
 
 **关键区别**：PUT 用于**覆写已有文件**，触发事件名为 `"save"`（而非 `"upload"`）。
 
@@ -354,7 +355,8 @@ api.PathPrefix("/resources").Handler(monkey(resourcePatchHandler(fileCache), "/a
 | **RunHook 调用** | `d.RunHook(fn, "copy", src, dst, d.user)` | [resource.go:256-258](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/http/resource.go#L256-L258) |
 | **包装的主操作** | `patchAction(ctx, "copy", src, dst, d, fileCache)` → 调用 `fileutils.Copy(...)` | [resource.go:340-347](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/http/resource.go#L340-L347) |
 | **环境变量** | `$FILE` = 源文件路径（**注意是 src 不是 dst**）<br>`$DESTINATION` = 目标路径<br>`$TRIGGER` = `"before_copy"` / `"after_copy"` |  |
-| **输出返回** | Stdout/Stderr → 服务器日志 |  |
+| **错误影响** | `before_copy` 钩子失败 → 不复制，返回 500<br>`after_copy` 钩子失败 → 已复制，仍返回 500（无回滚） |  |
+| **输出返回** | Stdout/Stderr → 服务器日志<br>成功返回 `200 OK`，失败 500 |  |
 
 ---
 
@@ -368,7 +370,8 @@ api.PathPrefix("/resources").Handler(monkey(resourcePatchHandler(fileCache), "/a
 | **RunHook 调用** | `d.RunHook(fn, "rename", src, dst, d.user)` | [resource.go:256-258](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/http/resource.go#L256-L258) |
 | **包装的主操作** | `patchAction(ctx, "rename", src, dst, d, fileCache)`：<br>1. 先删源文件的缩略图缓存<br>2. 调用 `fileutils.MoveFile(...)` | [resource.go:348-373](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/http/resource.go#L348-L373) |
 | **环境变量** | `$FILE` = 源文件路径<br>`$DESTINATION` = 目标路径<br>`$TRIGGER` = `"before_rename"` / `"after_rename"` |  |
-| **输出返回** | Stdout/Stderr → 服务器日志 |  |
+| **错误影响** | `before_rename` 钩子失败 → 不重命名，返回 500<br>`after_rename` 钩子失败 → 已重命名，仍返回 500（无回滚） |  |
+| **输出返回** | Stdout/Stderr → 服务器日志<br>成功返回 `200 OK`，失败 500 |  |
 
 ---
 
@@ -407,7 +410,7 @@ api.PathPrefix("/tus").Handler(monkey(tusPatchHandler(uploadCache), "/api/tus"))
 | **RunHook 调用** | `d.RunHook(func() error { return nil }, "upload", r.URL.Path, "", d.user)` |  |
 | **包装的主操作** | `func() error { return nil }` → **空函数**！<br>（因为文件写入已在 Hook 之前完成） |  |
 | **环境变量** | `$FILE` = 上传文件路径<br>`$TRIGGER` = `"before_upload"` / `"after_upload"` |  |
-| **特殊说明** | `before_upload` 钩子在**文件已写入完成后**才执行（因为主操作为空）<br>但钩子错误仍然会导致 API 返回错误状态码<br>错误被 `_` 忽略：`_ = d.RunHook(...)`，不影响 HTTP 204 返回 | [tus_handlers.go:234](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/http/tus_handlers.go#L234) |
+| **特殊说明** | `before_upload` 钩子在**文件已写入完成后**才执行（因为主操作为空函数）<br>**钩子错误完全不影响 API 返回**：`_ = d.RunHook(...)` 显式丢弃返回值，始终返回 HTTP 204<br>钩子命令的 stdout/stderr 仍会输出到服务器日志 | [tus_handlers.go:234](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/http/tus_handlers.go#L234) |
 
 ##### 6.3 TUS DELETE（取消分片上传）
 
@@ -500,8 +503,8 @@ HTTP 请求到达
 4. **额外环境变量**：同样的 5 个变量追加到 `cmd.Env`
 5. **IO 定向**：`Stdin/Stdout/Stderr` → 服务器标准流（即日志）
 6. **执行**：
-   - 非阻塞：`cmd.Start()` + 异步 `cmd.Wait()`（失败仅记录日志，不影响主流程）
-   - 阻塞：`cmd.Run()`（失败返回错误，可能中断主流程）
+   - 非阻塞：`cmd.Start()` 返回的 error 会中断 RunHook；`cmd.Start()` 成功后的 `cmd.Wait()` 失败仅记录日志，不影响主流程
+   - 阻塞：`cmd.Run()` 失败返回 error，会中断 RunHook
 
 ### 4.2 模式二：交互式 Shell（WebSocket）
 
@@ -593,97 +596,123 @@ if status != 0 {
 
 ### 5.2 各操作成功时的完整返回链路
 
+所有操作的成功返回都遵循统一流程：
+1. handler 返回 `(status, nil)`
+2. [handle()](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/http/data.go#L78-L97) 中间件检查 `status != 0` → 为 true
+3. 调用 `http.Error(w, strconv.Itoa(status)+" "+http.StatusText(status), status)` 写入响应
+
+也就是说，**成功时也走 `http.Error` 分支**，response body 会包含形如 `"200 OK"` / `"204 No Content"` 的文本字符串，而不是空 body。handler 内部设置的 header（如 ETag、Upload-Offset）仍会出现在响应中。
+
+---
+
 #### 🔹 普通上传（POST）成功
 
-[resourcePostHandler](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/http/resource.go#L125-L178) 成功路径：
-
-```
-d.RunHook(fn, "upload", ..., d.user)  → 返回 nil
-    ↓
-err == nil
-    ↓
-不执行 RemoveAll 回滚
-    ↓
-return errToStatus(nil), nil           → (200, nil)
-    ↓
-handle() 中 status == 0 → 不调用 http.Error
-    ↓
-但等一下——handler 内部已通过 fn 设置了 ETag header
-    ↓
-前端实际收到的响应：HTTP 200 + ETag header + 无 body
-```
-
-**⚠️ 修正说明**：`errToStatus(nil)` 返回 `http.StatusOK` 即 `200`，不是 `0`。
-
-再仔细看 `handle()` 中 `status != 0` 时会调用 `http.Error`，所以实际上当 `errToStatus(err)` 返回 `200` 时，**也会走到 `http.Error` 分支**！
-
 ```go
-// errToStatus(nil) → 200
-// handle() 中: status != 0 → true (200 != 0)
-// → http.Error(w, "200 OK", 200)
+// resource.go:161-176
+err = d.RunHook(fn, "upload", ..., d.user)
+// err == nil → 不执行 RemoveAll 回滚
+return errToStatus(nil), nil    // → (200, nil)
 ```
 
-这意味着**普通上传成功时返回的是 HTTP 200 + body "200 OK"**，而非无 body 的 200。但 handler 内部在 `fn` 中已通过 `w.Header().Set("ETag", ...)` 设置了 ETag 头（[resource.go:167-168](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/http/resource.go#L167-L168)），ETag 仍会出现在响应中。
+| 环节 | 值 |
+|------|---|
+| handler 返回 | `(200, nil)` |
+| handle() 处理 | `status != 0` → `http.Error(w, "200 OK", 200)` |
+| 最终响应 | HTTP 200 + body `"200 OK"` + ETag header |
+| 文件状态 | 已创建 |
+
+**关键代码**：`fn()` 中已通过 `w.Header().Set("ETag", etag)` 设置 ETag 头（[resource.go:167-168](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/http/resource.go#L167-L168)）。
+
+---
 
 #### 🔹 保存（PUT）成功
 
-[resourcePutHandler](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/http/resource.go#L180-L210) 成功路径完全同上传：
+```go
+// resource.go:198-209
+err = d.RunHook(fn, "save", ..., d.user)
+return errToStatus(nil), nil    // → (200, nil)
+```
 
-```
-d.RunHook(fn, "save", ..., d.user) → nil
-    ↓
-return errToStatus(nil), nil         → (200, nil)
-    ↓
-http.Error(w, "200 OK", 200) + ETag header
-```
+| 环节 | 值 |
+|------|---|
+| handler 返回 | `(200, nil)` |
+| handle() 处理 | `http.Error(w, "200 OK", 200)` |
+| 最终响应 | HTTP 200 + body `"200 OK"` + ETag header |
+| 文件状态 | 已覆写 |
+
+---
 
 #### 🔹 删除（DELETE）成功
 
-[resourceDeleteHandler](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/http/resource.go#L84-L123) 成功路径：
+```go
+// resource.go:113-119
+err = d.RunHook(fn, "delete", ..., d.user)
+if err != nil {
+    return errToStatus(err), err
+}
+return http.StatusNoContent, nil    // → (204, nil)
+```
 
-```
-d.RunHook(fn, "delete", ..., d.user) → nil
-    ↓
-return http.StatusNoContent, nil      → (204, nil)
-    ↓
-handle() 中: status != 0 → http.Error(w, "204 No Content", 204)
-```
+| 环节 | 值 |
+|------|---|
+| handler 返回 | `(204, nil)` |
+| handle() 处理 | `http.Error(w, "204 No Content", 204)` |
+| 最终响应 | HTTP 204 + body `"204 No Content"` |
+| 文件状态 | 已删除 |
+
+---
 
 #### 🔹 复制/重命名（PATCH）成功
 
-[resourcePatchHandler](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/http/resource.go#L212-L262) 成功路径：
+```go
+// resource.go:256-261
+err = d.RunHook(fn, action, ..., d.user)
+return errToStatus(nil), nil    // → (200, nil)
+```
 
-```
-d.RunHook(fn, action, ..., d.user) → nil
-    ↓
-return errToStatus(nil), nil         → (200, nil)
-    ↓
-http.Error(w, "200 OK", 200)
-```
+| 环节 | 值 |
+|------|---|
+| handler 返回 | `(200, nil)` |
+| handle() 处理 | `http.Error(w, "200 OK", 200)` |
+| 最终响应 | HTTP 200 + body `"200 OK"` |
+| 文件状态 | 已复制 / 已重命名 |
+
+---
 
 #### 🔹 分片上传（TUS PATCH）成功
 
-[tusPatchHandler](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/http/tus_handlers.go#L156-L239) 成功路径：
+```go
+// tus_handlers.go:229-237
+w.Header().Set("Upload-Offset", strconv.FormatInt(newOffset, 10))
 
-```
-文件写入完成 + newOffset >= uploadLength
-    ↓
-cache.Complete(file.RealPath())
-_ = d.RunHook(func() error { return nil }, "upload", ..., d.user)
-    ↓
-return http.StatusNoContent, nil      → (204, nil)
-    ↓
-http.Error(w, "204 No Content", 204)
-    ↑ 前面还设置了 Upload-Offset header
+if newOffset >= uploadLength {
+    cache.Complete(file.RealPath())
+    _ = d.RunHook(func() error { return nil }, "upload", ..., d.user)  // 返回值被丢弃
+}
+
+return http.StatusNoContent, nil    // → (204, nil)，无条件执行
 ```
 
-**分片上传中间片段**（`newOffset < uploadLength`）：
+**完整上传完成时**（`newOffset >= uploadLength`）：
 
-```
-不触发 RunHook
-    ↓
-return http.StatusNoContent, nil      → (204, nil)
-```
+| 环节 | 值 |
+|------|---|
+| RunHook 返回 | 被 `_` 丢弃，不影响任何逻辑 |
+| handler 返回 | `(204, nil)` |
+| handle() 处理 | `http.Error(w, "204 No Content", 204)` |
+| 最终响应 | HTTP 204 + body `"204 No Content"` + Upload-Offset header |
+| 文件状态 | 已写入完成，缓存已标记 Complete |
+
+**中间分片时**（`newOffset < uploadLength`）：
+
+| 环节 | 值 |
+|------|---|
+| RunHook | 不触发 |
+| handler 返回 | `(204, nil)` |
+| 最终响应 | HTTP 204 + body `"204 No Content"` + Upload-Offset header |
+| 文件状态 | 数据追加写入 |
+
+**⚠️ 重要**：无论 before_upload / after_upload 钩子是否成功执行，客户端始终收到 HTTP 204。钩子命令的 stdout/stderr 仍会输出到服务器日志（[runner.go:99-101](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/runner/runner.go#L99-L101)），但失败不会传播到客户端。
 
 ---
 

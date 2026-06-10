@@ -389,3 +389,444 @@ HTTP 请求到达
 | CLI 管理 | [cmd/rules.go](file:///d:/fz/0601/solo-dogfeeding/code/175-filebrowser/cmd/rules.go) | 规则命令的通用逻辑 |
 | CLI 添加 | [cmd/rules_add.go](file:///d:/fz/0601/solo-dogfeeding/code/175-filebrowser/cmd/rules_add.go) | rules add 命令 |
 | CLI 删除 | [cmd/rule_rm.go](file:///d:/fz/0601/solo-dogfeeding/code/175-filebrowser/cmd/rule_rm.go) | rules rm 命令 |
+| 原始下载 | [http/raw.go](file:///d:/fz/0601/solo-dogfeeding/code/175-filebrowser/http/raw.go) | raw/rawFileHandler/rawDirHandler |
+| 搜索 | [search/search.go](file:///d:/fz/0601/solo-dogfeeding/code/175-filebrowser/search/search.go) | Search 函数、规则过滤 |
+| 错误码 | [errors/errors.go](file:///d:/fz/0601/solo-dogfeeding/code/175-filebrowser/errors/errors.go) | 权限错误定义 |
+| 错误映射 | [http/utils.go](file:///d:/fz/0601/solo-dogfeeding/code/175-filebrowser/http/utils.go) | errToStatus 错误→HTTP状态码 |
+
+---
+
+## 九、各操作路径的规则生效详细分析
+
+### 9.1 删除操作
+
+#### 触发入口
+
+- **HTTP 路由**：`DELETE /api/resources/*path`
+- **路由注册**：[http/http.go#L62](file:///d:/fz/0601/solo-dogfeeding/code/175-filebrowser/http/http.go#L62)
+- **处理函数**：[resourceDeleteHandler](file:///d:/fz/0601/solo-dogfeeding/code/175-filebrowser/http/resource.go#L84-L123)
+
+#### 执行顺序
+
+```
+1. withUser 中间件认证
+   ├─ 解析 JWT Token，加载用户信息
+   └─ 失败 → 401 Unauthorized
+
+2. 权限前置检查（第86行）
+   ├─ r.URL.Path == "/" → 403 Forbidden（禁止删除根目录）
+   └─ !d.user.Perm.Delete → 403 Forbidden（无删除权限）
+
+3. NewFileInfo 规则检查（第90-97行）  ← 规则生效点
+   ├─ 创建 FileOptions，Checker = d（data 实例）
+   ├─ NewFileInfo 内部调用 d.Check(r.URL.Path)
+   │   ├─ 检查 HideDotfiles（隐藏文件直接拒绝）
+   │   ├─ 遍历全局规则
+   │   └─ 遍历用户规则
+   └─ 规则拒绝 → 返回 os.ErrPermission
+
+4. errToStatus 错误映射（第98-100行）
+   └─ os.ErrPermission → 403 Forbidden
+
+5. 删除关联分享记录（第102行）
+
+6. 删除缩略图缓存（第107行）
+
+7. 执行 Hook + 实际删除操作（第113-115行）
+```
+
+#### 拒绝后的返回
+
+| 拒绝阶段 | 返回状态码 | 说明 |
+|---------|-----------|------|
+| JWT 认证失败 | 401 | 未登录或 Token 过期 |
+| 路径为根目录 `/` | 403 | 禁止删除根目录 |
+| 无删除权限 | 403 | `user.Perm.Delete == false` |
+| **规则拒绝** | **403** | `d.Check(path)` 返回 false → `os.ErrPermission` → `errToStatus` 映射为 403 |
+
+#### 关键代码路径
+
+规则拒绝时的传播链：
+```go
+// files/file.go#L78
+if !opts.Checker.Check(opts.Path) {
+    return nil, os.ErrPermission  // 规则检查失败，返回权限错误
+}
+
+// http/resource.go#L98-99
+if err != nil {
+    return errToStatus(err), err  // os.ErrPermission → 403
+}
+
+// http/utils.go#L34-35
+case os.IsPermission(err):
+    return http.StatusForbidden   // 最终返回 403
+```
+
+---
+
+### 9.2 原始文件下载（Raw Download）
+
+#### 触发入口
+
+- **HTTP 路由**：`GET /api/raw/*path`
+- **路由注册**：[http/http.go#L82](file:///d:/fz/0601/solo-dogfeeding/code/175-filebrowser/http/http.go#L82)
+- **处理函数**：[rawHandler](file:///d:/fz/0601/solo-dogfeeding/code/175-filebrowser/http/raw.go#L83-L110)
+
+#### 执行顺序
+
+```
+1. withUser 中间件认证
+   └─ 失败 → 401 Unauthorized
+
+2. 下载权限检查（第84-86行）
+   └─ !d.user.Perm.Download → 202 Accepted（注意：不是403！）
+
+3. NewFileInfo 规则检查（第88-95行）  ← 规则生效点
+   ├─ 创建 FileOptions，Checker = d
+   ├─ Expand = false（不展开目录内容，只检查路径本身）
+   ├─ NewFileInfo 内部调用 d.Check(r.URL.Path)
+   │   ├─ 检查 HideDotfiles
+   │   ├─ 遍历全局规则
+   │   └─ 遍历用户规则
+   └─ 规则拒绝 → 返回 os.ErrPermission → 403 Forbidden
+
+4. 命名管道检查（第100-103行）
+   └─ 是命名管道 → 设置 Content-Disposition，返回 200 空内容
+
+5. 分支处理
+   ├─ 普通文件 → rawFileHandler（第105-106行）
+   │   └─ 直接以 http.ServeContent 流式传输文件内容
+   └─ 目录 → rawDirHandler（第108-109行）
+       └─ 进入打包下载流程（见9.3节）
+```
+
+#### 拒绝后的返回
+
+| 拒绝阶段 | 返回状态码 | 说明 |
+|---------|-----------|------|
+| JWT 认证失败 | 401 | 未登录 |
+| 无下载权限 | 202 | `user.Perm.Download == false`，注意不是403 |
+| **规则拒绝** | **403** | `d.Check(path)` 返回 false → 403 |
+
+#### 特别注意
+
+无下载权限时返回 **202 Accepted** 而非 403，这是一个有意的设计。202 表示请求已被接受但尚未完成，前端可能据此做特殊处理（如弹出提示而非报错）。这与规则拒绝返回 403 有语义上的区别。
+
+---
+
+### 9.3 打包下载（目录下载）
+
+#### 触发入口
+
+- **HTTP 路由**：`GET /api/raw/*path`（目标是目录时）
+- **入口函数**：[rawDirHandler](file:///d:/fz/0601/solo-dogfeeding/code/175-filebrowser/http/raw.go#L170-L216)
+- **递归收集文件**：[getFiles](file:///d:/fz/0601/solo-dogfeeding/code/175-filebrowser/http/raw.go#L112-L168)
+
+#### 执行顺序
+
+```
+1. rawHandler 前置流程（同9.2节）
+   ├─ 认证、权限、NewFileInfo 规则检查（检查目录路径本身）
+   └─ 目标路径通过规则检查后，判断是目录，进入 rawDirHandler
+
+2. rawDirHandler 解析请求参数（第171-178行）
+   ├─ parseQueryFiles：解析 ?files=a.txt,b.txt 参数
+   │   └─ 无 files 参数时，默认打包整个目录
+   └─ parseQueryAlgorithm：解析 ?algo=zip|tar|targz|... 参数
+
+3. 计算公共路径前缀（第181行）
+   └─ fileutils.CommonPrefix 确定归档包内的目录结构
+
+4. 逐文件/目录递归收集  ← 规则生效点
+   └─ 对每个 filename 调用 getFiles(d, fname, commonDir)
+
+5. getFiles 内部流程（第112-168行）
+   ├─ 对当前路径调用 d.Check(path)（第113行）
+   │   ├─ 规则拒绝 → 返回 nil, nil（静默跳过，不报错）
+   │   └─ 规则允许 → 继续处理
+   ├─ Stat 获取文件信息
+   ├─ 如果是文件且不是 commonPath → 加入归档列表
+   └─ 如果是目录 → 递归处理子目录
+       └─ 对每个子项递归调用 getFiles（第158行）
+           ├─ 规则拒绝的子项 → 静默跳过
+           └─ 规则允许的子项 → 加入归档列表
+
+6. 执行归档打包（第211行）
+   └─ archiver.Archive 将所有收集的文件写入 HTTP Response
+```
+
+#### 拒绝后的返回
+
+打包下载中的规则拒绝行为与其他操作**截然不同**：
+
+| 拒绝阶段 | 行为 | 说明 |
+|---------|------|------|
+| 目录路径本身被规则拒绝 | 403 | 在 rawHandler 的 NewFileInfo 中被拦截 |
+| **目录内子文件/子目录被规则拒绝** | **静默跳过** | `getFiles` 返回 `nil, nil`，不报错、不包含在归档中 |
+| 归档中部分文件被拒绝 | 返回不完整的归档 | 只有允许的文件被打包，被拒绝的文件无提示地消失 |
+
+#### 关键代码分析
+
+```go
+// http/raw.go#L112-L115
+func getFiles(d *data, path, commonPath string) ([]archives.FileInfo, error) {
+    if !d.Check(path) {
+        return nil, nil  // 规则拒绝 → 返回空列表，无错误
+    }
+    // ...
+}
+```
+
+这是一个**过滤式**的规则应用方式，与删除操作的**拦截式**应用方式不同：
+- **拦截式**（删除）：规则拒绝 → 返回错误 → 中断操作 → 返回 403
+- **过滤式**（打包下载）：规则拒绝 → 跳过该条目 → 继续处理其他条目 → 返回不完整结果
+
+同时注意，`getFiles` 中对目录的递归处理：如果子目录被规则拒绝，该目录及其**所有子内容**都不会被包含在归档中（因为不会递归进入被拒绝的目录）。
+
+---
+
+### 9.4 搜索过滤
+
+#### 触发入口
+
+- **HTTP 路由**：`GET /api/search?query=xxx`
+- **路由注册**：[http/http.go#L86](file:///d:/fz/0601/solo-dogfeeding/code/175-filebrowser/http/http.go#L86)
+- **HTTP 处理函数**：[searchHandler](file:///d:/fz/0601/solo-dogfeeding/code/175-filebrowser/http/search.go#L17-L82)
+- **核心搜索逻辑**：[search.Search](file:///d:/fz/0601/solo-dogfeeding/code/175-filebrowser/search/search.go#L22-L77)
+
+#### 执行顺序
+
+```
+1. withUser 中间件认证
+   └─ 失败 → 401 Unauthorized
+
+2. searchHandler 创建流式响应通道（第18-21行）
+   └─ 使用 Server-Sent Events 风格的流式响应
+
+3. 调用 search.Search（第61行）
+   └─ 传入 d（data 实例）作为 checker
+
+4. search.Search 内部流程
+   ├─ 解析搜索查询（parseSearch）
+   │   ├─ 提取搜索条件（type:image, type:video 等）
+   │   └─ 提取搜索关键词
+   ├─ afero.Walk 递归遍历文件系统
+   └─ 对每个文件/目录：
+       ├─ 跳过根路径自身（第38-40行）
+       ├─ 规则检查（第42-44行）  ← 规则生效点
+       │   ├─ checker.Check(fPath) 返回 false → return nil（跳过）
+       │   └─ checker.Check(fPath) 返回 true → 继续
+       ├─ 搜索条件过滤（第46-58行）
+       │   └─ 不满足任何 condition → return nil（跳过）
+       ├─ 关键词匹配（第61-73行）
+       │   └─ 文件名不包含任何关键词 → return nil（跳过）
+       └─ 匹配成功 → 调用 found 回调发送结果
+
+5. 流式发送搜索结果（第62-69行）
+   └─ 每找到一个匹配结果，立即通过 response channel 发送
+```
+
+#### 拒绝后的返回
+
+| 拒绝阶段 | 行为 | 说明 |
+|---------|------|------|
+| JWT 认证失败 | 401 | 未登录 |
+| **文件/目录被规则拒绝** | **静默跳过** | 不出现在搜索结果中 |
+| 被拒绝的目录 | 不递归进入 | 但与打包下载不同，这里 Walk 会继续进入子目录 |
+| 搜索条件不满足 | 静默跳过 | 不是规则拒绝，而是搜索条件过滤 |
+| 关键词不匹配 | 静默跳过 | 不是规则拒绝，而是搜索匹配过滤 |
+
+#### 关键代码分析
+
+```go
+// search/search.go#L42-L44
+if !checker.Check(fPath) {
+    return nil  // 规则拒绝 → 返回 nil，Walk 继续遍历其他路径
+}
+```
+
+**重要差异**：搜索中的规则拒绝，与打包下载中 `getFiles` 的行为类似，是**过滤式**的。但有一个关键区别：
+
+- **打包下载**：被拒绝的目录不会被递归进入，整个子树都被排除
+- **搜索**：被拒绝的路径 `return nil`，`afero.Walk` **仍会递归进入**该目录的子目录
+
+这意味着在搜索中，如果 `/data/private` 被规则拒绝：
+- `/data/private` 本身不会出现在搜索结果中
+- 但 `/data/private/subfile.txt` 仍会被 Walk 访问到，如果该子路径没有被单独的规则拒绝，它仍可能出现在搜索结果中
+
+这与递归列表 `resourceGetRecursiveHandler` 的行为不同——后者在目录被拒绝时使用 `filepath.SkipDir` 跳过整个子树。
+
+#### 搜索条件与规则的关系
+
+搜索条件（conditions）和规则（rules）是两个独立的过滤层：
+
+```
+文件路径
+  ↓
+第1层：规则检查（checker.Check） — 基于路径的权限控制
+  ↓ 通过
+第2层：搜索条件（conditions） — 基于文件类型/扩展名的过滤
+  ↓ 通过
+第3层：关键词匹配（terms） — 基于文件名的文本搜索
+  ↓ 通过
+返回搜索结果
+```
+
+---
+
+### 9.5 公共分享
+
+公共分享是规则应用中最复杂的场景，因为它涉及文件系统的重定位（rebase）和规则路径的回溯映射。
+
+#### 触发入口
+
+- **分享查看**：`GET /api/public/share/{hash}[/path]`
+- **分享下载**：`GET /api/public/dl/{hash}[/path]`
+- **路由注册**：[http/http.go#L90-L91](file:///d:/fz/0601/solo-dogfeeding/code/175-filebrowser/http/http.go#L90-L91)
+- **中间件**：[withHashFile](file:///d:/fz/0601/solo-dogfeeding/code/175-filebrowser/http/public.go#L17-L98)
+- **分享查看处理**：[publicShareHandler](file:///d:/fz/0601/solo-dogfeeding/code/175-filebrowser/http/public.go#L115-L125)
+- **分享下载处理**：[publicDlHandler](file:///d:/fz/0601/solo-dogfeeding/code/175-filebrowser/http/public.go#L127-L134)
+
+#### 执行顺序
+
+```
+1. withHashFile 中间件（核心，第17-98行）
+   │
+   ├─ 1.1 从 URL 解析分享 hash 和子路径（第19行）
+   │   └─ ifPathWithName：hash 为 URL 第一段，后续为子路径
+   │
+   ├─ 1.2 查找分享记录（第20-23行）
+   │   └─ share.GetByHash(id) → 不存在 → 404/500
+   │
+   ├─ 1.3 分享认证（第25-28行）
+   │   ├─ 无密码分享 → 通过
+   │   ├─ URL token 认证 → 通过
+   │   ├─ X-SHARE-PASSWORD 头认证 → 通过
+   │   └─ 认证失败 → 401 Unauthorized
+   │
+   ├─ 1.4 加载分享所有者用户（第30-33行）
+   │   └─ 获取用户信息（包含用户规则）
+   │
+   ├─ 1.5 权限检查（第35-37行）
+   │   ├─ !user.Perm.Share → 403 Forbidden
+   │   └─ !user.Perm.Download → 403 Forbidden
+   │
+   ├─ 1.6 设置 d.user = user（第39行）
+   │   └─ 此后 d.Check 将使用分享所有者的规则
+   │
+   ├─ 1.7 第一次 NewFileInfo — 检查分享根路径（第41-53行）  ← 规则生效点①
+   │   ├─ Path = link.Path（分享链接指向的原始路径）
+   │   ├─ Checker = d（使用分享所有者的规则）
+   │   ├─ d.Checker.Check(link.Path) 检查分享根路径
+   │   └─ 规则拒绝 → os.ErrPermission → 403 Forbidden
+   │
+   ├─ 1.8 重定位文件系统（第66-75行）  ← 关键步骤
+   │   ├─ d.user.Fs = files.NewScopedFs(d.user.Fs, basePath)
+   │   │   └─ 文件系统根目录重设为分享路径
+   │   └─ d.checkerPrefix = basePath
+   │       └─ 规则检查时，路径会加上此前缀，回溯到原始作用域
+   │
+   ├─ 1.9 第二次 NewFileInfo — 检查实际访问路径（第77-87行）  ← 规则生效点②
+   │   ├─ Path = filePath（分享内的子路径）
+   │   ├─ Checker = d（此时 checkerPrefix 已设置）
+   │   ├─ d.Check(filePath) 内部：
+   │   │   ├─ path = gopath.Join(d.checkerPrefix, filePath)
+   │   │   │   └─ 将子路径还原为用户原始作用域的完整路径
+   │   │   ├─ 检查 HideDotfiles
+   │   │   ├─ 遍历全局规则（Settings.Rules）
+   │   │   └─ 遍历用户规则（User.Rules，分享所有者的规则）
+   │   └─ 规则拒绝 → os.ErrPermission → 403 Forbidden
+   │
+   └─ 1.10 将 FileInfo 存入 d.raw，调用业务处理函数（第95-96行）
+
+2. 业务处理函数
+   ├─ publicShareHandler：返回目录/文件的 JSON 信息
+   │   └─ readListing 内部对每个子项也会调用 checker.Check
+   └─ publicDlHandler：下载文件或打包目录
+       ├─ 普通文件 → rawFileHandler（直接下载）
+       └─ 目录 → rawDirHandler → getFiles（递归，每个文件都过 checker.Check）
+```
+
+#### 拒绝后的返回
+
+| 拒绝阶段 | 返回状态码 | 说明 |
+|---------|-----------|------|
+| 分享记录不存在 | 404 | 分享 hash 无效 |
+| 分享认证失败 | 401 | 密码错误或未提供 |
+| 所有者无 Share 权限 | 403 | `user.Perm.Share == false` |
+| 所有者无 Download 权限 | 403 | `user.Perm.Download == false` |
+| **分享根路径被规则拒绝** | **403** | 第一次 NewFileInfo，规则生效点① |
+| **分享内子路径被规则拒绝** | **403** | 第二次 NewFileInfo，规则生效点② |
+| 目录列表中子项被规则拒绝 | 静默过滤 | readListing 中 `continue` 跳过 |
+| 打包下载中子文件被规则拒绝 | 静默跳过 | getFiles 返回 `nil, nil` |
+
+#### checkerPrefix 机制详解
+
+这是公共分享场景中最关键的设计，用一个具体例子说明：
+
+```
+假设：
+  用户 scope = "/srv/data"
+  用户规则：{Allow: false, Path: "/projects/private"}
+  分享链接：{Hash: "abc123", Path: "/projects"}
+
+访问 /api/public/share/abc123/private/secret.txt 时：
+
+1. 第一次 NewFileInfo
+   - Path = "/projects"（分享根路径）
+   - Check("/projects") → 规则不匹配 → allow = true → 通过
+
+2. 设置 checkerPrefix
+   - d.user.Fs = NewScopedFs(fs, "/projects")  // 文件系统根变为 /projects
+   - d.checkerPrefix = "/projects"
+
+3. 第二次 NewFileInfo
+   - Path = "private/secret.txt"（相对于分享根的子路径）
+   - Check 内部：
+     - path = Join("/projects", "private/secret.txt") = "/projects/private/secret.txt"
+     - 规则匹配：/projects/private 是前缀 → Allow = false → 拒绝！
+   - 返回 403 Forbidden
+```
+
+**如果没有 checkerPrefix**：`Check("private/secret.txt")` 不会匹配规则 `/projects/private`，该文件就会被错误地放行。
+
+这个机制确保了即使文件系统被重定位，规则仍然基于用户原始作用域的完整路径进行匹配，防止通过分享链接绕过规则限制。
+
+相关测试用例参见 [http/public_test.go#L151-L255](file:///d:/fz/0601/solo-dogfeeding/code/175-filebrowser/http/public_test.go#L151-L255)。
+
+---
+
+## 十、规则生效方式对比总结
+
+### 10.1 两种生效方式
+
+| 生效方式 | 机制 | 拒绝结果 | 适用场景 |
+|---------|------|---------|---------|
+| **拦截式** | `NewFileInfo` 中 `Check` 失败 → 返回 `os.ErrPermission` | 中断操作，返回 HTTP 403 | 删除、下载（文件本身）、分享根路径 |
+| **过滤式** | 遍历中 `Check` 失败 → `continue`/`return nil` | 静默跳过，不影响其他条目 | 目录列表、打包下载子文件、搜索、递归列表 |
+
+### 10.2 各操作对比
+
+| 操作 | 路由 | 规则生效点 | 生效方式 | 被拒后的返回 |
+|------|------|-----------|---------|------------|
+| 删除 | `DELETE /api/resources/*` | NewFileInfo | 拦截式 | 403 Forbidden |
+| 原始文件下载 | `GET /api/raw/*`（文件） | NewFileInfo | 拦截式 | 403 Forbidden |
+| 打包下载（目录本身） | `GET /api/raw/*`（目录） | NewFileInfo | 拦截式 | 403 Forbidden |
+| 打包下载（子文件） | 同上 | getFiles | 过滤式 | 静默跳过，归档不完整 |
+| 搜索（整体） | `GET /api/search` | search.Search | 过滤式 | 结果中不出现 |
+| 公共分享（根路径） | `GET /api/public/share/*` | 第一次 NewFileInfo | 拦截式 | 403 Forbidden |
+| 公共分享（子路径） | 同上 | 第二次 NewFileInfo | 拦截式 | 403 Forbidden |
+| 公共分享（目录列表子项） | 同上 | readListing | 过滤式 | 静默跳过 |
+| 公共分享下载（子文件） | `GET /api/public/dl/*` | getFiles | 过滤式 | 静默跳过，归档不完整 |
+| 递归列表 | `GET /api/resources/recursive` | Walk 回调 | 过滤式 | 目录用 SkipDir，文件静默跳过 |
+
+### 10.3 搜索 vs 递归列表的目录跳过行为差异
+
+| 场景 | 目录被规则拒绝时 | 代码位置 |
+|------|----------------|---------|
+| 递归列表 | `filepath.SkipDir` — 跳过整个子树 | [http/resource.go#L420-L422](file:///d:/fz/0601/solo-dogfeeding/code/175-filebrowser/http/resource.go#L420-L422) |
+| 搜索 | `return nil` — 只跳过目录本身，**子目录仍会被遍历** | [search/search.go#L42-L44](file:///d:/fz/0601/solo-dogfeeding/code/175-filebrowser/search/search.go#L42-L44) |
+| 打包下载 | `return nil, nil` — 跳过整个子树（因为不递归进入被拒目录） | [http/raw.go#L113-L115](file:///d:/fz/0601/solo-dogfeeding/code/175-filebrowser/http/raw.go#L113-L115) |
+
+这意味着：在搜索场景下，如果一个目录被规则拒绝但其子路径没有被单独的规则覆盖，搜索仍可能找到该目录下的文件。这是一个潜在的规则绕过点，需要通过在规则中使用路径前缀匹配（如 `/data/private` 规则会同时匹配 `/data/private` 及其所有子路径）来避免。

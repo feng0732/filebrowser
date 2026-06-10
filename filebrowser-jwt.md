@@ -304,10 +304,11 @@ func renewableErr(err error, d *data) bool {
 
 **过期令牌如何续签**：
 即使通过了 `renewableErr` 的宽容放行，`withUser` 中的刷新检测逻辑仍然执行：
-1. **expiresSoon**：对已过期 Token，`time.Until(expiredTime)` 为负数，不触发 `< time.Hour` 条件
+1. **expiresSoon**：对已过期 Token，`time.Until(expiredTime)` 返回**负数**，而**负数 < 1 小时恒成立**，因此 `expiresSoon=true`
 2. **updated**：用户信息变更时仍会触发 `X-Renew-Token: true`
-3. 前端 `fetchURL()` 收到响应头后照样调用 `renew()` → `POST /api/renew`
-4. **关键点**：`renewHandler` 也被 `withUser` 包裹，而 `withUser` 对 Proxy + 自定义登出页场景下的过期 Token 是放行的，因此**过期 Token 也能成功换取新 Token**
+3. 以上两个条件**任一满足**就会设置响应头 `X-Renew-Token: true`
+4. 前端 `fetchURL()` 收到响应头后调用 `renew()` → `POST /api/renew`
+5. **关键点**：`renewHandler` 也被 `withUser` 包裹，而 `withUser` 对 Proxy + 自定义登出页场景下的过期 Token 是放行的，因此**过期 Token 也能成功换取新 Token**
 
 ```
 请求携带过期 JWT（proxy + 自定义登出页场景）
@@ -316,10 +317,10 @@ withUser 中间件
     ├─ ParseFromRequest：签名正确但 err=ErrTokenExpired
     ├─ renewableErr() → true（三条件均满足）
     ├─ 跳过 401，继续执行
-    ├─ expiresSoon=false（过期了不满足<1h）
-    ├─ updated 判断（用户有变更则触发刷新头）
+    ├─ expiresSoon=true（过期返回负数，负数 < 1h 恒成立 ★）
+    ├─ updated 判断（用户有变更也触发，双保险）
     ├─ d.store.Users.Get(ID) → 加载用户
-    └─ 业务函数正常返回 + 可能附带 X-Renew-Token:true
+    └─ 业务函数正常返回 + X-Renew-Token:true（几乎必然触发）
     ↓
 前端 fetchURL() 检测 X-Renew-Token:true
     └─→ renew(过期JWT)
@@ -327,7 +328,9 @@ withUser 中间件
               └─→ printToken() → 返回全新未过期 JWT
 ```
 
-> 这就是**过期令牌续签**的完整链条：服务端对过期 Token 放行 → 仍通过 `updated` 条件或下一次未过期请求触发刷新提示 → 前端发起 renew → renewHandler 凭借同样的过期宽容机制通过校验并签发新 Token。
+> 这就是**过期令牌续签**的完整链条：服务端对过期 Token 放行（`renewableErr`）→ `expiresSoon=true` 几乎必然触发刷新提示（过期后恒成立）→ 前端发起 renew → renewHandler 凭借同样的过期宽容机制通过校验并签发新 Token。
+>
+> **修正前的错误理解**：曾认为过期 Token 的 `time.Until` 为负不会触发 `< time.Hour`，实际是**负数一定小于正数**，所以过期后 `expiresSoon` 恒为 `true`。
 
 ### 2.5 校验路径完整流程图
 
@@ -350,6 +353,7 @@ withUser 中间件
     │         ├─ 非 ErrTokenExpired → false → 401（签名错误不宽容）
     │         └─ proxy + 自定义登出 + 仅过期 → true → ★ 放行过期 Token
     ├─→ 刷新检测（expiresSoon || updated）→ X-Renew-Token 响应头
+    │    （过期 Token 的 expiresSoon 恒为 true，负数 < 1h）
     ├─→ d.store.Users.Get() 从 DB 加载最新用户
     └─→ 执行业务处理函数
 ```
@@ -373,8 +377,14 @@ if expiresSoon || updated {
 
 | 触发条件 | 判断逻辑 | 设计意图 | Proxy+自定义登出页场景下 |
 |---------|---------|---------|----------------------|
-| **即将过期** | Token 剩余有效期 < 1 小时 | 提前续期，避免用户操作中途掉线 | 对已过期 Token 不触发（`time.Until` 为负），但未过期的最后 1 小时仍正常触发 |
-| **用户信息变更** | Token 签发时间 (iat) < 用户最后更新时间 | 确保前端持有最新权限/偏好设置 | **仍会触发**，这是过期 Token 被续签的主要触发路径 |
+| **即将过期（含已过期）** | `time.Until(ExpiresAt) < 1h` | 提前续期，避免用户操作中途掉线 | **过期后恒触发**（`time.Until` 返回负数，**负数 < 1 小时恒成立**），这是过期 Token 续签的**主要触发路径** |
+| **用户信息变更** | Token 签发时间 (iat) < 用户最后更新时间 | 确保前端持有最新权限/偏好设置 | 仍会触发，与 expiresSoon 形成**双保险** |
+
+> **关键修正**：`time.Until(t)` 返回 `t - now`，当 `t` 已过时时返回负值。而**任何负数都小于 1 小时**，因此：
+> ```go
+> time.Until(已过期的时间)  // 返回 -1h30m 这样的负数
+> -1h30m < time.Hour        // 结果为 true！
+> ```
 
 **用户更新时间戳机制**：[users/storage.go](users/storage.go#L76-L90) 在每次 `Update()` 时记录：
 
@@ -421,7 +431,7 @@ export async function renew(jwt: string) {
 func renewHandler(tokenExpireTime time.Duration) handleFunc {
     return withUser(func(w http.ResponseWriter, r *http.Request, d *data) (int, error) {
         w.Header().Set("X-Renew-Token", "false")  // 清除刷新提示
-        return printToken(w, r, d, d.user, tokenExpirationTime)  // 签发全新 Token
+        return printToken(w, r, d, d.user, tokenExpireTime)  // 签发全新 Token（参数名与形参一致）
     })
 }
 ```
@@ -514,7 +524,7 @@ export async function validateLogin() {
 │                                                             │
 │ 过期宽容分支（proxy + 自定义登出页 + ErrTokenExpired）：      │
 │   └─→ renewableErr=true → 跳过 401，仍执行上述刷新检测       │
-│      （主要依赖 updated 条件触发续签）                        │
+│      （expiresSoon 恒成立 + updated 双保险触发续签）          │
 └─────────────────────────────────────────────────────────────┘
                          ↓
 ┌─ 前端响应 ─────────────────────────────────────────────────┐
@@ -563,15 +573,18 @@ export async function validateLogin() {
 
 ## 四、Proxy 认证 + 自定义登出页分支专项总结
 
-### 4.1 三处代码改动的协同关系
+### 4.1 三处代码改动 + 一处恒成立逻辑的协同关系
 
-Proxy 认证 + 自定义登出页配置同时触发前后端**三处独立但互相配合**的逻辑分支：
+Proxy 认证 + 自定义登出页配置同时触发前后端**三处独立但互相配合**的逻辑分支，再结合 `expiresSoon` 的固有行为，共同完成过期令牌续签：
 
 | 位置 | 代码点 | 作用 |
 |------|-------|------|
 | 后端校验 | [`renewableErr()`](http/auth.go#L69-L83) | 过期 JWT 仍可通过校验，不返回 401 |
+| 后端刷新 | [`expiresSoon`](http/auth.go#L98) | 过期后恒为 `true`（负数 < 1h），触发 `X-Renew-Token: true` |
 | 前端解析 | [`parseToken()` early return](frontend/src/utils/auth.ts#L22-L25) | 禁用 JWT 自身的空闲登出计时器，交还给外部 SSO 管理 |
 | 前端登出 | [`logout()` redirect](frontend/src/utils/auth.ts#L127-L128) | 登出时跳转到外部 SSO 统一登出端点 |
+
+> **注意**：`renewHandler` 的形参名是 `tokenExpireTime`（无 'a'），与 `printToken` 的 `tokenExpirationTime`（有 'a'）不同，调用时需保持参数名一致：`printToken(..., tokenExpireTime)`。
 
 ### 4.2 为什么需要三处同时改动？
 
@@ -614,11 +627,11 @@ Proxy 认证 + 自定义登出页配置同时触发前后端**三处独立但互
                      ┌───────────────────────────────┐
   GET /api/...      │                               │
  ───────────────────→│  withUser 校验 JWT             │
-                     │    ├─ 未过期 → expiresSoon     │
-                     │    └─ 已过期 → renewableErr   │
-                     │        (三条件命中则放行)       │
-                     │    → updated 判断              │
-                     │    → 可能返回 X-Renew-Token    │
+                     │    ├─ 已过期 → renewableErr   │
+                     │    │    (三条件命中则放行)     │
+                     │    ├─ expiresSoon（过期恒 true）│
+                     │    └─ updated（双保险）        │
+                     │    → X-Renew-Token: true（几乎必发）│
                      │  fetchURL 检测到后 renew()     │
                      │    renewHandler 签发新 JWT     │
                      │    parseToken()（仍禁用计时）  │
@@ -679,8 +692,8 @@ Proxy 认证 + 自定义登出页配置同时触发前后端**三处独立但互
  │                                       │    │  └─ renewableErr 三条件 ?
  │                                       │    │       ├─ YES → ★ 放行
  │                                       │    │       └─ NO  → 401
- │                                       │    ├─ expiresSoon?
- │                                       │    └─ updated?
+ │                                       │    ├─ expiresSoon?（过期则恒 true）
+ │                                       │    └─ updated?（双保险）
  │←─ 200 + (可能 X-Renew-Token:true) ──│
  │                                       │
  │── detect X-Renew-Token:true           │

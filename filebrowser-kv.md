@@ -111,7 +111,7 @@ func (st usersBackend) GetBy(i interface{}) (user *users.User, err error) {
 4. `indexBucket.Get([]byte("admin"))` 得到数据 key `[1]`
 5. 用数据 key 从 `User` bucket 读取值并反序列化
 
-**无索引字段查询**：对 Password、Scope 等无索引字段调用 `db.One()` 会触发全 bucket 扫描（逐条反序列化后比较字段值），性能较差。
+**无索引字段查询**：对 Password、Scope 等无索引字段调用 `db.One()` 会触发 fallback 机制——storm 自动构造 `q.StrictEq(field, value)` Matcher 走全表扫描（逐条反序列化后比较字段值），功能可用但性能为 O(n)。
 
 ### 2.4 Save 时的索引更新
 
@@ -186,19 +186,57 @@ Bucket: "Link"
 
 #### 2.5.3 Prefix 查询的工作原理
 
-`db.Prefix("Path", "/a", &links)` 底层流程：
-1. 调用 `ListIndex.Prefix("/a", opts)`
-2. 生成前缀：`generatePrefix("/a")` → `"/a__"`
-3. 在 `IndexBucket` 上用 `Cursor().Seek("/a__")` 定位
-4. 前向扫描所有以 `"/a__"` 为前缀的 key
-5. 收集每个 key 对应的 value（数据 ID）
-6. 根据数据 ID 从主数据 bucket 读取完整记录并反序列化
+`db.Prefix("Path", "/a", &links)` 根据字段是否有索引，走两条不同的执行路径：
+
+**有索引字段（如 Path）：走索引前缀扫描**
+
+底层流程：
+1. 确认字段有 `index` 或 `unique` 标签
+2. 调用 `ListIndex.Prefix("/a", opts)` 或 `UniqueIndex.Prefix("/a", opts)`
+3. 生成前缀：`generatePrefix("/a")` → `"/a__"`（ListIndex）或直接 `"/a"`（UniqueIndex）
+4. 在 `IndexBucket` 上用 `Cursor().Seek(prefix)` 定位
+5. 前向扫描所有匹配前缀的 key
+6. 收集每个 key 对应的 value（数据 ID）
+7. 根据数据 ID 从主数据 bucket 读取完整记录并反序列化
 
 **时间复杂度**：O(k + m)，其中 k 是前缀匹配的索引条目数，m 是实际返回的记录数
 
-#### 2.5.4 Select 查询为什么不走索引
+**无索引字段：fallback 到正则全表扫描**
 
-`db.Select(q.Eq("Path", "/a")).Find(&v)` 不走索引的根本原因：
+如果字段没有索引标签，storm 会自动降级：
+1. 构造 `q.Re(fieldName, fmt.Sprintf("^%s", prefix))` 正则匹配器
+2. 走 `Select` + `Matcher` 的通用查询路径
+3. 全表遍历主数据 bucket → 反序列化 → 正则匹配 → 收集结果
+
+**时间复杂度**：O(n)，n 为总记录数，与 Select 查询相同
+
+#### 2.5.5 storm 查询的统一 fallback 机制
+
+根据 storm v3 源码核实，所有**直接指定字段名**的查询方法（`One`/`Find`/`Prefix`/`Range`）都有统一的 fallback 模式：
+
+```go
+field, ok := cfg.Fields[fieldName]
+if !ok || (!field.IsID && field.Index == "") {
+    // 无索引字段：构造对应的 Matcher，走全表扫描
+    query := newQuery(n, matcher)
+    // ...
+    return query.query(tx, sink)
+}
+// 有索引字段：走索引查询
+```
+
+各方法的 fallback 对应关系：
+
+| 方法 | 有索引 | 无索引 fallback |
+|------|--------|-----------------|
+| `One(field, val, &v)` | 索引 Get → 数据 Get | `q.StrictEq(field, val)` + Limit(1) → 全表扫描 |
+| `Find(field, val, &v)` | 索引 All → 逐条读数据 | `q.Eq(field, val)` → 全表扫描 |
+| `Prefix(field, prefix, &v)` | 索引 Prefix → 逐条读数据 | `q.Re(field, "^prefix")` → 正则全表扫描 |
+| `Range(field, min, max, &v)` | 索引 Range → 逐条读数据 | `q.And(q.Gte(field, min), q.Lte(field, max))` → 全表扫描 |
+
+**设计意图**：API 层面的透明降级，保证代码能正常运行，但性能从 O(log n) 下降到 O(n)。开发者需注意：**字段没有索引标签时，这些方法依然能工作，但实际是全表扫描**，容易产生性能误判。
+
+#### 2.5.6 Select 查询为什么不走索引
 
 1. **接口设计**：`q.Matcher` 接口定义为 `Match(interface{}) (bool, error)`，接收完整结构体实例，匹配逻辑在数据反序列化之后执行
 2. **通用匹配**：Matcher 可以是任意复杂逻辑（与、或、非、正则、字段间比较等），无法静态优化为索引查找
@@ -390,7 +428,10 @@ Bucket: "Link"                                                ← 主数据 buck
 | `All()` | `db.All(&v)` | ❌ 全表遍历 | O(n)，顺序扫描 |
 | `DeleteWithPathPrefix(prefix, uid)` | `db.Prefix("Path", prefix, &links)` | ✅ 走 Path 索引前缀扫描 | O(k)，k 为前缀匹配数量 |
 
-> **重要修正**：`db.Select(q.Eq("Path", value)).Find()` **不走索引**，即使 `Path` 字段有 `index` 标签。`Select` + `Matcher` 是通用查询机制，通过反射遍历每条记录并调用 `Matcher.Match()` 在内存中判断是否匹配，官方文档明确说明 "Doesn't use indexes"。只有 `One`、`Find`、`Prefix`、`Range`、`AllByIndex` 等**直接指定字段名的 API** 才会走索引。
+> **重要修正**：
+> 1. `db.Select(q.Eq("Path", value)).Find()` **不走索引**，即使 `Path` 字段有 `index` 标签。`Select` + `Matcher` 是通用查询机制，通过反射遍历每条记录并调用 `Matcher.Match()` 在内存中判断是否匹配，官方文档明确说明 "Doesn't use indexes"。
+> 2. `db.Prefix("Path", prefix, &links)` 在 Path 有索引时走索引前缀扫描；**如果字段没有索引，Prefix 会自动 fallback 到 `q.Re(field, "^prefix")` 正则全表扫描**，功能可用但性能降为 O(n)。
+> 3. 同理，`One`、`Find`、`Range` 等直接指定字段名的 API，在无索引字段上都会自动 fallback 到全表扫描，不会报错。只有 `AllByIndex` 严格要求索引存在。
 
 ### 4.4 DeleteWithPathPrefix 的两阶段过滤
 
@@ -494,17 +535,18 @@ func save(db *storm.DB, name string, from interface{}) error {
 
 封装于 [users.go](storage/bolt/users.go)、[share.go](storage/bolt/share.go)：
 
-| 上层调用 | storm API | bbolt 操作 | 事务类型 | 走索引？ |
-|----------|-----------|-----------|----------|----------|
-| `st.db.One("ID", 1, user)` | 按主键查 | `bucket.Get(idBytes)` + Unmarshal | 只读事务 | ✅ 主键天然索引 |
-| `st.db.One("Username", "admin", user)` | 按唯一索引查 | `__storm_index_Username` 嵌套索引子 bucket Get → 数据 bucket Get + Unmarshal | 只读事务 | ✅ 走唯一索引 |
-| `st.db.All(&allUsers)` | 全量遍历 | `bucket.Cursor()` 遍历所有键值 + 逐条 Unmarshal | 只读事务 | ❌ 全表扫描 |
-| `st.db.Save(user)` | 新增保存 | `bucket.NextSequence()` + `bucket.Put(seq, data)` + 更新所有索引 | 写事务 | — |
-| `st.db.UpdateField(user, "Password", val)` | 单字段更新 | 读取旧值 → 合并新字段值 → `bucket.Put` + 更新相关索引 | 写事务 | — |
-| `st.db.DeleteStruct(user)` | 删除实体 | `bucket.Delete(dataKey)` + 清除所有索引中的条目 | 写事务 | — |
-| `db.Find("Path", "/a", &links)` | 按索引查多条 | `__storm_index_Path` 列表索引子 bucket → 获取所有匹配 ID → 逐条读数据 | 只读事务 | ✅ 走索引 |
-| `db.Prefix("Path", "/a", &links)` | 前缀查询 | `__storm_index_Path` 索引子 bucket 的 `Cursor().Seek("/a__")` 前向扫描 | 只读事务 | ✅ 走索引 |
-| `db.Select(q.Eq("Path", "/a")).Find(&v)` | 条件查询 | 全表遍历 + `Matcher.Match()` 内存过滤 | 只读事务 | ❌ 全表扫描 |
+| 上层调用 | storm API | bbolt 操作 | 事务类型 | 有索引时 | 无索引时 |
+|----------|-----------|-----------|----------|----------|----------|
+| `st.db.One("ID", 1, user)` | 按主键查 | `bucket.Get(idBytes)` + Unmarshal | 只读事务 | ✅ 主键天然索引 | —（主键始终可用） |
+| `st.db.One("Username", "admin", user)` | 按唯一索引查 | `__storm_index_Username` 嵌套索引子 bucket Get → 数据 bucket Get + Unmarshal | 只读事务 | ✅ 走唯一索引 | ❌ fallback 到 `q.StrictEq` 全表扫描 |
+| `st.db.All(&allUsers)` | 全量遍历 | `bucket.Cursor()` 遍历所有键值 + 逐条 Unmarshal | 只读事务 | — | ❌ 全表扫描 |
+| `st.db.Save(user)` | 新增保存 | `bucket.NextSequence()` + `bucket.Put(seq, data)` + 更新所有索引 | 写事务 | — | — |
+| `st.db.UpdateField(user, "Password", val)` | 单字段更新 | 读取旧值 → 合并新字段值 → `bucket.Put` + 更新相关索引 | 写事务 | — | — |
+| `st.db.DeleteStruct(user)` | 删除实体 | `bucket.Delete(dataKey)` + 清除所有索引中的条目 | 写事务 | — | — |
+| `db.Find("Path", "/a", &links)` | 按索引查多条 | `__storm_index_Path` 列表索引子 bucket → 获取所有匹配 ID → 逐条读数据 | 只读事务 | ✅ 走索引 | ❌ fallback 到 `q.Eq` 全表扫描 |
+| `db.Prefix("Path", "/a", &links)` | 前缀查询 | `__storm_index_Path` 索引子 bucket 的 `Cursor().Seek("/a__")` 前向扫描 | 只读事务 | ✅ 走索引前缀扫描 | ❌ fallback 到 `q.Re("^prefix")` 正则全表扫描 |
+| `db.Range("ID", min, max, &items)` | 范围查询 | 索引 bucket 的范围扫描 → 逐条读数据 | 只读事务 | ✅ 走索引范围扫描 | ❌ fallback 到 `q.And(q.Gte, q.Lte)` 全表扫描 |
+| `db.Select(q.Eq("Path", "/a")).Find(&v)` | 条件查询 | 全表遍历 + `Matcher.Match()` 内存过滤 | 只读事务 | ❌ 全表扫描（不用索引） | ❌ 全表扫描 |
 
 ### 6.2 storm 的 codec 序列化
 
@@ -844,23 +886,27 @@ filebrowser.db
 
 ### 9.3 查询 API 与索引使用对照
 
-| storm API | 字段有索引 | 字段无索引 |
-|-----------|-----------|------------|
-| `One(field, value, &v)` | ✅ 走索引 | ❌ 全表扫描 |
-| `Find(field, value, &v)` | ✅ 走索引 | ❌ 全表扫描 |
-| `Prefix(field, prefix, &v)` | ✅ 走索引前缀扫描 | ❌ 错误（返回 ErrIdxNotFound） |
-| `Range(field, min, max, &v)` | ✅ 走索引范围扫描 | ❌ 错误 |
-| `All(&v)` | — | ❌ 全表扫描 |
-| `AllByIndex(field, &v)` | ✅ 按索引顺序遍历 | ❌ 错误 |
-| `Select(q.Eq(field, value)).Find(&v)` | ❌ 全表扫描 + 内存过滤 | ❌ 全表扫描 + 内存过滤 |
-| `Select(q.Re(field, regex)).Find(&v)` | ❌ 全表扫描 + 内存过滤 | ❌ 全表扫描 + 内存过滤 |
+| storm API | 字段有索引 | 字段无索引 | fallback 机制 |
+|-----------|-----------|------------|--------------|
+| `One(field, value, &v)` | ✅ 走索引 | ❌ 全表扫描 | `q.StrictEq(field, value)` + Limit(1) |
+| `Find(field, value, &v)` | ✅ 走索引 | ❌ 全表扫描 | `q.Eq(field, value)` |
+| `Prefix(field, prefix, &v)` | ✅ 走索引前缀扫描 | ❌ 全表扫描 | `q.Re(field, "^prefix")` 正则匹配 |
+| `Range(field, min, max, &v)` | ✅ 走索引范围扫描 | ❌ 全表扫描 | `q.And(q.Gte(field, min), q.Lte(field, max))` |
+| `All(&v)` | — | ❌ 全表扫描 | 直接遍历数据 bucket |
+| `AllByIndex(field, &v)` | ✅ 按索引顺序遍历 | ❌ 错误（返回 ErrIdxNotFound） | 无 fallback，要求必须有索引 |
+| `Select(q.Eq(field, value)).Find(&v)` | ❌ 全表扫描 + 内存过滤 | ❌ 全表扫描 + 内存过滤 | Matcher 始终在内存匹配 |
+| `Select(q.Re(field, regex)).Find(&v)` | ❌ 全表扫描 + 内存过滤 | ❌ 全表扫描 + 内存过滤 | Matcher 始终在内存匹配 |
 
-> **核心结论**：只有直接指定字段名的查询方法（`One`/`Find`/`Prefix`/`Range`/`AllByIndex`）才会利用索引。`Select` + `Matcher` 的通用查询机制**始终是全表扫描 + 内存过滤**，即使匹配的字段有索引也不会利用。storm 官方文档明确说明 Select "Doesn't use indexes"。
+> **核心结论修正**：
+> 1. **`One`/`Find`/`Prefix`/`Range` 在无索引字段上不会报错**，而是自动 fallback 到全表扫描 + 对应的 Matcher 匹配
+> 2. 只有 `AllByIndex` 严格要求索引存在，无索引时返回 `ErrIdxNotFound` 错误
+> 3. `Select` + `Matcher` 的通用查询机制**始终是全表扫描 + 内存过滤**，即使匹配的字段有索引也不会利用。storm 官方文档明确说明 Select "Doesn't use indexes"
 
 **原理佐证**：
 - `q.Matcher` 接口定义了 `Match(interface{}) (bool, error)` 方法，接收结构体实例进行匹配，说明匹配发生在数据反序列化之后
 - `Select` 不接受字段名参数，无法直接定位到某个索引
-- 索引查询（One/Find/Prefix 等）直接与 `index.UniqueIndex` 或 `index.ListIndex` 交互，通过索引 bucket 的 B+Tree 快速定位
+- 索引查询（One/Find/Prefix 等）在入口处检查 `field.Index == ""`，为空则构造对应的 Matcher 走通用查询路径
+- 统一 fallback 模式的设计意图：API 透明降级，保证功能可用，但性能从 O(log n) 下降到 O(n)，容易产生性能误判
 
 ### 9.4 数据库初始化与连接
 

@@ -290,7 +290,7 @@ func printToken(w http.ResponseWriter, _ *http.Request, d *data, user *users.Use
 | 层级 | 执行时机 | 函数/位置 | 剥离内容 | 剥离对象 |
 |------|----------|-----------|----------|----------|
 | 第 1 层 | 最外层，进入 mux.Router 之前 | [http.go#L93](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/http.go#L93) `stripPrefix(server.BaseURL, r)` | 应用基础路径 BaseURL（如 `/files`） | 全局所有请求 |
-| 第 2 层 | mux.Router 匹配后，进入业务 handler 之前 | [data.go#L100](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/data.go#L100) `stripPrefix(prefix, handler)` | 路由注册前缀（如 `/api/resources`） | 单个路由组 |
+| 第 2 层 | mux.Router 匹配后，进入业务 handler 之前 | [data.go#L100](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/data.go#L100) `stripPrefix(prefix, handler)` | 路由注册前缀（如 `/api/resources` 无尾斜杠 → 结果带 `/`；如 `/static/` 有尾斜杠 → 结果无 `/`） | 单个路由组 |
 | 第 3 层 | 分享场景中，进入业务逻辑前 | [public.go#L70](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/public.go#L70) `files.NewScopedFs` + `checkerPrefix` | 分享根路径（如 `/docs/share/`） | 分享场景的文件系统路径 |
 
 ### 3.2 代码层面的精确执行顺序
@@ -317,33 +317,70 @@ api.PathPrefix("/resources").Handler(
 
 ### 3.3 实际请求路径变换示例
 
-假设配置：
-- `server.BaseURL = "/app"`
-- 请求 URL: `http://host/app/api/resources/docs/report.pdf`
+**核心区别**：prefix 是否带末尾斜杠，决定了剥离后路径是否带前导斜杠。
 
-#### 变换过程
+- API 路由 prefix **不带末尾斜杠**（如 `"/api/resources"`）→ 剥离后路径**带前导斜杠**
+- 静态资源 prefix **带末尾斜杠**（如 `"/static/"`）→ 剥离后路径**无前导斜杠**
+- public 分享 prefix **带末尾斜杠**（如 `"/api/public/dl/"`）→ 剥离后路径**无前导斜杠**
+
+#### 示例 A：API 资源路由（prefix 无末尾斜杠 → 带前导斜杠）
+
+配置：`server.BaseURL = "/app"`，请求 URL: `http://host/app/api/resources/docs/report.pdf`
 
 ```
-原始 URL.Path (进入 Go net/http 时):
+原始 URL.Path:
     /app/api/resources/docs/report.pdf
 
-─────────────── 第 1 层剥离: stripPrefix("/app", r) ───────────────
-传入 mux.Router 的 URL.Path:
+─────────────── 第 1 层剥离: stripPrefix("/app") ───────────────
     /api/resources/docs/report.pdf
 
-    mux.Router 匹配: PathPrefix("/api/resources") 匹配成功
-    → 调用 monkey 返回的 http.Handler
+    mux.Router 匹配: PathPrefix("/api/resources") 成功
 
-─────────────── 第 2 层剥离: stripPrefix("/api/resources", handler) ───────────────
-传入 handle 内 HandlerFunc 的 URL.Path:
-    /docs/report.pdf
-
-    handle 调用: fn(w, r, &data{...})  → 即 resourceGetHandler
-    (withUser 包装的业务 handler 接收的 r.URL.Path 就是这个值)
+─────────────── 第 2 层剥离: stripPrefix("/api/resources") ───────────────
+    prefix = "/api/resources"（无末尾斜杠）
+    TrimPrefix("/api/resources/docs/report.pdf", "/api/resources")
+    = "/docs/report.pdf"              ← 带前导斜杠
 
 ─────────────── 业务 handler 内部 ───────────────
-resourceGetHandler 内看到的路径: /docs/report.pdf
-→ d.user.Fs.Open("/docs/report.pdf")  // 直接用，已经是相对用户根路径
+    resourceGetHandler 内 r.URL.Path = "/docs/report.pdf"
+    → d.user.Fs.Open("/docs/report.pdf")  // 用户文件系统，路径带 / 正常工作
+```
+
+#### 示例 B：静态资源路由（prefix 有末尾斜杠 → 无前导斜杠）
+
+配置：`server.BaseURL = ""`，请求 URL: `GET /static/js/app.js`
+
+```
+原始 URL.Path:
+    /static/js/app.js
+
+─────────────── 第 1 层剥离: stripPrefix("") ───────────────
+    /static/js/app.js（无变化）
+
+    mux.Router 匹配: PathPrefix("/static") 成功
+
+─────────────── 第 2 层剥离: stripPrefix("/static/") ───────────────
+    prefix = "/static/"（有末尾斜杠）
+    TrimPrefix("/static/js/app.js", "/static/")
+    = "js/app.js"                      ← 无前导斜杠
+
+─────────────── 业务 handler 内部 ───────────────
+    static handler 内 r.URL.Path = "js/app.js"
+    → assetsFs.Open("js/app.js.gz")    // fs.FS 要求无前导斜杠，正常工作
+```
+
+#### 示例 C：public 分享路由（prefix 有末尾斜杠 → 无前导斜杠）
+
+请求 URL: `GET /api/public/share/abc123/docs/readme.md`
+
+```
+─────────────── 第 2 层剥离: stripPrefix("/api/public/share/") ───────────────
+    prefix = "/api/public/share/"（有末尾斜杠）
+    TrimPrefix("/api/public/share/abc123/docs/readme.md", "/api/public/share/")
+    = "abc123/docs/readme.md"          ← 无前导斜杠
+
+─────────────── withHashFile 内部 ───────────────
+    解析 "abc123" 为分享 ID，剩余路径 "docs/readme.md"
 ```
 
 ### 3.4 stripPrefix 的内部实现
@@ -390,7 +427,7 @@ r.PathPrefix("/static").Handler(static)   // static 内部带 stripPrefix("/stat
 r.NotFoundHandler = index                 // index 无内部前缀剥离
 ```
 
-- `/static` 路由：进入 `getStaticHandlers` 返回的 `static` handler，其内部的 `handle` 包装又会执行 `stripPrefix("/static/", ...)`，所以业务 handler 看到的是相对路径（如 `/js/app.js`）
+- `/static` 路由：进入 `getStaticHandlers` 返回的 `static` handler，其内部的 `handle` 包装又会执行 `stripPrefix("/static/", ...)`，所以业务 handler 看到的是无前导斜杠的相对路径（如 `js/app.js`、`css/app.css`）
 - `NotFoundHandler`：所有未匹配的请求都走 SPA 的 `index` handler，**不会剥离任何前缀**，因为注册时传给 `handle` 的 prefix 是 `""`
 
 ---
@@ -662,6 +699,8 @@ for s.Scan() {
 
 [commands.go#L41-L120](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/commands.go#L41-L120) 内共有 **13 个** 错误分支点。以 `upgrader.Upgrade`（L42）为界，严格区分升级前和升级后：
 
+> **注意**：5.1 节列出了调用链上 3 个升级前错误点（settings 加载、withUser JWT、upgrader.Upgrade），其中前两个在 commandsHandler 函数体之外。本表仅统计 commandsHandler **函数体内**的 13 个分支，其中 L42 是唯一的升级前错误点。
+
 #### 升级前（HTTP 阶段）— 共 1 个，走 handle 统一 HTTP 出口
 
 | 行号 | 错误点 | 返回值 | 实际错误出口 |
@@ -816,6 +855,8 @@ static = handle(func(w http.ResponseWriter, r *http.Request, d *data) (int, erro
 ### 6.4 完整路径变换示例（每一步 r.URL.Path 的精确值）
 
 请求 URL：`GET /static/js/app.js`，假设 `server.BaseURL = ""`。
+
+因为 static 路由的 prefix 是 `"/static/"`（**有末尾斜杠**），剥离后路径为**无前导斜杠的相对路径**——这与 API 路由（prefix 无末尾斜杠 → 剥离后带前导斜杠）形成对比（见 3.3 节）。
 
 下面是每一层处理后 `r.URL.Path` 的精确值：
 

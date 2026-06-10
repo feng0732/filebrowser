@@ -563,160 +563,148 @@ export default function command(url, command, onmessage, onclose) {
 
 ## 五、输出返回与错误处理链路（代码核准）
 
-### 5.1 返回值的传递机制
+### 5.1 响应写入机制与状态码模式
 
-所有 HTTP handler 函数签名为 `func(w, r, d) (int, error)`，返回值由 [handle()](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/http/data.go#L66-L101) 中间件统一处理：
+所有 HTTP handler 函数签名为 `func(w, r, d) (int, error)`，返回值由 [handle()](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/http/data.go#L66-L101) 中间件统一处理。
+
+#### 两种响应模式
+
+| 模式 | handler 返回 | handle() 行为 | 典型场景 |
+|------|-------------|--------------|---------|
+| **JSON 模式** | `(0, nil)` | 不调用 `http.Error`，handler 自行写响应体 | settings 查询、用户信息获取等 |
+| **状态码模式** | `(status, err)` 且 `status != 0` | 调用 `http.Error(w, status_text, status)` 写响应 | 所有资源操作（增删改）、所有错误返回 |
+
+**状态码模式的处理逻辑**（[data.go:85-97](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/http/data.go#L85-L97)）：
 
 ```go
-// data.go:78-97
-status, err := fn(w, r, &data{...})
-
 if status >= 400 || err != nil {
-    log.Printf("%s: %v %s %v", r.URL.Path, status, clientIP, err)
+    log.Printf("%s: %v %s %v", r.URL.Path, status, clientIP, err)   // 打印日志
 }
 
 if status != 0 {
     txt := http.StatusText(status)
     if status == http.StatusBadRequest && err != nil {
-        txt += " (" + err.Error() + ")"
+        txt += " (" + err.Error() + ")"                              // 仅 400 追加 err 详情
     }
-    http.Error(w, strconv.Itoa(status)+" "+txt, status)
+    http.Error(w, strconv.Itoa(status)+" "+txt, status)              // 写响应
     return
 }
-// status == 0 时不写任何错误响应，handler 自行写正常响应
 ```
 
-**关键逻辑**：
-- `status != 0` → 写 HTTP 错误响应（`http.Error` 会设置 Content-Type 和 body）
-- `status == 0` → 不写错误响应，handler 自行处理正常响应体
-- `err != nil` 且 `status >= 400` → 打印日志（但日志不影响响应内容，只用于服务端排查）
-- **handler 返回的 status 决定了一切**，err 只影响日志和 400 状态码的 body 细节
+**关键规则**：
+- **status 决定一切**：只要 `status != 0` 就走 `http.Error`，与 err 是否为 nil 无关
+- **err 仅影响日志和 400 body**：err != nil 且 status >= 400 时打日志；只有 400 状态码会把 err 内容追加到响应 body
+- **所有资源操作都是状态码模式**：删除/上传/保存/复制/重命名/分片上传都返回非 0 status
 
 ---
 
-### 5.2 各操作成功时的完整返回链路
+### 5.2 各操作成功时的响应与状态码
 
-所有操作的成功返回都遵循统一流程：
-1. handler 返回 `(status, nil)`
-2. [handle()](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/http/data.go#L78-L97) 中间件检查 `status != 0` → 为 true
-3. 调用 `http.Error(w, strconv.Itoa(status)+" "+http.StatusText(status), status)` 写入响应
+所有资源操作成功时都走 **状态码模式**（`http.Error`），区别仅在于 status 是 200 还是 204。
 
-也就是说，**成功时也走 `http.Error` 分支**，response body 会包含形如 `"200 OK"` / `"204 No Content"` 的文本字符串，而不是空 body。handler 内部设置的 header（如 ETag、Upload-Offset）仍会出现在响应中。
+#### 成功状态码汇总
 
----
+| 操作 | HTTP 方法 | 成功 status | handler 中的返回 |
+|------|----------|-----------|-----------------|
+| **普通上传** | POST | `200 OK` | `errToStatus(nil)` → 200 |
+| **保存** | PUT | `200 OK` | `errToStatus(nil)` → 200 |
+| **删除** | DELETE | `204 No Content` | `http.StatusNoContent` → 204 |
+| **复制** | PATCH | `200 OK` | `errToStatus(nil)` → 200 |
+| **重命名** | PATCH | `200 OK` | `errToStatus(nil)` → 200 |
+| **分片上传** | PATCH (TUS) | `204 No Content` | `http.StatusNoContent` → 204 |
 
-#### 🔹 普通上传（POST）成功
+#### 200 OK 响应的完整链路（以上传/保存为例）
 
 ```go
-// resource.go:161-176
-err = d.RunHook(fn, "upload", ..., d.user)
-// err == nil → 不执行 RemoveAll 回滚
-return errToStatus(nil), nil    // → (200, nil)
+// resource.go:161-176  POST 上传
+err = d.RunHook(fn, "upload", ..., d.user)   // err == nil
+return errToStatus(err), err                  // → (200, nil)
 ```
 
-| 环节 | 值 |
-|------|---|
+| 环节 | 具体内容 |
+|------|---------|
 | handler 返回 | `(200, nil)` |
-| handle() 处理 | `status != 0` → `http.Error(w, "200 OK", 200)` |
-| 最终响应 | HTTP 200 + body `"200 OK"` + ETag header |
-| 文件状态 | 已创建 |
+| handle() 判断 | `status != 0` → true → 走 `http.Error` |
+| `http.Error` 行为 | 1. 设置 `Content-Type: text/plain; charset=utf-8`<br>2. 设置 `X-Content-Type-Options: nosniff`<br>3. `WriteHeader(200)`<br>4. `Write([]byte("200 OK\n"))` |
+| 最终响应 | HTTP 200 + body `"200 OK\n"` + ETag header |
+| 响应体语义 | 纯文本状态码描述，**不包含业务数据** |
 
-**关键代码**：`fn()` 中已通过 `w.Header().Set("ETag", etag)` 设置 ETag 头（[resource.go:167-168](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/http/resource.go#L167-L168)）。
+> **注意**：handler 内部 `fn()` 中通过 `w.Header().Set("ETag", etag)` 设置的 ETag 头会保留，因为 header 设置在 `WriteHeader` 之前均有效。
 
----
-
-#### 🔹 保存（PUT）成功
-
-```go
-// resource.go:198-209
-err = d.RunHook(fn, "save", ..., d.user)
-return errToStatus(nil), nil    // → (200, nil)
-```
-
-| 环节 | 值 |
-|------|---|
-| handler 返回 | `(200, nil)` |
-| handle() 处理 | `http.Error(w, "200 OK", 200)` |
-| 最终响应 | HTTP 200 + body `"200 OK"` + ETag header |
-| 文件状态 | 已覆写 |
-
----
-
-#### 🔹 删除（DELETE）成功
+#### 204 No Content 响应的完整链路（以删除/分片上传为例）
 
 ```go
-// resource.go:113-119
-err = d.RunHook(fn, "delete", ..., d.user)
-if err != nil {
-    return errToStatus(err), err
-}
-return http.StatusNoContent, nil    // → (204, nil)
+// resource.go:113-119  DELETE 删除
+err = d.RunHook(fn, "delete", ..., d.user)   // err == nil
+return http.StatusNoContent, nil              // → (204, nil)
 ```
 
-| 环节 | 值 |
-|------|---|
+| 环节 | 具体内容 |
+|------|---------|
 | handler 返回 | `(204, nil)` |
-| handle() 处理 | `http.Error(w, "204 No Content", 204)` |
-| 最终响应 | HTTP 204 + body `"204 No Content"` |
-| 文件状态 | 已删除 |
+| handle() 判断 | `status != 0` → true → 走 `http.Error` |
+| `http.Error` 行为 | 尝试写入 `"204 No Content\n"` body，但 HTTP 规范规定 204 无 body，实际传输时 body 会被 Go net/http 忽略 |
+| 最终响应 | HTTP 204 + 无 body + 无 Content-Length |
+| 响应体语义 | 操作成功，无返回内容 |
 
 ---
 
-#### 🔹 复制/重命名（PATCH）成功
+### 5.3 分片上传钩子失败不传播的本质
+
+分片上传（TUS PATCH）是唯一**不将钩子错误传播到响应**的操作。
+
+#### 代码位置
+
+[tus_handlers.go:229-237](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/http/tus_handlers.go#L229-L237)
 
 ```go
-// resource.go:256-261
-err = d.RunHook(fn, action, ..., d.user)
-return errToStatus(nil), nil    // → (200, nil)
-```
-
-| 环节 | 值 |
-|------|---|
-| handler 返回 | `(200, nil)` |
-| handle() 处理 | `http.Error(w, "200 OK", 200)` |
-| 最终响应 | HTTP 200 + body `"200 OK"` |
-| 文件状态 | 已复制 / 已重命名 |
-
----
-
-#### 🔹 分片上传（TUS PATCH）成功
-
-```go
-// tus_handlers.go:229-237
 w.Header().Set("Upload-Offset", strconv.FormatInt(newOffset, 10))
 
 if newOffset >= uploadLength {
     cache.Complete(file.RealPath())
-    _ = d.RunHook(func() error { return nil }, "upload", ..., d.user)  // 返回值被丢弃
+    _ = d.RunHook(func() error { return nil }, "upload", r.URL.Path, "", d.user)
 }
 
-return http.StatusNoContent, nil    // → (204, nil)，无条件执行
+return http.StatusNoContent, nil    // 无条件执行
 ```
 
-**完整上传完成时**（`newOffset >= uploadLength`）：
+#### 三层因果关系
 
-| 环节 | 值 |
-|------|---|
-| RunHook 返回 | 被 `_` 丢弃，不影响任何逻辑 |
-| handler 返回 | `(204, nil)` |
-| handle() 处理 | `http.Error(w, "204 No Content", 204)` |
-| 最终响应 | HTTP 204 + body `"204 No Content"` + Upload-Offset header |
-| 文件状态 | 已写入完成，缓存已标记 Complete |
+```
+钩子命令执行失败（exit code != 0）
+    │
+    ▼
+RunHook() 返回 exec.ExitError
+    │
+    ▼
+_ = RunHook()  →  错误被丢弃，err 变量不受影响
+    │
+    ▼
+return http.StatusNoContent, nil  →  始终返回 (204, nil)
+    │
+    ▼
+handle() 中 status = 204 → http.Error(204)
+    │
+    ▼
+客户端收到 HTTP 204，完全感知不到钩子失败
+```
 
-**中间分片时**（`newOffset < uploadLength`）：
+#### 与普通上传（POST）的对比
 
-| 环节 | 值 |
-|------|---|
-| RunHook | 不触发 |
-| handler 返回 | `(204, nil)` |
-| 最终响应 | HTTP 204 + body `"204 No Content"` + Upload-Offset header |
-| 文件状态 | 数据追加写入 |
+| 维度 | 普通上传（POST） | 分片上传（TUS PATCH） |
+|------|----------------|---------------------|
+| RunHook 返回值处理 | 赋值给 `err` 变量 | 用 `_` 丢弃 |
+| 钩子失败 → err | err != nil | err 仍为 nil（不受影响） |
+| 钩子失败 → status | errToStatus(err) → 500 | 恒为 204 |
+| 钩子失败 → 响应 | 500 Internal Server Error | 204 No Content |
+| 钩子失败 → 文件 | after 失败会触发 RemoveAll 删除 | 文件已写入，不受影响 |
+| 钩子输出去向 | 服务器日志 | 服务器日志 |
 
-**⚠️ 重要**：无论 before_upload / after_upload 钩子是否成功执行，客户端始终收到 HTTP 204。钩子命令的 stdout/stderr 仍会输出到服务器日志（[runner.go:99-101](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/runner/runner.go#L99-L101)），但失败不会传播到客户端。
+> **统一理解**：钩子命令的 stdout/stderr 永远输出到服务器日志（`os.Stdout`/`os.Stderr`）。区别仅在于——钩子命令的**退出码（exit code）是否会影响 HTTP 响应**。普通上传会影响（通过 err 传播 → errToStatus → 500），分片上传不会（`_` 丢弃了 error）。
 
 ---
 
-### 5.3 RunHook 中 before 和 after 命令失败的返回差异
+### 5.4 RunHook 中 before 和 after 命令失败的返回差异
 
 [RunHook](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/runner/runner.go#L21-L53) 的完整逻辑：
 
@@ -774,7 +762,7 @@ func (r *Runner) RunHook(fn func() error, evt, path, dst string, user *users.Use
 
 ---
 
-### 5.4 各操作的错误返回完整链路（代码逐行核准）
+### 5.5 各操作的错误返回完整链路（代码逐行核准）
 
 #### 🔹 删除（DELETE）—— before/after 失败
 
@@ -917,7 +905,7 @@ return http.StatusNoContent, nil                    // ← 无论钩子成败都
 
 ---
 
-### 5.5 非阻塞命令（`&` 后缀）的失败行为
+### 5.6 非阻塞命令（`&` 后缀）的失败行为
 
 [exec()](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/runner/runner.go#L55-L118) 中非阻塞模式的关键逻辑：
 
@@ -953,7 +941,7 @@ if !blocking {
 
 ---
 
-### 5.6 errToStatus 映射表
+### 5.7 errToStatus 映射表
 
 [errToStatus](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/http/utils.go#L30-L51) 函数将不同错误类型映射为 HTTP 状态码：
 
@@ -984,7 +972,7 @@ func errToStatus(err error) int {
 
 ---
 
-### 5.7 交互式 Shell 的输出返回
+### 5.8 交互式 Shell 的输出返回
 
 ```
        commandsHandler (WebSocket)
@@ -1034,7 +1022,7 @@ commands(
 
 ---
 
-### 5.8 关键差异总结表
+### 5.9 关键差异总结表
 
 | 操作 | before 失败 → 文件状态 | after 失败 → 文件状态 | 失败回滚 | 成功状态码 | 失败状态码 |
 |------|----------------------|---------------------|---------|----------|----------|

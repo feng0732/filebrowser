@@ -714,49 +714,53 @@ i18n.global.t("buttons.reportIssue")
 
 国际化系统涉及三个独立的"语言代码"来源，它们之间存在不一致甚至冲突。本节逐一拆解。
 
-### 12.1 五层数据对照表
+### 12.1 全量数据对照表（5 个语言链路维度 + 2 个 RTL 样式维度）
 
-| 语言代码 | 资源文件(JSON) | detectLocale返回 | Languages下拉key | dayjs加载 | RTL列表 | 完整可达 |
-|---------|:---:|:---:|:---:|:---:|:---:|:---:|
-| ar | ✅ ar.json | ✅ "ar" | ✅ "ar" | ✅ ar | ✅ 是 | ✅ 是 |
-| bg | ✅ bg.json | ✅ "bg" | ✅ "bg" | ✅ bg | ❌ | ✅ 是 |
-| ca | ✅ ca.json | ❌ 无分支→en | ✅ "ca" | ✅ ca | ❌ | ⚠️ 仅手动 |
-| cs | ✅ cs.json | ✅ "cs" | ✅ "cs" | ✅ cs | ❌ | ✅ 是 |
-| de | ✅ de.json | ✅ "de" | ✅ "de" | ✅ de | ❌ | ✅ 是 |
-| el | ✅ el.json | ✅ "el" | ✅ "el" | ✅ el | ❌ | ✅ 是 |
-| en | ✅ en.json | ✅ "en" | ✅ "en" | ✅ en | ❌ | ✅ 是 |
-| es | ✅ es.json | ✅ "es" | ✅ "es" | ✅ es | ❌ | ✅ 是 |
-| **fa** | ✅ fa.json | ❌ 无分支→en | ❌ 不存在 | ❌ 未加载 | ❌ 不在列表 | ❌ 完全不可达 |
-| fr | ✅ fr.json | ✅ "fr" | ✅ "fr" | ✅ fr | ❌ | ✅ 是 |
-| he | ✅ he.json | ✅ "he" | ✅ "he" | ✅ he | ✅ 是 | ✅ 是 |
-| hr | ✅ hr.json | ✅ "hr" | ✅ "hr" | ✅ hr | ❌ | ✅ 是 |
-| hu | ✅ hu.json | ✅ "hu" | ✅ "hu" | ✅ hu | ❌ | ✅ 是 |
-| is | ✅ is.json | ✅ "is" | ✅ "is" | ✅ is | ❌ | ✅ 是 |
-| it | ✅ it.json | ✅ "it" | ✅ "it" | ✅ it | ❌ | ✅ 是 |
-| ja | ✅ ja.json | ✅ "ja" | ✅ "ja" | ✅ ja | ❌ | ✅ 是 |
-| ko | ✅ ko.json | ✅ "ko" | ✅ "ko" | ✅ ko | ❌ | ✅ 是 |
-| lv | ✅ lv.json | ✅ "lv" | ✅ "lv" | ✅ lv | ❌ | ✅ 是 |
-| nl | ✅ nl.json | ✅ "nl" | ✅ "nl" | ✅ nl | ❌ | ✅ 是 |
-| **nl-be** | ✅ nl-be.json | ⚠️ 被nl截断 | ✅ "nl-be" | ✅ nl-be | ❌ | ⚠️ 仅手动 |
-| no | ✅ no.json | ✅ "no"(nb/no) | ✅ "no" | ⚠️ 加载了nb（代码不匹配） | ❌ | ⚠️ 日期不本地化 |
-| pl | ✅ pl.json | ✅ "pl" | ✅ "pl" | ✅ pl | ❌ | ✅ 是 |
-| **pt** | ✅ pt.json | ⚠️ 映射到pt-pt | ❌ 不存在 | ✅ pt | ❌ | ❌ 不可达（冗余） |
-| pt-br | ✅ pt-br.json | ✅ "pt-br" | ✅ "pt-br" | ✅ pt-br | ❌ | ✅ 是 |
-| pt-pt | ✅ pt-pt.json | ✅ "pt-pt" | ✅ "pt-pt" | ⚠️ 加载了pt（代码不匹配） | ❌ | ⚠️ 日期不本地化 |
-| ro | ✅ ro.json | ✅ "ro" | ✅ "ro" | ✅ ro | ❌ | ✅ 是 |
-| ru | ✅ ru.json | ✅ "ru" | ✅ "ru" | ✅ ru | ❌ | ✅ 是 |
-| sk | ✅ sk.json | ✅ "sk" | ✅ "sk" | ✅ sk | ❌ | ✅ 是 |
-| **sv-se** | ✅ sv-se.json | ⚠️ 返回"sv"不匹配 | ✅ "sv-se" | ✅ sv(而非sv-se) | ❌ | ⚠️ 复杂错位 |
-| tr | ✅ tr.json | ✅ "tr" | ✅ "tr" | ✅ tr | ❌ | ✅ 是 |
-| uk | ✅ uk.json | ✅ "uk" | ✅ "uk" | ✅ uk | ❌ | ✅ 是 |
-| vi | ✅ vi.json | ✅ "vi" | ✅ "vi" | ✅ vi | ❌ | ✅ 是 |
-| zh-cn | ✅ zh-cn.json | ✅ "zh-cn" | ✅ "zh-cn" | ✅ zh-cn | ❌ | ✅ 是 |
-| zh-tw | ✅ zh-tw.json | ✅ "zh-tw" | ✅ "zh-tw" | ✅ zh-tw | ❌ | ✅ 是 |
+**列说明**：第 1 列是语言代码（索引），第 2-6 列是 5 个语言链路维度（资源、检测、下拉、dayjs、RTL列表），第 7-8 列是 2 个 RTL 样式维度，最后 1 列是综合可达性评估。
 
-**可达性说明**：
-- ✅ 是：浏览器自动检测 + 手动下拉 + dayjs本地化 + RTL(如适用) 全部正常
-- ⚠️ 部分：某个环节存在缺陷但仍可部分使用
+| 语言代码 | 资源文件(JSON) | detectLocale返回 | Languages下拉key | dayjs加载 | RTL列表 | html[dir]样式(24处) | body.rtl样式(2处) | 完整可达 |
+|---------|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| ar | ✅ ar.json | ✅ "ar" | ✅ "ar" | ✅ ar | ✅ 是 | ✅ 生效 | ❌ 不匹配（死代码） | ⚠️ 基本正常（2处RTL样式不生效） |
+| bg | ✅ bg.json | ✅ "bg" | ✅ "bg" | ✅ bg | ❌（非RTL） | N/A | N/A | ✅ 是 |
+| ca | ✅ ca.json | ❌ 无分支→en | ✅ "ca" | ✅ ca | ❌（非RTL） | N/A | N/A | ⚠️ 仅手动，不可自动检测 |
+| cs | ✅ cs.json | ✅ "cs" | ✅ "cs" | ✅ cs | ❌（非RTL） | N/A | N/A | ✅ 是 |
+| de | ✅ de.json | ✅ "de" | ✅ "de" | ✅ de | ❌（非RTL） | N/A | N/A | ✅ 是 |
+| el | ✅ el.json | ✅ "el" | ✅ "el" | ✅ el | ❌（非RTL） | N/A | N/A | ✅ 是 |
+| en | ✅ en.json | ✅ "en" | ✅ "en" | ✅ en | ❌（非RTL） | N/A | N/A | ✅ 是 |
+| es | ✅ es.json | ✅ "es" | ✅ "es" | ✅ es | ❌（非RTL） | N/A | N/A | ✅ 是 |
+| **fa** | ✅ fa.json | ❌ 无分支→en | ❌ 不存在 | ❌ 未加载 | ❌ 不在列表 | ❌ dir=ltr（应为rtl） | ❌ 不匹配 | ❌ 完全不可达 |
+| fr | ✅ fr.json | ✅ "fr" | ✅ "fr" | ✅ fr | ❌（非RTL） | N/A | N/A | ✅ 是 |
+| he | ✅ he.json | ✅ "he" | ✅ "he" | ✅ he | ✅ 是 | ✅ 生效 | ❌ 不匹配（死代码） | ⚠️ 基本正常（2处RTL样式不生效） |
+| hr | ✅ hr.json | ✅ "hr" | ✅ "hr" | ✅ hr | ❌（非RTL） | N/A | N/A | ✅ 是 |
+| hu | ✅ hu.json | ✅ "hu" | ✅ "hu" | ✅ hu | ❌（非RTL） | N/A | N/A | ✅ 是 |
+| is | ✅ is.json | ✅ "is" | ✅ "is" | ✅ is | ❌（非RTL） | N/A | N/A | ✅ 是 |
+| it | ✅ it.json | ✅ "it" | ✅ "it" | ✅ it | ❌（非RTL） | N/A | N/A | ✅ 是 |
+| ja | ✅ ja.json | ✅ "ja" | ✅ "ja" | ✅ ja | ❌（非RTL） | N/A | N/A | ✅ 是 |
+| ko | ✅ ko.json | ✅ "ko" | ✅ "ko" | ✅ ko | ❌（非RTL） | N/A | N/A | ✅ 是 |
+| lv | ✅ lv.json | ✅ "lv" | ✅ "lv" | ✅ lv | ❌（非RTL） | N/A | N/A | ✅ 是 |
+| nl | ✅ nl.json | ✅ "nl" | ✅ "nl" | ✅ nl | ❌（非RTL） | N/A | N/A | ✅ 是 |
+| **nl-be** | ✅ nl-be.json | ⚠️ 被nl截断 | ✅ "nl-be" | ✅ nl-be | ❌（非RTL） | N/A | N/A | ⚠️ 仅手动，自动检测时用nl |
+| no | ✅ no.json | ✅ "no"(nb/no) | ✅ "no" | ⚠️ 加载了nb（代码不匹配） | ❌（非RTL） | N/A | N/A | ⚠️ 日期不本地化 |
+| pl | ✅ pl.json | ✅ "pl" | ✅ "pl" | ✅ pl | ❌（非RTL） | N/A | N/A | ✅ 是 |
+| **pt** | ✅ pt.json | ⚠️ 映射到pt-pt | ❌ 不存在 | ✅ pt | ❌（非RTL） | N/A | N/A | ❌ 不可达（冗余文件） |
+| pt-br | ✅ pt-br.json | ✅ "pt-br" | ✅ "pt-br" | ✅ pt-br | ❌（非RTL） | N/A | N/A | ✅ 是 |
+| pt-pt | ✅ pt-pt.json | ✅ "pt-pt" | ✅ "pt-pt" | ⚠️ 加载了pt（代码不匹配） | ❌（非RTL） | N/A | N/A | ⚠️ 日期不本地化 |
+| ro | ✅ ro.json | ✅ "ro" | ✅ "ro" | ✅ ro | ❌（非RTL） | N/A | N/A | ✅ 是 |
+| ru | ✅ ru.json | ✅ "ru" | ✅ "ru" | ✅ ru | ❌（非RTL） | N/A | N/A | ✅ 是 |
+| sk | ✅ sk.json | ✅ "sk" | ✅ "sk" | ✅ sk | ❌（非RTL） | N/A | N/A | ✅ 是 |
+| **sv-se** | ✅ sv-se.json | ⚠️ 返回"sv"不匹配 | ✅ "sv-se" | ✅ sv(而非sv-se) | ❌（非RTL） | N/A | N/A | ⚠️ 复杂错位 |
+| tr | ✅ tr.json | ✅ "tr" | ✅ "tr" | ✅ tr | ❌（非RTL） | N/A | N/A | ✅ 是 |
+| uk | ✅ uk.json | ✅ "uk" | ✅ "uk" | ✅ uk | ❌（非RTL） | N/A | N/A | ✅ 是 |
+| vi | ✅ vi.json | ✅ "vi" | ✅ "vi" | ✅ vi | ❌（非RTL） | N/A | N/A | ✅ 是 |
+| zh-cn | ✅ zh-cn.json | ✅ "zh-cn" | ✅ "zh-cn" | ✅ zh-cn | ❌（非RTL） | N/A | N/A | ✅ 是 |
+| zh-tw | ✅ zh-tw.json | ✅ "zh-tw" | ✅ "zh-tw" | ✅ zh-tw | ❌（非RTL） | N/A | N/A | ✅ 是 |
+
+**可达性说明**（按 5 个语言链路维度 + 2 个 RTL 样式维度评估）：
+- ✅ 是：非 RTL 语言的资源文件、浏览器检测、下拉可选、dayjs本地化均正常；RTL列表正确标记为非RTL，RTL样式列不适用
+- ⚠️ 部分：某个环节存在缺陷但整体仍可用
 - ❌ 不可达：翻译资源存在但没有任何入口可以触发
+- **RTL 语言额外评估**：ar/he 虽然 24 处 `html[dir="rtl"]` 样式正常，但 2 处 `body.rtl` 样式（卡片按钮对齐、终端内容方向）永不生效，因此不是"完全正常"
+- **N/A**：非 RTL 语言，html[dir]样式 和 body.rtl样式 不适用
 
 ---
 
@@ -1543,49 +1547,53 @@ export function setHtmlLocale(locale: string) {
 
 ---
 
-## 十九、全量语言矩阵统一核对表（34 种语言 × 8 个维度）
+## 十九、全量语言矩阵统一核对表（34 种语言 × 9 个数据维度 + 综合状态）
 
-| 语言 | JSON资源 | detectLocale返回 | Languages下拉 | dayjs加载 | dayjs匹配 | videojs加载 | RTL列表 | html[dir]样式 | 综合状态 |
-|-----|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| ar | ✅ ar.json | ✅ "ar" | ✅ "ar" | ✅ ar | ✅ 匹配 | ✅ ar.json | ✅ 是 | ✅ 生效 | ✅ 完全正常 |
-| bg | ✅ bg.json | ✅ "bg" | ✅ "bg" | ✅ bg | ✅ 匹配 | ✅ bg.json | ❌ | ✅ 生效 | ✅ 正常 |
-| ca | ✅ ca.json | ❌ 无→en | ✅ "ca" | ✅ ca | ✅ 匹配 | ❌ 无 | ❌ | ✅ 生效 | ⚠️ 仅手动，视频控件英语 |
-| cs | ✅ cs.json | ✅ "cs" | ✅ "cs" | ✅ cs | ✅ 匹配 | ✅ cs.json | ❌ | ✅ 生效 | ✅ 正常 |
-| de | ✅ de.json | ✅ "de" | ✅ "de" | ✅ de | ✅ 匹配 | ✅ de.json | ❌ | ✅ 生效 | ✅ 正常 |
-| el | ✅ el.json | ✅ "el" | ✅ "el" | ✅ el | ✅ 匹配 | ✅ el.json | ❌ | ✅ 生效 | ✅ 正常 |
-| en | ✅ en.json | ✅ "en" | ✅ "en" | ✅ en | ✅ 匹配 | ✅ en.json | ❌ | ✅ 生效 | ✅ 正常 |
-| es | ✅ es.json | ✅ "es" | ✅ "es" | ✅ es | ✅ 匹配 | ✅ es.json | ❌ | ✅ 生效 | ✅ 正常 |
-| **fa** | ✅ fa.json | ❌ 无→en | ❌ 无 | ❌ 未加载 | — | ❌ 无 | ❌ 不在 | ✅ 但dir=ltr | ❌ 完全不可达 |
-| fr | ✅ fr.json | ✅ "fr" | ✅ "fr" | ✅ fr | ✅ 匹配 | ✅ fr.json | ❌ | ✅ 生效 | ✅ 正常 |
-| he | ✅ he.json | ✅ "he" | ✅ "he" | ✅ he | ✅ 匹配 | ✅ he.json | ✅ 是 | ✅ 生效 | ✅ 完全正常（含RTL） |
-| hr | ✅ hr.json | ✅ "hr" | ✅ "hr" | ✅ hr | ✅ 匹配 | ✅ hr.json | ❌ | ✅ 生效 | ✅ 正常 |
-| hu | ✅ hu.json | ✅ "hu" | ✅ "hu" | ✅ hu | ✅ 匹配 | ✅ hu.json | ❌ | ✅ 生效 | ✅ 正常 |
-| is | ✅ is.json | ✅ "is" | ✅ "is" | ✅ is | ✅ 匹配 | ❌ 无 | ❌ | ✅ 生效 | ⚠️ 视频控件英语 |
-| it | ✅ it.json | ✅ "it" | ✅ "it" | ✅ it | ✅ 匹配 | ✅ it.json | ❌ | ✅ 生效 | ✅ 正常 |
-| ja | ✅ ja.json | ✅ "ja" | ✅ "ja" | ✅ ja | ✅ 匹配 | ✅ ja.json | ❌ | ✅ 生效 | ✅ 正常 |
-| ko | ✅ ko.json | ✅ "ko" | ✅ "ko" | ✅ ko | ✅ 匹配 | ✅ ko.json | ❌ | ✅ 生效 | ✅ 正常 |
-| lv | ✅ lv.json | ✅ "lv" | ✅ "lv" | ✅ lv | ✅ 匹配 | ✅ lv.json | ❌ | ✅ 生效 | ✅ 正常 |
-| nl | ✅ nl.json | ✅ "nl" | ✅ "nl" | ✅ nl | ✅ 匹配 | ✅ nl.json | ❌ | ✅ 生效 | ✅ 正常 |
-| **nl-be** | ✅ nl-be.json | ⚠️ 被nl截断→"nl" | ✅ "nl-be" | ✅ nl-be | ✅ 匹配 | ✅ nl.json(回退) | ❌ | ✅ 生效 | ⚠️ 自动检测时用nl，手动正常 |
-| no | ✅ no.json | ✅ "no"(nb/no) | ✅ "no" | ✅ nb(挪威) | ❌ no→nb | ❌ 无（nb key是死代码） | ❌ | ✅ 生效 | ⚠️ 日期/视频控件均英语 |
-| pl | ✅ pl.json | ✅ "pl" | ✅ "pl" | ✅ pl | ✅ 匹配 | ✅ pl.json | ❌ | ✅ 生效 | ✅ 正常 |
-| **pt** | ✅ pt.json | ⚠️ 映射到pt-pt | ❌ 无 | ✅ pt | ❌ pt→pt-pt | ❌ 无 | ❌ | ✅ 但不可达 | ❌ 不可达（冗余） |
-| pt-br | ✅ pt-br.json | ✅ "pt-br" | ✅ "pt-br" | ✅ pt-br | ✅ 匹配 | ✅ pt-BR.json | ❌ | ✅ 生效 | ✅ 正常 |
-| **pt-pt** | ✅ pt-pt.json | ✅ "pt-pt" | ✅ "pt-pt" | ✅ pt(加载) | ❌ pt-pt→pt | ✅ pt-PT.json | ❌ | ✅ 生效 | ⚠️ 日期英语 |
-| ro | ✅ ro.json | ✅ "ro" | ✅ "ro" | ✅ ro | ✅ 匹配 | ✅ ro.json | ❌ | ✅ 生效 | ✅ 正常 |
-| ru | ✅ ru.json | ✅ "ru" | ✅ "ru" | ✅ ru | ✅ 匹配 | ✅ ru.json | ❌ | ✅ 生效 | ✅ 正常 |
-| sk | ✅ sk.json | ✅ "sk" | ✅ "sk" | ✅ sk | ✅ 匹配 | ✅ sk.json | ❌ | ✅ 生效 | ✅ 正常 |
-| **sv-se** | ✅ sv-se.json | ⚠️ 返回"sv"→不匹配 | ✅ "sv-se" | ✅ sv(加载) | ❌ 双向错配 | ❌ 无 | ❌ | ✅ 生效 | ❌ 检测→界面英语，手动→日期英语 |
-| tr | ✅ tr.json | ✅ "tr" | ✅ "tr" | ✅ tr | ✅ 匹配 | ✅ tr.json | ❌ | ✅ 生效 | ✅ 正常 |
-| uk | ✅ uk.json | ✅ "uk" | ✅ "uk" | ✅ uk | ✅ 匹配 | ✅ uk.json | ❌ | ✅ 生效 | ✅ 正常 |
-| vi | ✅ vi.json | ✅ "vi" | ✅ "vi" | ✅ vi | ✅ 匹配 | ✅ vi.json | ❌ | ✅ 生效 | ✅ 正常 |
-| zh-cn | ✅ zh-cn.json | ✅ "zh-cn" | ✅ "zh-cn" | ✅ zh-cn | ✅ 匹配 | ✅ zh-CN.json | ❌ | ✅ 生效 | ✅ 正常 |
-| zh-tw | ✅ zh-tw.json | ✅ "zh-tw" | ✅ "zh-tw" | ✅ zh-tw | ✅ 匹配 | ✅ zh-TW.json | ❌ | ✅ 生效 | ✅ 正常 |
+**列说明**：语言列只是索引，不计入维度；其后 9 列是数据维度（JSON资源、detectLocale、Languages下拉、dayjs加载、dayjs匹配、videojs加载、RTL列表、html[dir]样式、body.rtl样式），最后 1 列是综合状态。
 
-**状态说明**：
-- ✅ 正常：6 个维度全部匹配
+| 语言 | JSON资源 | detectLocale返回 | Languages下拉 | dayjs加载 | dayjs匹配 | videojs加载 | RTL列表 | html[dir]样式 | body.rtl样式 | 综合状态 |
+|-----|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| ar | ✅ ar.json | ✅ "ar" | ✅ "ar" | ✅ ar | ✅ 匹配 | ✅ ar.json | ✅ 是 | ✅ 生效 | ❌ 死代码 | ⚠️ 基本正常，2处RTL样式不生效 |
+| bg | ✅ bg.json | ✅ "bg" | ✅ "bg" | ✅ bg | ✅ 匹配 | ✅ bg.json | ❌（非RTL） | N/A | N/A | ✅ 正常 |
+| ca | ✅ ca.json | ❌ 无→en | ✅ "ca" | ✅ ca | ✅ 匹配 | ❌ 无 | ❌（非RTL） | N/A | N/A | ⚠️ 仅手动，视频控件英语 |
+| cs | ✅ cs.json | ✅ "cs" | ✅ "cs" | ✅ cs | ✅ 匹配 | ✅ cs.json | ❌（非RTL） | N/A | N/A | ✅ 正常 |
+| de | ✅ de.json | ✅ "de" | ✅ "de" | ✅ de | ✅ 匹配 | ✅ de.json | ❌（非RTL） | N/A | N/A | ✅ 正常 |
+| el | ✅ el.json | ✅ "el" | ✅ "el" | ✅ el | ✅ 匹配 | ✅ el.json | ❌（非RTL） | N/A | N/A | ✅ 正常 |
+| en | ✅ en.json | ✅ "en" | ✅ "en" | ✅ en | ✅ 匹配 | ✅ en.json | ❌（非RTL） | N/A | N/A | ✅ 正常 |
+| es | ✅ es.json | ✅ "es" | ✅ "es" | ✅ es | ✅ 匹配 | ✅ es.json | ❌（非RTL） | N/A | N/A | ✅ 正常 |
+| **fa** | ✅ fa.json | ❌ 无→en | ❌ 无 | ❌ 未加载 | — | ❌ 无 | ❌ 不在列表 | ❌ dir=ltr（应为rtl） | ❌ 不匹配 | ❌ 完全不可达 |
+| fr | ✅ fr.json | ✅ "fr" | ✅ "fr" | ✅ fr | ✅ 匹配 | ✅ fr.json | ❌（非RTL） | N/A | N/A | ✅ 正常 |
+| he | ✅ he.json | ✅ "he" | ✅ "he" | ✅ he | ✅ 匹配 | ✅ he.json | ✅ 是 | ✅ 生效 | ❌ 死代码 | ⚠️ 基本正常，2处RTL样式不生效 |
+| hr | ✅ hr.json | ✅ "hr" | ✅ "hr" | ✅ hr | ✅ 匹配 | ✅ hr.json | ❌（非RTL） | N/A | N/A | ✅ 正常 |
+| hu | ✅ hu.json | ✅ "hu" | ✅ "hu" | ✅ hu | ✅ 匹配 | ✅ hu.json | ❌（非RTL） | N/A | N/A | ✅ 正常 |
+| is | ✅ is.json | ✅ "is" | ✅ "is" | ✅ is | ✅ 匹配 | ❌ 无 | ❌（非RTL） | N/A | N/A | ⚠️ 视频控件英语 |
+| it | ✅ it.json | ✅ "it" | ✅ "it" | ✅ it | ✅ 匹配 | ✅ it.json | ❌（非RTL） | N/A | N/A | ✅ 正常 |
+| ja | ✅ ja.json | ✅ "ja" | ✅ "ja" | ✅ ja | ✅ 匹配 | ✅ ja.json | ❌（非RTL） | N/A | N/A | ✅ 正常 |
+| ko | ✅ ko.json | ✅ "ko" | ✅ "ko" | ✅ ko | ✅ 匹配 | ✅ ko.json | ❌（非RTL） | N/A | N/A | ✅ 正常 |
+| lv | ✅ lv.json | ✅ "lv" | ✅ "lv" | ✅ lv | ✅ 匹配 | ✅ lv.json | ❌（非RTL） | N/A | N/A | ✅ 正常 |
+| nl | ✅ nl.json | ✅ "nl" | ✅ "nl" | ✅ nl | ✅ 匹配 | ✅ nl.json | ❌（非RTL） | N/A | N/A | ✅ 正常 |
+| **nl-be** | ✅ nl-be.json | ⚠️ 被nl截断→"nl" | ✅ "nl-be" | ✅ nl-be | ✅ 匹配 | ✅ nl.json(回退) | ❌（非RTL） | N/A | N/A | ⚠️ 自动检测时用nl，手动正常 |
+| no | ✅ no.json | ✅ "no"(nb/no) | ✅ "no" | ✅ nb(挪威) | ❌ no→nb | ❌ 无（nb key是死代码） | ❌（非RTL） | N/A | N/A | ⚠️ 日期/视频控件均英语 |
+| pl | ✅ pl.json | ✅ "pl" | ✅ "pl" | ✅ pl | ✅ 匹配 | ✅ pl.json | ❌（非RTL） | N/A | N/A | ✅ 正常 |
+| **pt** | ✅ pt.json | ⚠️ 映射到pt-pt | ❌ 无 | ✅ pt | ❌ pt→pt-pt | ❌ 无 | ❌（非RTL） | N/A | N/A | ❌ 不可达（冗余） |
+| pt-br | ✅ pt-br.json | ✅ "pt-br" | ✅ "pt-br" | ✅ pt-br | ✅ 匹配 | ✅ pt-BR.json | ❌（非RTL） | N/A | N/A | ✅ 正常 |
+| **pt-pt** | ✅ pt-pt.json | ✅ "pt-pt" | ✅ "pt-pt" | ✅ pt(加载) | ❌ pt-pt→pt | ✅ pt-PT.json | ❌（非RTL） | N/A | N/A | ⚠️ 日期英语 |
+| ro | ✅ ro.json | ✅ "ro" | ✅ "ro" | ✅ ro | ✅ 匹配 | ✅ ro.json | ❌（非RTL） | N/A | N/A | ✅ 正常 |
+| ru | ✅ ru.json | ✅ "ru" | ✅ "ru" | ✅ ru | ✅ 匹配 | ✅ ru.json | ❌（非RTL） | N/A | N/A | ✅ 正常 |
+| sk | ✅ sk.json | ✅ "sk" | ✅ "sk" | ✅ sk | ✅ 匹配 | ✅ sk.json | ❌（非RTL） | N/A | N/A | ✅ 正常 |
+| **sv-se** | ✅ sv-se.json | ⚠️ 返回"sv"→不匹配 | ✅ "sv-se" | ✅ sv(加载) | ❌ 双向错配 | ❌ 无 | ❌（非RTL） | N/A | N/A | ❌ 检测→界面英语，手动→日期英语 |
+| tr | ✅ tr.json | ✅ "tr" | ✅ "tr" | ✅ tr | ✅ 匹配 | ✅ tr.json | ❌（非RTL） | N/A | N/A | ✅ 正常 |
+| uk | ✅ uk.json | ✅ "uk" | ✅ "uk" | ✅ uk | ✅ 匹配 | ✅ uk.json | ❌（非RTL） | N/A | N/A | ✅ 正常 |
+| vi | ✅ vi.json | ✅ "vi" | ✅ "vi" | ✅ vi | ✅ 匹配 | ✅ vi.json | ❌（非RTL） | N/A | N/A | ✅ 正常 |
+| zh-cn | ✅ zh-cn.json | ✅ "zh-cn" | ✅ "zh-cn" | ✅ zh-cn | ✅ 匹配 | ✅ zh-CN.json | ❌（非RTL） | N/A | N/A | ✅ 正常 |
+| zh-tw | ✅ zh-tw.json | ✅ "zh-tw" | ✅ "zh-tw" | ✅ zh-tw | ✅ 匹配 | ✅ zh-TW.json | ❌（非RTL） | N/A | N/A | ✅ 正常 |
+
+**状态说明**（按 9 个数据维度评估）：
+- ✅ 正常：非 RTL 语言 6 个基础 i18n 维度（JSON资源、detectLocale、Languages下拉、dayjs加载、dayjs匹配、videojs加载）全部匹配，RTL相关列为非RTL或 N/A
 - ⚠️ 部分缺陷：某个维度存在问题，但整体仍可用
 - ❌ 严重缺陷：完全不可达或多个维度不匹配
+- **N/A**：非 RTL 语言，html[dir]样式 和 body.rtl样式 不适用
+- **RTL 语言额外要求**：RTL列表 + html[dir]样式 + body.rtl样式 三项均需满足才算"完全正常"，ar/he 因 body.rtl 样式不生效只能评"基本正常"
 
 ---
 

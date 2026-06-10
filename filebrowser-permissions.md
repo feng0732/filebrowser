@@ -8,7 +8,7 @@
 
 ### 1.1 User 用户结构
 
-定义于 [users.go](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/users/users.go#L21-L39)
+定义于 `users/users.go`
 
 ```
 User {
@@ -40,7 +40,7 @@ User {
 
 ### 1.2 Permissions 权限位
 
-定义于 [permissions.go](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/users/permissions.go#L4-L13)
+定义于 `users/permissions.go`
 
 | 权限位 | 字段名 | 含义 |
 |--------|--------|------|
@@ -53,11 +53,11 @@ User {
 | `Share` | `share` | 可创建分享链接（必须同时拥有 `Download` 权限） |
 | `Download` | `download` | 可下载文件、预览文件、查看字幕 |
 
-**约束关系**：`Share` 依赖 `Download`——创建分享时同时校验两个权限位（见 [share.go](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/http/share.go#L22-L24)），创建用户时若 `Share=true && Download=false` 则直接拒绝（见 [users.go](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/http/users.go#L159-L161)）。
+**约束关系**：`Share` 依赖 `Download`——创建分享时同时校验两个权限位（见 `http/share.go` withPermShare），创建用户时若 `Share=true && Download=false` 则直接拒绝（见 `http/users.go` userPostHandler / userPutHandler）。
 
 ### 1.3 Rule 访问规则
 
-定义于 [rules.go](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/rules/rules.go#L15-L20)
+定义于 `rules/rules.go`
 
 ```
 Rule {
@@ -68,18 +68,18 @@ Rule {
 }
 ```
 
-**匹配逻辑**（[Rule.Matches](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/rules/rules.go#L29-L44)）：
+**匹配逻辑**（`rules/rules.go` Rule.Matches）：
 1. 若 `Regex=true`，使用正则匹配
 2. 否则使用路径匹配：
    - 路径完全相等 → 匹配
    - 规则路径是目标路径的前缀 → 匹配（自动补 `/` 后缀，防止 `/uploads` 匹配 `/uploads_backup`）
 3. 不匹配则跳过该规则
 
-**规则评估顺序**：全局规则先执行，用户规则后执行，**后匹配的覆盖先匹配的**（最后一条匹配的规则决定结果）。详见 [data.Check](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/http/data.go#L37-L64)。
+**规则评估顺序**：全局规则先执行，用户规则后执行，**后匹配的覆盖先匹配的**（最后一条匹配的规则决定结果）。详见 `http/data.go` data.Check。
 
 ### 1.4 Share 分享链接
 
-定义于 [share.go](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/share/share.go#L10-L20)
+定义于 `share/share.go`
 
 ```
 Link {
@@ -94,7 +94,7 @@ Link {
 
 ### 1.5 Settings 全局配置
 
-定义于 [settings.go](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/settings/settings.go#L23-L41)
+定义于 `settings/settings.go`
 
 ```
 Settings {
@@ -125,7 +125,7 @@ Server {
 
 ### 2.1 四种认证方式
 
-所有认证方式实现 [Auther 接口](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/auth/auth.go#L11-L16)：
+所有认证方式实现 `auth/auth.go` 中的 Auther 接口：
 
 ```
 Auther {
@@ -136,34 +136,46 @@ Auther {
 
 | 方式 | 标识 | 登录页 | 身份识别逻辑 |
 |------|------|--------|-------------|
-| **JSON Auth** | `json` | ✅ | 请求体中读取 username+password，比对数据库中用户密码 |
-| **Proxy Auth** | `proxy` | ❌ | 从 HTTP Header（可配置）中读取 username，查找或自动创建用户 |
-| **Hook Auth** | `hook` | ✅ | 读取 username+password，调用外部命令，根据返回的 `hook.action` 决定：`auth`（创建/更新用户）、`pass`（验证已有用户）、`block`（拒绝） |
-| **No Auth** | `noauth` | ❌ | 直接返回 ID=1 的用户 |
+| **JSON Auth** | `json` | ✅ | 请求体中读取 username+password，比对数据库中已有用户密码；**不自动创建用户** |
+| **Proxy Auth** | `proxy` | ❌ | 从 HTTP Header（可配置）中读取 username，查找用户；若不存在则**自动创建** |
+| **Hook Auth** | `hook` | ✅ | 读取 username+password，调用外部命令，根据返回的 `hook.action` 决定：`auth`（**创建/更新用户**）、`pass`（验证已有用户）、`block`（拒绝） |
+| **No Auth** | `noauth` | ❌ | 直接返回 ID=1 的用户；**不创建任何用户**，依赖初始化时已存在的 ID=1 用户 |
 
-### 2.2 自动创建用户的权限限制
+### 2.2 自动创建用户的权限差异对照
 
-**注册用户**（[auth.go#signupHandler](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/http/auth.go#L151-L214)）：
-- 强制 `Perm.Admin = false`
-- 强制 `Perm.Execute = false`
-- 强制 `Commands = []`
-- 应用 `Settings.Defaults` 中的其他默认值
+四种认证方式中，**JSON Auth 和 NoAuth 不自动创建用户**，只有 Proxy Auth、Hook Auth 以及 Signup 注册端点会创建新用户。以下对照各方式创建用户的权限差异：
 
-**Proxy Auth 自动创建**（[proxy.go#createUser](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/auth/proxy.go#L30-L66)）：
-- 强制 `Perm.Admin = false`
-- 强制 `Perm.Execute = false`
-- 强制 `Commands = []`
-- 强制 `LockPassword = true`
-- 应用 `Settings.Defaults` 中的其他默认值
+| 属性 | Signup 注册 (`http/auth.go` signupHandler) | Proxy Auth 自动创建 (`auth/proxy.go` createUser) | Hook Auth action=auth 创建 (`auth/hook.go` SaveUser) |
+|------|---------------------------------------------|--------------------------------------------------|-------------------------------------------------------|
+| **Admin** | 强制 `false` | 强制 `false` | 由外部命令输出决定（`user.perm.admin`） |
+| **Execute** | 强制 `false` | 强制 `false` | 由外部命令输出决定（`user.perm.execute`）；若 Admin=true 则自动为 true |
+| **Create** | 来自 Defaults | 来自 Defaults | 由外部命令输出决定（`user.perm.create`）；若 Admin=true 则自动为 true |
+| **Rename** | 来自 Defaults | 来自 Defaults | 由外部命令输出决定（`user.perm.rename`）；若 Admin=true 则自动为 true |
+| **Modify** | 来自 Defaults | 来自 Defaults | 由外部命令输出决定（`user.perm.modify`）；若 Admin=true 则自动为 true |
+| **Delete** | 来自 Defaults | 来自 Defaults | 由外部命令输出决定（`user.perm.delete`）；若 Admin=true 则自动为 true |
+| **Share** | 来自 Defaults | 来自 Defaults | 由外部命令输出决定（`user.perm.share`）；若 Admin=true 则自动为 true |
+| **Download** | 来自 Defaults | 来自 Defaults | 由外部命令输出决定（`user.perm.download`）；若 Admin=true 则自动为 true |
+| **Commands** | 强制 `[]`（空数组） | 强制 `[]`（空数组） | 由外部命令输出决定（`user.commands`），空格分隔 |
+| **LockPassword** | 不设置（默认 false） | 强制 `true` | 强制 `true` |
+| **Scope** | 由 MakeUserDir 生成个人目录 | 由 MakeUserDir 生成个人目录 | 由 MakeUserDir 生成个人目录 |
+| **Rules** | 不设置（默认 nil → 空） | 不设置（默认 nil → 空） | 不设置（hook 不支持设置 Rules） |
+| **其他偏好** | 来自 Defaults.Apply | 来自 Defaults.Apply | 来自 Defaults 初始值 + hook 字段覆盖 |
 
-**Hook Auth 创建**（[hook.go#SaveUser](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/auth/hook.go#L131-L191)）：
-- 权限由外部命令输出决定
-- **管理员自动获得所有权限**：若 `user.perm.admin=true`，则所有其他权限位自动设为 true（见 [hook.go#GetUser](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/auth/hook.go#L194-L228)）
-- 强制 `LockPassword = true`
+**关键差异总结**：
+
+1. **Signup 与 Proxy Auth 的权限限制策略一致**——都强制剥夺 Admin 和 Execute，清空 Commands，其余权限继承 Defaults。区别仅在于 LockPassword：Proxy Auth 锁密码（随机生成），Signup 不锁（用户自设）。
+
+2. **Hook Auth 不强制剥夺任何权限**——所有权限位由外部命令输出决定。但存在隐式规则：若 `user.perm.admin=true`，则 `auth/hook.go` GetUser 中所有其他权限位自动置为 true（`isAdmin || GetBoolean(...)`）。因此 Hook Auth 下 Admin 一定拥有全部权限。
+
+3. **NoAuth 不创建用户**——它仅查找 ID=1 的用户，该用户必须在初始化或管理操作中预先存在。其权限完全取决于 ID=1 用户在数据库中的记录。
+
+4. **JSON Auth 不创建用户**——仅在数据库中查找已有用户并验证密码。用户必须由管理员通过 API 或其他认证方式预先创建。
+
+5. **Rules 从不被自动创建流程设置**——所有四种认证方式中，新用户的 Rules 字段均为空（nil），不受 Defaults 或外部命令影响。Rules 只能由管理员后续手动配置。
 
 ### 2.3 JWT 令牌机制
 
-登录成功后签发 JWT（HS256），令牌中包含用户关键信息（[auth.go#printToken](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/http/auth.go#L223-L257)）：
+登录成功后签发 JWT（HS256），令牌中包含用户关键信息（`http/auth.go` printToken）：
 
 ```
 authToken {
@@ -172,11 +184,11 @@ authToken {
 }
 ```
 
-令牌提取优先级（[extractor.ExtractToken](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/http/auth.go#L49-L67)）：
+令牌提取优先级（`http/auth.go` extractor.ExtractToken）：
 1. `X-Auth` 请求头（包含两个点的字符串视为 JWT）
 2. `auth` Cookie（仅 GET 请求）
 
-令牌续期条件（[withUser](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/http/auth.go#L85-L111)）：
+令牌续期条件（`http/auth.go` withUser）：
 - 令牌将在 1 小时内过期 → 响应头 `X-Renew-Token: true`
 - 用户数据在令牌签发后被更新 → 响应头 `X-Renew-Token: true`
 - Proxy Auth 模式下过期令牌可自动续期（如果有配置 LogoutPage）
@@ -191,30 +203,30 @@ authToken {
 请求 → handle() → withUser() / withAdmin() / withSelfOrAdmin() / withPermShare() / withHashFile() → 业务Handler
 ```
 
-#### handle()（[data.go#handle](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/http/data.go#L66-L101)）
+#### handle()（`http/data.go` handle）
 - 加载全局 Settings
 - 构造 `data` 上下文对象
 - 处理错误响应
 
-#### withUser()（[auth.go#withUser](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/http/auth.go#L85-L111)）
+#### withUser()（`http/auth.go` withUser）
 1. 从请求中提取并验证 JWT
 2. 从数据库重新加载用户（确保最新权限）
 3. 检查令牌续期需求
 4. 将用户对象存入 `d.user`
 
-#### withAdmin()（[auth.go#withAdmin](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/http/auth.go#L113-L121)）
+#### withAdmin()（`http/auth.go` withAdmin）
 - 包装 `withUser`
 - 额外检查 `d.user.Perm.Admin`，非管理员返回 403
 
-#### withSelfOrAdmin()（[users.go#withSelfOrAdmin](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/http/users.go#L57-L71)）
+#### withSelfOrAdmin()（`http/users.go` withSelfOrAdmin）
 - 包装 `withUser`
 - 检查 `d.user.ID == 目标ID || d.user.Perm.Admin`，不满足返回 403
 
-#### withPermShare()（[share.go#withPermShare](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/http/share.go#L20-L28)）
+#### withPermShare()（`http/share.go` withPermShare）
 - 包装 `withUser`
 - 检查 `d.user.Perm.Share && d.user.Perm.Download`，不满足返回 403
 
-#### withHashFile()（[public.go#withHashFile](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/http/public.go#L17-L98)）
+#### withHashFile()（`http/public.go` withHashFile）
 - 从 URL 提取分享哈希
 - 加载分享链接并验证（过期、密码）
 - 加载分享创建者用户，检查其 `Share+Download` 权限
@@ -234,23 +246,23 @@ authToken {
 | `/api/users/{id}` | PUT | withSelfOrAdmin | 非管理员不可改 Username/Scope/LockPassword/Perm/Commands/Rules；JSON Auth 敏感字段需当前密码；`Share→Download` 约束 |
 | `/api/users/{id}` | DELETE | withSelfOrAdmin | JSON Auth 需当前密码；唯一管理员不可删除 |
 | `/api/settings` | GET/PUT | withAdmin | — |
-| `/api/resources` | GET | withUser | `Download` 控制内容读取 |
+| `/api/resources` | GET | withUser | `Download` 控制内容读取；NewFileInfo 内调用 Check(path) |
 | `/api/resources` | DELETE | withUser | `Delete` + 路径≠`/` |
 | `/api/resources` | POST | withUser | `Create` + `Check(path)`；覆盖需 `Modify` |
 | `/api/resources` | PUT | withUser | `Modify` + `Check(path)`；仅文件 |
 | `/api/resources` | PATCH | withUser | `Check(src+dst)`；copy 需 `Create`；rename 需 `Rename`；覆盖需 `Modify` |
-| `/api/raw` | GET | withUser | `Download` |
-| `/api/preview` | GET | withUser | `Download` |
-| `/api/subtitle` | GET | withUser | `Download` |
+| `/api/raw` | GET | withUser | `Download`；NewFileInfo 内调用 Check(path)；目录下载递归调用 Check |
+| `/api/preview` | GET | withUser | `Download`；NewFileInfo 内调用 Check(path) |
+| `/api/subtitle` | GET | withUser | `Download`；NewFileInfo 内调用 Check(path) |
 | `/api/command` | GET(WS) | withUser | `EnableExec` + `Execute` + 命令在 `Commands` 中 |
 | `/api/shares` | GET | withPermShare | Admin 查全部，否则查自己的 |
 | `/api/share` | GET | withPermShare | Admin 按路径查，否则按用户+路径查 |
-| `/api/share` | POST | withPermShare | 目标路径必须存在（Fs.Stat 校验） |
+| `/api/share` | POST | withPermShare | 目标路径必须存在（Fs.Stat 校验，见 §5.1 规则过滤分析） |
 | `/api/share` | DELETE | withPermShare | Admin 或分享创建者本人 |
-| `/api/public/share` | GET | withHashFile | 分享链接验证（密码/过期） |
-| `/api/public/dl` | GET | withHashFile | 分享链接验证（密码/过期）+ 下载令牌 |
-| `/api/search` | GET | withUser | 无额外权限（通过 Fs+Check 限制范围） |
-| `/api/usage` | GET | withUser | 无额外权限 |
+| `/api/public/share` | GET | withHashFile | 分享链接验证（密码/过期）；规则过滤见 §5.2 |
+| `/api/public/dl` | GET | withHashFile | 分享链接验证（密码/过期）+ 下载令牌；规则过滤见 §5.2 |
+| `/api/search` | GET | withUser | 通过 Checker 接口传入 search.Search，搜索过程中每个路径调用 Check |
+| `/api/usage` | GET | withUser | NewFileInfo 内调用 Check(path) |
 | `/api/tus` | POST | withUser | `Create` + `Check(path)`；覆盖需 `Modify` |
 | `/api/tus` | HEAD/GET | withUser | `Create` + `Check(path)` |
 | `/api/tus` | PATCH | withUser | `Create` + `Check(path)` |
@@ -262,7 +274,7 @@ authToken {
 
 ### 4.1 第一层：文件系统作用域隔离（Scope + ScopedFs）
 
-**构建过程**（[users.go#Clean](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/users/users.go#L92-L98)）：
+**构建过程**（`users/users.go` User.Clean）：
 ```
 scope = filepath.Join(baseScope, filepath.Join("/", userScope))
 user.Fs = files.NewScopedFs(afero.NewOsFs(), scope)
@@ -271,7 +283,7 @@ user.Fs = files.NewScopedFs(afero.NewOsFs(), scope)
 - `userScope` = 用户配置的 Scope（如 `/users/alice`）
 - 最终路径 = `server.Root` + 清理后的用户 Scope
 
-**ScopedFs 的双重保护**（[scoped.go](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/files/scoped.go)）：
+**ScopedFs 的双重保护**（`files/scoped.go`）：
 
 1. **词法限制**（afero.BasePathFs）：所有文件操作自动限制在 base 目录下，无法通过 `../` 逃逸
 2. **符号链接限制**（ScopedFs.guard + within）：每次操作前检查目标路径解析后的实际位置是否在 scope 内
@@ -283,7 +295,7 @@ user.Fs = files.NewScopedFs(afero.NewOsFs(), scope)
 
 ### 4.2 第二层：路径规则过滤（Rules + Check）
 
-**检查入口**：[data.Check](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/http/data.go#L37-L64)
+**检查入口**：`http/data.go` data.Check
 
 ```go
 func (d *data) Check(path string) bool {
@@ -323,14 +335,26 @@ func (d *data) Check(path string) bool {
 - `HideDotfiles` 是独立于规则的额外检查，优先级最高
 - 分享场景下 `checkerPrefix` 保证规则仍然基于用户原始 scope 路径匹配
 
-**Check() 在以下场景被调用**：
-- 创建文件/上传（POST /resources, POST /tus）
-- 修改文件（PUT /resources）
-- 移动/重命名（PATCH /resources，源和目标都检查）
-- 递归列举（GET /resources/recursive）
-- 目录下载/打包（raw handler 中的 getFiles）
-- 搜索（通过 Checker 接口传入 search.Search）
-- 创建分享时通过 `Fs.Stat` 间接使用 ScopedFs
+**Check() 的两层调用机制**：
+
+Check() 不仅在 handler 中显式调用，还在 `files.NewFileInfo` 内部被隐式调用：
+
+1. **显式调用**——handler 代码中直接调用 `d.Check(path)`，用于在执行操作前判定路径是否允许：
+   - 创建文件/上传（POST /resources, POST /tus）
+   - 修改文件（PUT /resources）
+   - 移动/重命名（PATCH /resources，源和目标都检查）
+   - 递归列举（GET /resources/recursive）
+
+2. **隐式调用**——通过 `files.NewFileInfo` 的 `FileOptions.Checker` 参数传入，在以下阶段生效：
+   - **入口校验**（`files/file.go` NewFileInfo 第 78 行）：对请求路径本身调用 `opts.Checker.Check(opts.Path)`，不通过则返回 `os.ErrPermission`
+   - **目录列举**（`files/file.go` readListing 第 409 行）：遍历目录子项时对每个子路径调用 `checker.Check(fPath)`，不通过则跳过该子项（continue），不会返回错误
+   - **符号链接过滤**（`files/file.go` readListing 第 426 行）：若 ScopedFs.Stat 返回 `os.ErrPermission`（符号链接目标逃逸 scope），同样跳过该子项
+
+   这意味着 GET /resources、GET /raw、GET /preview、GET /subtitle、GET /usage 等端点虽然 handler 代码中未显式调用 `d.Check()`，但通过 NewFileInfo 内部的 Checker 调用同样受到规则过滤。
+
+3. **其他间接调用**：
+   - 目录下载/打包（`http/raw.go` getFiles）：递归遍历时对每个路径调用 `d.Check(path)`
+   - 搜索（`http/search.go`）：通过 Checker 接口传入 `search.Search`，搜索过程中对每个路径调用 Check
 
 ### 4.3 第三层：操作权限位（Permissions）
 
@@ -340,38 +364,92 @@ func (d *data) Check(path string) bool {
 
 ## 5. 分享（Share）场景的权限判断
 
-### 5.1 创建分享
+### 5.1 创建分享时的规则过滤
 
-前置条件（[share.go#withPermShare](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/http/share.go#L20-L28)）：
-1. 用户已认证（withUser）
-2. `Perm.Share = true` 且 `Perm.Download = true`
-
-额外限制（[share.go#sharePostHandler](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/http/share.go#L100-L180)）：
-- 目标路径必须存在（`d.user.Fs.Stat`），这同时通过 ScopedFs 阻止了符号链接逃逸 scope 的分享
-
-### 5.2 访问分享（公开端点）
-
-流程（[public.go#withHashFile](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/http/public.go#L17-L98)）：
+创建分享的完整权限检查链如下（`http/share.go` sharePostHandler）：
 
 ```
-1. 从 URL 提取分享 Hash
-2. 查询 Link 记录
-3. authenticateShareRequest():
-   - 无密码 → 直接通过
-   - 有密码 → 验证 X-SHARE-PASSWORD 头（bcrypt比对）或 URL token
-   - 过期检查（Expire 字段）
-4. 加载创建者用户 → 检查 Perm.Share && Perm.Download
-5. 重新绑定 Fs：
-   - d.user.Fs = files.NewScopedFs(d.user.Fs, link.Path)
-   - 将 Fs 根缩小到分享的文件/目录
-6. 设置 checkerPrefix = link.Path（保证规则匹配正确）
-7. 执行业务 handler
+阶段 1: withPermShare 中间件
+  ├─ withUser → JWT 验证 + 加载用户
+  └─ Perm.Share && Perm.Download → 否则 403
+
+阶段 2: 路径存在性校验（隐含 Scope + 符号链接限制）
+  └─ d.user.Fs.Stat(r.URL.Path)
+       ├─ ScopedFs 词法限制：路径无法逃逸用户 Scope
+       └─ ScopedFs.guard → within：符号链接目标无法逃逸用户 Scope
+       └─ 任一不通过 → 返回错误，分享创建失败
+
+阶段 3: 分享数据创建
+  └─ 生成 Hash、设置过期、可选密码 → 保存到数据库
 ```
 
-**关键安全措施**：
-- Fs 被二次封装：访问者只能看到分享路径下的内容
-- 符号链接限制仍然生效（Nested ScopedFs）
-- 创建者用户如果被禁用 Share/Download 权限，分享立即失效
+**关键点**：创建分享时，**不显式调用 `d.Check(r.URL.Path)`**（即不对 Rules 进行检查）。这意味着只要路径在用户的 Scope 内（通过 ScopedFs.Stat 校验），即使该路径被全局或用户规则标记为拒绝（`Allow=false`），用户仍然可以创建指向该路径的分享链接。
+
+然而，这个分享创建后是否能被访问者看到内容，取决于公开访问时的规则过滤（见 §5.2）。创建者自己在正常文件浏览中若访问该路径，会因 NewFileInfo 内的 Checker 校验而看不到该路径的内容。
+
+### 5.2 访问分享时的规则过滤
+
+公开访问分享的完整权限检查链如下（`http/public.go` withHashFile）：
+
+```
+阶段 1: 分享链接验证
+  ├─ 提取 Hash → 查询 Link 记录
+  └─ authenticateShareRequest()
+       ├─ 无密码 → 直接通过
+       ├─ URL ?token= → ConstantTimeCompare 验证
+       └─ X-SHARE-PASSWORD 头 → bcrypt 比对
+
+阶段 2: 创建者权限验证
+  └─ 加载创建者用户 (d.store.Users.Get)
+       └─ user.Perm.Share && user.Perm.Download → 否则 403
+
+阶段 3: 首次 NewFileInfo（原始 Scope 下）
+  └─ files.NewFileInfo{Path: link.Path, Checker: d}
+       ├─ 此时 d.user.Fs = 创建者的原始 ScopedFs
+       ├─ Check(link.Path)：checkerPrefix 为空，路径为用户 Scope 内的原始路径
+       │    ├─ HideDotfiles 检查
+       │    ├─ 全局 Rules 匹配
+       │    └─ 用户 Rules 匹配
+       └─ 若 Check 不通过 → 返回 os.ErrPermission → 403
+
+阶段 4: 重新绑定 Fs + 设置 checkerPrefix
+  ├─ d.user.Fs = files.NewScopedFs(d.user.Fs, basePath)
+  │    └─ Fs 根缩小到分享路径，符号链接仍受限
+  └─ d.checkerPrefix = basePath
+       └─ 后续 Check() 调用将路径还原为用户 Scope 内的原始路径
+
+阶段 5: 第二次 NewFileInfo（重新绑定后的 Scope 下）
+  └─ files.NewFileInfo{Path: filePath, Checker: d}
+       ├─ 对于目录分享：filePath = ifPath（URL 中的子路径）
+       ├─ Check(filePath)：
+       │    ├─ checkerPrefix 拼接：实际匹配路径 = basePath + filePath
+       │    ├─ HideDotfiles 检查（基于还原后的路径）
+       │    ├─ 全局 Rules 匹配（基于还原后的路径）
+       │    └─ 用户 Rules 匹配（基于还原后的路径）
+       └─ 若为目录 + Expand=true → readListing 中对每个子项调用 Check
+
+阶段 6: 执行业务 handler
+  ├─ publicShareHandler → 返回文件/目录 JSON
+  └─ publicDlHandler → rawFileHandler 或 rawDirHandler
+       └─ rawDirHandler.getFiles → 对每个路径调用 d.Check(path)
+```
+
+**规则过滤生效的三个阶段**：
+
+| 阶段 | 检查路径 | checkerPrefix | 规则匹配基准 | 不通过后果 |
+|------|----------|---------------|-------------|-----------|
+| 阶段 3：首次 NewFileInfo | `link.Path` | 空（未设置） | 用户原始 Scope 路径 | 403，分享完全不可访问 |
+| 阶段 5：第二次 NewFileInfo | `filePath`（子路径） | `basePath`（= link.Path） | `basePath + filePath`，还原为用户原始 Scope 路径 | 403 或子项被跳过 |
+| 阶段 6：业务 handler | 目录子路径 | `basePath` | 同上 | 子项被跳过（下载时省略） |
+
+**checkerPrefix 的作用**：阶段 4 将 Fs 重新绑定到 `basePath` 后，后续传入 Check 的路径是相对于新 Fs 根的路径（如 `/subdir/file.txt`）。但用户的 Rules 是基于原始 Scope 的完整路径编写的（如 `/docs/secret/subdir/file.txt`）。checkerPrefix 将 `basePath` 拼接回去，确保规则匹配使用的是 `/docs/secret/subdir/file.txt` 而非 `/subdir/file.txt`，否则拒绝规则会被绕过。
+
+**示例**：假设用户 Scope 为 `/data`，分享路径为 `/data/docs`，用户有一条规则 `Path=/data/docs/secret, Allow=false`：
+- 访问者请求 `/api/public/share/<hash>/secret/file.txt`
+- 阶段 5 中 filePath = `/secret/file.txt`，checkerPrefix = `/docs`
+- Check 内还原路径 = `/docs/secret/file.txt`（相对于 Scope 根 `/data`，即绝对路径 `/data/docs/secret/file.txt`）
+- 规则 `/data/docs/secret` 匹配成功 → Allow=false → 403
+- 若无 checkerPrefix，匹配路径仅为 `/secret/file.txt`，规则不匹配 → 被错误放行
 
 ### 5.3 下载密码保护的分享
 
@@ -379,13 +457,13 @@ func (d *data) Check(path string) bool {
 - URL 查询参数 `?token=<token>` 直接下载（避免重复输入密码）
 - `X-SHARE-PASSWORD` 请求头输入密码
 
-验证使用 `crypto/subtle.ConstantTimeCompare` 防止时序攻击（[public.go#authenticateShareRequest](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/http/public.go#L136-L161)）。
+验证使用 `crypto/subtle.ConstantTimeCompare` 防止时序攻击（`http/public.go` authenticateShareRequest）。
 
 ---
 
 ## 6. 命令执行的权限判断
 
-三层检查（[commands.go#commandsHandler](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/http/commands.go#L41-L119)）：
+三层检查（`http/commands.go` commandsHandler）：
 
 ```
 1. d.server.EnableExec → 全局开关（Server 配置）
@@ -395,7 +473,7 @@ func (d *data) Check(path string) bool {
 
 命令工作目录 = `d.user.FullPath(r.URL.Path)`，即用户 Scope 下的请求路径。
 
-命令定义来自 `Settings.Commands`（map[string][]string），如 `{"git": ["git", "--no-pager"]}`。通过 [runner.ParseCommand](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/runner/parser.go) 解析。
+命令定义来自 `Settings.Commands`（map[string][]string），如 `{"git": ["git", "--no-pager"]}`。通过 `runner/parser.go` ParseCommand 解析。
 
 ---
 
@@ -403,7 +481,7 @@ func (d *data) Check(path string) bool {
 
 ### 7.1 非管理员可修改的字段
 
-定义于 [users.go#NonModifiableFieldsForNonAdmin](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/http/users.go#L22-L23)：
+定义于 `http/users.go` NonModifiableFieldsForNonAdmin：
 
 ```
 Username, Scope, LockPassword, Perm, Commands, Rules
@@ -418,7 +496,7 @@ Username, Scope, LockPassword, Perm, Commands, Rules
 
 ### 7.3 唯一管理员保护
 
-[storage.go#IsUniqueAdmin](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/users/storage.go#L142-L152)：如果用户是管理员且系统中只剩 1 个管理员，则禁止删除该用户。
+`users/storage.go` IsUniqueAdmin：如果用户是管理员且系统中只剩 1 个管理员，则禁止删除该用户。
 
 ### 7.4 用户创建的约束
 
@@ -436,11 +514,13 @@ HTTP 请求
   ├─ 公开端点 (/api/public/*)
   │   └─ withHashFile
   │       ├─ 提取分享 Hash → 查询 Link
-  │       ├─ 验证分享（密码/过期）
+  │       ├─ 验证分享（密码/过期/Token）
   │       ├─ 加载创建者用户
   │       ├─ 检查创建者 Perm.Share + Perm.Download
-  │       ├─ 重新绑定 Fs（二次 Scope 限制）
-  │       └─ 执行 handler
+  │       ├─ 首次 NewFileInfo(link.Path) → Check(path) 规则过滤
+  │       ├─ 重新绑定 Fs（二次 Scope 限制）+ 设置 checkerPrefix
+  │       ├─ 第二次 NewFileInfo(filePath) → Check(checkerPrefix+path) 规则过滤
+  │       └─ 执行 handler → 业务中进一步 Check
   │
   ├─ 认证端点 (/api/login, /api/signup)
   │   └─ 无中间件，由 Auther 认证
@@ -458,7 +538,7 @@ HTTP 请求
               │     ├─ HideDotfiles 检查
               │     ├─ 全局 Rules 匹配
               │     └─ 用户 Rules 匹配（覆盖全局）
-              │     └─ 不满足 → 403 Forbidden
+              │     └─ 不满足 → 403 Forbidden 或子项被跳过
               │
               └─ 3. 通过 d.user.Fs 执行文件操作
                     ├─ Scope 词法限制（BasePathFs）
@@ -472,26 +552,29 @@ HTTP 请求
 
 | 领域 | 文件 | 核心内容 |
 |------|------|----------|
-| 用户模型 | [users/users.go](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/users/users.go) | User 结构体、Clean()、FullPath() |
-| 权限位 | [users/permissions.go](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/users/permissions.go) | Permissions 结构体（8个布尔位） |
-| 规则模型 | [rules/rules.go](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/rules/rules.go) | Rule 结构体、Matches()、MatchHidden() |
-| 作用域文件系统 | [files/scoped.go](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/files/scoped.go) | ScopedFs、guard()、within()（防符号链接逃逸） |
-| 认证接口 | [auth/auth.go](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/auth/auth.go) | Auther 接口 |
-| JSON 认证 | [auth/json.go](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/auth/json.go) | JSONAuth、防时序攻击 |
-| 代理认证 | [auth/proxy.go](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/auth/proxy.go) | ProxyAuth、自动创建用户 |
-| Hook 认证 | [auth/hook.go](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/auth/hook.go) | HookAuth、外部命令、管理员自动获得全部权限 |
-| 无认证 | [auth/none.go](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/auth/none.go) | NoAuth、固定 ID=1 |
-| HTTP 认证中间件 | [http/auth.go](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/http/auth.go) | withUser、withAdmin、JWT 处理、注册限制 |
-| HTTP 数据上下文 | [http/data.go](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/http/data.go) | data 结构体、Check()（规则评估） |
-| 资源操作 | [http/resource.go](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/http/resource.go) | CRUD handler 中的权限检查 |
-| 分享操作 | [http/share.go](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/http/share.go) | withPermShare、分享 CRUD |
-| 公开访问 | [http/public.go](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/http/public.go) | withHashFile、分享验证、Fs 重新绑定 |
-| 命令执行 | [http/commands.go](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/http/commands.go) | 三层命令权限检查 |
-| 用户管理 | [http/users.go](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/http/users.go) | withSelfOrAdmin、非管理员字段限制 |
-| 全局设置 | [http/settings.go](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/http/settings.go) | withAdmin 保护 |
-| TUS 上传 | [http/tus_handlers.go](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/http/tus_handlers.go) | 上传/续传权限检查 |
-| 分享模型 | [share/share.go](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/share/share.go) | Link 结构体 |
-| 全局配置 | [settings/settings.go](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/settings/settings.go) | Settings、Server 结构体 |
-| 默认值 | [settings/defaults.go](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/settings/defaults.go) | UserDefaults.Apply() |
-| 用户存储 | [users/storage.go](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/users/storage.go) | 唯一管理员保护、用户 CRUD |
-| 错误定义 | [errors/errors.go](file:///d:/fz/0601/solo-dogfeeding/code/166-filebrowser/errors/errors.go) | ErrPermissionDenied、ErrShareRequiresDownload 等 |
+| 用户模型 | `users/users.go` | User 结构体、Clean()、FullPath() |
+| 权限位 | `users/permissions.go` | Permissions 结构体（8个布尔位） |
+| 规则模型 | `rules/rules.go` | Rule 结构体、Matches()、MatchHidden() |
+| 文件信息 | `files/file.go` | NewFileInfo（入口 Check + readListing 递归 Check） |
+| 作用域文件系统 | `files/scoped.go` | ScopedFs、guard()、within()（防符号链接逃逸） |
+| 认证接口 | `auth/auth.go` | Auther 接口 |
+| JSON 认证 | `auth/json.go` | JSONAuth、防时序攻击 |
+| 代理认证 | `auth/proxy.go` | ProxyAuth、自动创建用户（Admin=false, Execute=false, LockPassword=true） |
+| Hook 认证 | `auth/hook.go` | HookAuth、外部命令、管理员自动获得全部权限、LockPassword=true |
+| 无认证 | `auth/none.go` | NoAuth、固定 ID=1、不创建用户 |
+| HTTP 认证中间件 | `http/auth.go` | withUser、withAdmin、JWT 处理、注册限制（Admin=false, Execute=false） |
+| HTTP 数据上下文 | `http/data.go` | data 结构体、Check()（规则评估 + checkerPrefix 还原） |
+| 资源操作 | `http/resource.go` | CRUD handler 中的权限检查 |
+| 分享操作 | `http/share.go` | withPermShare、分享 CRUD（创建时不调 Check） |
+| 公开访问 | `http/public.go` | withHashFile、分享验证、Fs 重新绑定、checkerPrefix 设置 |
+| 文件下载 | `http/raw.go` | rawHandler、getFiles（递归 Check） |
+| 命令执行 | `http/commands.go` | 三层命令权限检查 |
+| 用户管理 | `http/users.go` | withSelfOrAdmin、非管理员字段限制 |
+| 全局设置 | `http/settings.go` | withAdmin 保护 |
+| TUS 上传 | `http/tus_handlers.go` | 上传/续传权限检查 |
+| 分享模型 | `share/share.go` | Link 结构体 |
+| 全局配置 | `settings/settings.go` | Settings、Server 结构体 |
+| 默认值 | `settings/defaults.go` | UserDefaults.Apply() |
+| 用户目录 | `settings/dir.go` | MakeUserDir（自动创建用户主目录） |
+| 用户存储 | `users/storage.go` | 唯一管理员保护、用户 CRUD |
+| 错误定义 | `errors/errors.go` | ErrPermissionDenied、ErrShareRequiresDownload 等 |

@@ -623,7 +623,390 @@ func (s *ScopedFs) Rename(oldname, newname string) error {
 
 ---
 
-## 九、关键安全设计总结
+## 九、断点续传（TUS 协议）完整协作流程
+
+TUS (Transloadit Upload Specification) 是实现大文件断点续传的标准协议。File Browser 实现了完整的 4 个 TUS 端点：
+
+| HTTP 方法 | 端点 | 作用 | 对应 Handler |
+|-----------|------|------|-------------|
+| POST | `/api/tus/*path` | 创建上传会话（分片初始化） | [tusPostHandler](http/tus_handlers.go#L41-L123) |
+| HEAD | `/api/tus/*path` | 查询上传进度（断点恢复用） | [tusHeadHandler](http/tus_handlers.go#L125-L154) |
+| PATCH | `/api/tus/*path` | 追加写入分片数据 | [tusPatchHandler](http/tus_handlers.go#L156-L239) |
+| DELETE | `/api/tus/*path` | 取消上传（清理部分文件） | [tusDeleteHandler](http/tus_handlers.go#L241-L273) |
+
+### 9.1 UploadCache：上传状态缓存抽象
+
+断点续传的核心在于**在多次 HTTP 请求之间维持上传状态**。[UploadCache](http/upload_cache_memory.go#L17-L32) 是状态存储的抽象接口：
+
+```go
+type UploadCache interface {
+    Register(filePath string, fileSize int64)   // 登记新上传（预期总大小）
+    Complete(filePath string)                  // 上传完成/取消，删除缓存条目
+    GetLength(filePath string) (int64, error)  // 查询预期总大小（用于验证会话）
+    Touch(filePath string)                     // 刷新 TTL，防止过期
+    Close()                                    // 清理资源
+}
+```
+
+有两种实现：
+
+**1) memoryUploadCache — 单实例内存缓存**（[upload_cache_memory.go:34-74](http/upload_cache_memory.go#L34-L74)）
+- 底层使用 `ttlcache.Cache[string, int64]`，key = 真实磁盘路径，value = 预期文件总大小
+- TTL = **3 分钟**，期间必须有 PATCH 或 HEAD 刷新，否则自动过期
+- **过期自动清理**：`OnEviction` 回调中检测到 `EvictionReasonExpired` 时，调用 `os.Remove(item.Key())` 删除未完成的部分文件
+
+**2) redisUploadCache — 多副本 Redis 缓存**（[upload_cache_redis.go:14-L84](http/upload_cache_redis.go#L14-L84)）
+- key 格式：`filebrowser:upload:<真实磁盘路径>`
+- `GET` 查询时会自动刷新 TTL（[GetLength 中调用 Touch](http/upload_cache_redis.go#L56-L73)）
+- **注意**：Redis 实现没有 `OnEviction` 钩子，过期的部分文件由谁清理？依赖 PATCH 再次命中时会话已不存在返回 404，由客户端决定重新上传覆盖
+
+构造入口 [NewUploadCache()](http/upload_cache_memory.go#L76-L85)：配置了 Redis URL 就用 Redis，否则用内存缓存。
+
+### 9.2 keepUploadActive：传输中防过期守护
+
+[tus_handlers.go:19-39](http/tus_handlers.go#L19-L39) 提供了一个在 PATCH 大分片传输期间持续刷新 TTL 的守护 goroutine：
+
+```go
+func keepUploadActive(cache UploadCache, filePath string) func() {
+    stop := make(chan bool)
+    go func() {
+        ticker := time.NewTicker(2 * time.Second)   // 每 2 秒
+        for {
+            select {
+            case <-stop: return
+            case <-ticker.C: cache.Touch(filePath)   // 刷新 TTL
+            }
+        }
+    }()
+    return func() { close(stop) }   // 返回停止函数，PATCH 结束时 defer 调用
+}
+```
+
+原因：单个 PATCH 请求传输大分片可能远超 3 分钟，如果中途不刷新 TTL，缓存会过期导致后续 PATCH 找不到会话。
+
+---
+
+### 9.3 步骤一：分片创建（POST 创建上传会话）
+
+对应 [tusPostHandler](http/tus_handlers.go#L41-L123)，逐阶段追踪：
+
+```
+HTTP POST /api/tus/uploads/large-video.mp4
+Headers:
+  Upload-Length: 524288000         (文件总大小 500MB)
+  Override: true                   (可选，是否覆盖已存在)
+    │
+    ▼
+【阶段 0】路由 & 认证
+│
+├─ ① stripPrefix("/api/tus") → r.URL.Path = "/uploads/large-video.mp4"
+├─ ② withUser() → 加载 d.user 和 ScopedFs
+│
+▼
+【阶段 1】权限检查（与普通 POST 上传一致）
+│
+└─ ③ [tus_handlers.go:43-45]
+     if !d.user.Perm.Create || !d.Check(r.URL.Path) → 403
+        │                    │
+        │                    └─ L3 标准化 + 细粒度规则检查
+        └─ 粗粒度创建权限
+│
+▼
+【阶段 2】文件存在性分析 & 父目录自动创建
+│
+└─ ④ [tus_handlers.go:47-65] files.NewFileInfo 探测目标路径
+     {
+       err == afero.ErrFileNotFound
+       │  → 取父目录 filepath.Dir(path)
+       │     └─ 父目录也不存在？→ d.user.Fs.MkdirAll(dir, DirMode)
+       │           └─ MkdirAll 走完整链路：guard → BasePathFs.MkdirAll
+       │
+       err == 其他错误 → 500
+       err == nil      → 文件已存在，进入覆盖判断
+     }
+│
+▼
+【阶段 3】覆盖权限 & 打开标志确定
+│
+└─ ⑤ [tus_handlers.go:67-86]
+     fileFlags = O_CREATE | O_WRONLY
+     if 文件已存在 {
+         if 文件是目录 → 400 Bad Request
+         if override != true → 409 Conflict
+         if !d.user.Perm.Modify → 403   ← 覆盖需要修改权限
+         fileFlags |= O_TRUNC            ← 截断覆盖
+     }
+│
+▼
+【阶段 4】创建空文件（或截断已有文件）
+│
+└─ ⑥ [tus_handlers.go:88-92]
+     openFile, err := d.user.Fs.OpenFile(path, fileFlags, FileMode)
+        │
+        └─ ScopedFs.OpenFile()
+             ├─ guard(path) → within() → FullBaseFsPath + EvalSymlinks + 前缀比较
+             │      └─ 作用域内含符号链接 → 越界会被拒绝（见 tus_symlink_test.go 验证）
+             └─ BasePathFs.OpenFile → OsFs.OpenFile
+                  └─ 此时文件在磁盘上已存在，大小为 0（或被截断为 0）
+     defer openFile.Close()
+│
+▼
+【阶段 5】登记上传会话到缓存
+│
+├─ ⑦ [tus_handlers.go:94-105] 再次 NewFileInfo 取 RealPath
+│     file.RealPath() → 磁盘绝对路径（如 /home/user/files/uploads/large-video.mp4）
+│
+├─ ⑧ [tus_handlers.go:107-110] getUploadLength(r)
+│     解析 Header "Upload-Length" → uploadLength = 524288000
+│
+└─ ⑨ [tus_handlers.go:113] 缓存登记
+     cache.Register(file.RealPath(), uploadLength)
+        │
+        ├─ memoryCache: ttlcache.Set(realPath, 524288000, ttl=3min)
+        └─ redisCache:  SET "filebrowser:upload:/home/..." "524288000" EX 180
+│
+▼
+【阶段 6】返回 Location，会话创建完成
+│
+└─ ⑩ [tus_handlers.go:115-121]
+     构造 Location Header = <BaseURL>/api/tus/<EscapedPath>
+     返回 HTTP 201 Created
+```
+
+**POST 关键点**：
+- 此时**磁盘上已创建了目标文件（空或被截断）**，上传会话也登记在缓存中
+- **缓存 key 用的是 `file.RealPath()`（真实磁盘路径）**，不是虚拟路径，因为跨请求需要唯一且稳定的标识
+- 后续 HEAD/PATCH/DELETE 都需要先通过 `NewFileInfo().RealPath()` 查找到对应缓存条目
+
+---
+
+### 9.4 步骤二：查询上传进度（HEAD 断点恢复）
+
+对应 [tusHeadHandler](http/tus_handlers.go#L125-L154)，客户端断线重连时调用：
+
+```
+HTTP HEAD /api/tus/uploads/large-video.mp4
+    │
+    ▼
+① 权限：!Perm.Create || !d.Check(path) → 403
+② NewFileInfo(path) → 取得文件当前 file.Size（已写入字节数）
+③ cache.GetLength(file.RealPath())
+   ├─ 缓存不存在 → 404（会话已过期或从未创建，需要从 POST 重新开始）
+   └─ 存在 → 返回 uploadLength = 524288000
+④ 返回 Headers：
+   Upload-Offset: 104857600   ← 当前文件大小 = 已上传进度 100MB
+   Upload-Length: 524288000   ← 文件总大小 500MB
+   Cache-Control: no-store
+   HTTP 200 OK
+```
+
+客户端比较 `Upload-Offset` 与自己记录的进度，下次 PATCH 从对应偏移量继续。
+
+---
+
+### 9.5 步骤三：追加写入（PATCH 分片上传）
+
+对应 [tusPatchHandler](http/tus_handlers.go#L156-L239)，这是实际传输数据的阶段：
+
+```
+HTTP PATCH /api/tus/uploads/large-video.mp4
+Headers:
+  Content-Type: application/offset+octet-stream
+  Upload-Offset: 104857600       (从 100MB 处继续)
+Body: <10MB 二进制数据>
+    │
+    ▼
+【阶段 1】权限 & Content-Type 校验
+│
+├─ ① [tus_handlers.go:158-160] !Perm.Create || !d.Check(path) → 403
+└─ ② [tus_handlers.go:161-163] Content-Type != "application/offset+octet-stream" → 415
+│
+▼
+【阶段 2】读取偏移量 & 验证文件与会话
+│
+├─ ③ [tus_handlers.go:165-168] getUploadOffset(r)
+│     解析 Header "Upload-Offset" → uploadOffset = 104857600
+│
+├─ ④ [tus_handlers.go:170-184] NewFileInfo(path)
+│     │
+│     ├─ d.Check(path) → 细粒度规则检查
+│     ├─ ScopedFs.LstatIfPossible → guard/within 作用域检查
+│     └─ 文件不存在 → 404（会话对应的空文件被清理了）
+│
+├─ ⑤ [tus_handlers.go:186-189] cache.GetLength(file.RealPath())
+│     ├─ 缓存不存在 → 404（会话过期，需要重新创建 POST）
+│     └─ 缓存命中 → uploadLength = 524288000
+│
+└─ ⑥ [tus_handlers.go:192-193] 启动保活
+     stop := keepUploadActive(cache, file.RealPath())
+     defer stop()   ← 每 2 秒 Touch 一次，防止大分片传输中缓存过期
+│
+▼
+【阶段 3】偏移量一致性校验（TUS 协议核心）
+│
+└─ ⑦ [tus_handlers.go:195-204] 一致性核对：
+     ├─ file.IsDir → 400（不能写入目录）
+     └─ file.Size != uploadOffset
+          → 409 Conflict
+            说明：客户端声称的偏移量 ≠ 文件实际大小
+            可能场景：其他客户端已推进进度 / 部分写入被回滚 / 缓存错乱
+│
+▼
+【阶段 4】追加写入数据
+│
+├─ ⑧ [tus_handlers.go:206-210] 以追加写模式打开文件
+│     d.user.Fs.OpenFile(path, O_WRONLY|O_APPEND, FileMode)
+│        └─ ScopedFs.OpenFile → guard → within → BasePathFs → OsFs
+│
+├─ ⑨ [tus_handlers.go:212-215] Seek 到约定偏移量（双重保险，尽管 O_APPEND 总是追加到末尾）
+│     openFile.Seek(uploadOffset, 0)
+│        └─ 理论上 O_APPEND 会忽略 Seek 直接写末尾，但显式 Seek 到 offset 做一致性验证
+│
+├─ ⑩ [tus_handlers.go:217-221] 写入分片数据
+│     bytesWritten, _ = io.Copy(openFile, r.Body)   ← 将请求体全部写入文件
+│        └─ 这一步实际向磁盘追加了 10MB 数据
+│
+└─ ⑪ [tus_handlers.go:225-227] 强制落盘
+     openFile.Sync()
+│
+▼
+【阶段 5】进度更新 & 完成判断
+│
+├─ ⑫ [tus_handlers.go:229-230] 计算新偏移量
+│     newOffset = uploadOffset + bytesWritten = 104857600 + 10485760 = 115343360
+│     响应头 Upload-Offset: 115343360
+│
+└─ ⑬ [tus_handlers.go:232-235] 判断是否传输完成
+     if newOffset >= uploadLength:
+         cache.Complete(file.RealPath())   ← 删除缓存条目，停止 TTL 计时
+         d.RunHook(noop, "upload", ...)   ← 触发 upload 钩子（通知系统上传完成）
+│
+▼
+返回 HTTP 204 No Content
+```
+
+**PATCH 关键点**：
+- `file.Size != uploadOffset` 检查是**协议级一致性保证**，防止错乱写入
+- 大分片传输期间 `keepUploadActive` 每 2 秒刷新一次 TTL，防止缓存意外过期
+- 完成判断用 `newOffset >= uploadLength`（而不是 `==`），容忍客户端多发送字节（协议兼容性）
+
+---
+
+### 9.6 步骤四：取消上传（DELETE 清理）
+
+对应 [tusDeleteHandler](http/tus_handlers.go#L241-L273)，客户端主动中断：
+
+```
+HTTP DELETE /api/tus/uploads/large-video.mp4
+    │
+    ▼
+【阶段 1】权限
+│
+└─ ① [tus_handlers.go:243-245]
+     path == "/" || !d.user.Perm.Delete → 403
+     注意：删除权限（不是 Create），因为会删除已创建的部分文件
+│
+▼
+【阶段 2】确认文件与会话存在
+│
+├─ ② [tus_handlers.go:247-257] NewFileInfo(path)
+│     d.Check(path) → 细粒度规则
+│     ScopedFs.LstatIfPossible → 作用域检查
+│     文件不存在 → 返回对应错误码
+│
+└─ ③ [tus_handlers.go:259-262] cache.GetLength(file.RealPath())
+      缓存不存在 → 404（会话已完成或已过期，不允许取消）
+│
+▼
+【阶段 3】实际清理
+│
+├─ ④ [tus_handlers.go:264-267] 删除磁盘文件
+│     d.user.Fs.RemoveAll(path)
+│        └─ ScopedFs.RemoveAll → BasePathFs.RemoveAll → OsFs.RemoveAll
+│           （⚠️ RemoveAll 不走 guard，但上层已通过 NewFileInfo 验证作用域合法）
+│
+└─ ⑤ [tus_handlers.go:269] 删除缓存条目
+     cache.Complete(file.RealPath())
+│
+▼
+返回 HTTP 204 No Content
+```
+
+---
+
+### 9.7 TUS 各步骤之间的状态流转
+
+```
+                (客户端发起)
+                     │
+                     ▼
+        ┌─── POST 创建会话 ───┐
+        │  cache.Register()   │
+        │  创建空文件(0B)     │
+        │  返回 201 + Location│
+        └─────────┬───────────┘
+                  │
+        ┌─────────▼───────────┐
+        │                     │
+        ▼                     ▼
+  HEAD 查询进度          PATCH 追加写
+  cache.GetLength()      cache.GetLength()
+  返回 Upload-Offset     keepUploadActive 保活
+  (404=会话过期)          Offset == file.Size 校验
+                         追加写入 + Sync
+                         newOffset >= total
+                         → cache.Complete() + 钩子
+                              │
+        ┌─────────────────────┤
+        │                     │
+        ▼                     ▼
+(继续 PATCH 循环)      DELETE 取消上传
+                  cache.GetLength()
+                  d.user.Fs.RemoveAll()
+                  cache.Complete()
+```
+
+**状态缓存的生命周期与触发事件**：
+
+| 事件 | cache 操作 | 磁盘文件变化 |
+|------|-----------|-------------|
+| POST 创建 | `Register(realPath, size)` → TTL=3min | 空文件创建 / 截断为 0 |
+| HEAD 查询 | `GetLength()` → 隐式 Touch（Redis 实现） | 无 |
+| PATCH 开始 | `GetLength()` + `keepUploadActive` 每 2s Touch | 无 |
+| PATCH 写入 | — | 追加 + Sync |
+| PATCH 完成且 `>=total` | `Complete()` → 删除条目 | 无（文件已完整） |
+| DELETE 取消 | `Complete()` → 删除条目 | `RemoveAll` 删除 |
+| TTL 过期（内存） | `OnEviction` 回调 → `os.Remove(realPath)` | 删除不完整文件 |
+| TTL 过期（Redis） | 自动过期（无回调） | 保留孤儿文件，下次 PATCH 返回 404 由客户端决定 |
+
+---
+
+### 9.8 TUS 与"路径标准化 / 权限控制 / 作用域约束"的协作
+
+TUS 的 4 个 Handler 每一个都完整走通了三层抽象栈，与普通文件操作的顺序完全一致：
+
+```
+每个 TUS Handler 的统一开头模式：
+  1. stripPrefix("/api/tus")            ← L1 路径标准化
+  2. withUser() 认证加载 d.user
+  3. !d.user.Perm.{Create|Delete}       ← 权限第1关：粗粒度
+  4. !d.Check(r.URL.Path)               ← L3 标准化 + 权限第2关：细粒度规则
+  5. files.NewFileInfo({                ← L3 标准化 + 权限第2关（第2次验证）
+       Checker: d,                      ← 内部 d.Check 再次确认
+       Fs: d.user.Fs,                   ← 触发 ScopedFs.LstatIfPossible
+       ...                              ← guard/within：L4 标准化 + 作用域约束
+     })
+  6. 实际文件操作（OpenFile/RemoveAll） ← 再次触发 ScopedFs 作用域约束
+```
+
+**安全验证**：[TestTusHandlersRejectSymlinkScopeEscape](http/tus_symlink_test.go#L24-L119) 测试专门验证：
+- 用户作用域内的目录符号链接指向作用域外 → POST 创建会话被 403 拒绝
+- 同一场景下 PATCH 写入也被 403 拒绝
+- 即使路径词法上合法，ScopedFs.within 的符号链接解析也会拦截越界
+
+---
+
+## 十、关键安全设计总结
 
 | 安全机制 | 实现位置 | 执行阶段 | 防护目标 |
 |----------|----------|----------|----------|
@@ -636,6 +1019,9 @@ func (s *ScopedFs) Rename(oldname, newname string) error {
 | 符号链接越界防护 | `ScopedFs.within()` | 作用域约束 | 阻止作用域内符号链接指向外部目录 |
 | 真实路径解析 | `FullBaseFsPath + EvalSymlinks` | L4 路径标准化 | 获取磁盘上真实位置，作为作用域判断依据 |
 | 分享路径二次约束 | `public.go` 嵌套 `ScopedFs` | 作用域约束 | 分享链接只能访问被分享的子树 |
+| TUS 偏移量一致性 | `file.Size == uploadOffset` | PATCH 阶段 3 | 防止多客户端或错乱写入 |
+| 上传会话 TTL | `UploadCache` + TTL 过期清理 | 全流程 | 防止孤儿不完整文件永久残留 |
+| TUS 传输保活 | `keepUploadActive` 每 2s Touch | PATCH 大分片期间 | 防止大文件传输中会话意外过期 |
 
 **多层防护的执行顺序口诀**：
 

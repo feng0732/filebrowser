@@ -201,9 +201,304 @@ Settings.vue
 
 ---
 
-## 四、状态管理与路由布局的配合
+## 四、核心交互机制详解
 
-### 4.1 Pinia 注入 Router
+### 4.1 面包屑：由当前路径生成层级
+
+[Breadcrumbs.vue](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/components/Breadcrumbs.vue) 通过 **响应式计算属性** 从 `route.path` 自动生成面包屑层级。
+
+#### 4.1.1 核心计算逻辑
+
+`items` 计算属性（[Breadcrumbs.vue#L35-L72](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/components/Breadcrumbs.vue#L35-L72)）的生成流程：
+
+```
+route.path (如 /files/documents/work/report/)
+  ↓ 1. 去除 base 前缀
+relativePath = /documents/work/report/
+  ↓ 2. 按 "/" 分割为数组
+parts = ["", "documents", "work", "report", ""]
+  ↓ 3. 移除首尾空字符串
+parts = ["documents", "work", "report"]
+  ↓ 4. 遍历构建面包屑层级
+  - 第 0 级: { name: "documents", url: "/files/documents/" }
+  - 第 1 级: { name: "work",      url: "/files/documents/work/" }
+  - 第 2 级: { name: "report",    url: "/files/documents/work/report/" }
+  ↓ 5. 超过 3 层时截断（保留最后 3 层，第 1 层显示为 "..."）
+  - 若层级 > 3，循环 shift() 直到只剩 4 项
+  - 第 0 项 name 替换为 "..."
+```
+
+#### 4.1.2 关键设计要点
+
+| 特性 | 实现方式 | 作用 |
+|------|----------|------|
+| **Base 路径** | `props.base` 作为根路径前缀 | 支持在 Files (`/files`) 和 Share (`/share/:hash`) 等不同场景复用 |
+| **自动解码** | `decodeURIComponent(parts[i])` | 正确显示中文或特殊字符文件名 |
+| **层级截断** | 超过 3 层时首项显示为 "..." | 避免深层级目录面包屑过长溢出 |
+| **无链接模式** | `noLink` prop 控制渲染 `span` 或 `router-link` | 用于只读展示场景 |
+| **首页图标** | 首项为 home 图标，链接到 `base` | 提供快速返回根目录的入口 |
+
+#### 4.1.3 与路由的响应式联动
+
+由于 `items` 是 computed 属性，依赖 `route.path`，因此**路由变化时面包屑会自动更新**，无需手动监听。
+
+### 4.2 顶部菜单与侧栏：通过弹窗栈联动
+
+顶部菜单栏（HeaderBar）和侧边栏（Sidebar）通过 **layoutStore 的弹窗栈** 实现显示/隐藏联动，二者共享同一套状态机制。
+
+#### 4.2.1 弹窗栈核心状态
+
+[stores/layout.ts](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/stores/layout.ts) 中的 `prompts` 数组是弹窗栈的核心：
+
+```ts
+state: () => ({
+  prompts: PopupProps[],  // 弹窗栈，数组末尾为栈顶
+  loading: boolean,
+  showShell: boolean,
+})
+
+getters: {
+  currentPrompt() { return prompts[prompts.length - 1] },  // 取栈顶
+  currentPromptName() { return this.currentPrompt?.prompt }, // 栈顶弹窗名
+}
+
+actions: {
+  showHover(value) { prompts.push(value) },   // 压栈
+  closeHovers() { prompts.pop()?.close?.() }, // 弹栈并调用 close 回调
+}
+```
+
+#### 4.2.2 侧栏打开/关闭联动
+
+**打开侧栏（HeaderBar → Sidebar）**：
+
+1. HeaderBar 的菜单按钮点击 → 调用 `layoutStore.showHover('sidebar')`（[HeaderBar.vue#L8-L10](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/components/header/HeaderBar.vue#L8-L10)）
+2. `showHover('sidebar')` 向 `prompts` 栈压入 `{ prompt: "sidebar", ... }`
+3. Sidebar 组件通过 `currentPromptName === 'sidebar'` 判断是否激活 → 添加 `active` 类（[Sidebar.vue#L155-L157](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/components/Sidebar.vue#L155-L157)）
+4. CSS 过渡动画使侧边栏从左侧滑入
+
+**关闭侧栏（多种触发方式）**：
+
+| 触发方式 | 实现位置 | 效果 |
+|----------|----------|------|
+| 点击遮罩层 | [Sidebar.vue#L2](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/components/Sidebar.vue#L2) | 点击 `.overlay` → `closeHovers()` |
+| 点击菜单项跳转 | [Sidebar.vue#L193-L201](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/components/Sidebar.vue#L193-L201) | `toRoot/toAccountSettings` 等方法内调用 `closeHovers()` |
+| 路由切换 | [Layout.vue#L47-L53](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/views/Layout.vue#L47-L53) | Layout 的 `watch(route)` → `closeHovers()`（非 success 弹窗） |
+
+#### 4.2.3 顶部"更多"菜单的同一机制
+
+HeaderBar 右侧的 `more_vert` 按钮也使用弹窗栈机制（[HeaderBar.vue#L14-L33](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/components/header/HeaderBar.vue#L14-L33)）：
+
+```
+点击 more 按钮
+  → layoutStore.showHover('more')
+  → #dropdown 元素添加 active 类（显示下拉菜单）
+  → .overlay 显示，点击遮罩调用 closeHovers() 关闭
+```
+
+#### 4.2.4 Action 组件的 show 属性
+
+[Action.vue](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/components/header/Action.vue) 封装了按钮 + 弹窗触发的通用逻辑：
+
+```ts
+const action = () => {
+  if (props.show) {
+    layoutStore.showHover(props.show);  // 自动触发弹窗
+  }
+  emit("action");
+};
+```
+
+这样使用方只需传入 `show="share"` 或 `show="rename"` 等属性，按钮点击就会自动打开对应弹窗，无需重复写触发逻辑。
+
+#### 4.2.5 弹窗栈与路由的关系
+
+弹窗栈**完全独立于路由**状态：
+- 弹窗状态不反映在 URL 中，刷新页面弹窗会消失
+- 路由切换时 Layout 会主动调用 `closeHovers()` 清理弹窗
+- 这是有意的设计选择：弹窗是临时 UI 状态，不应通过路由管理
+
+### 4.3 侧栏跳转与用量刷新：响应路由变化
+
+[Sidebar.vue](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/components/Sidebar.vue) 既是导航的发起者，也是路由变化的响应者。
+
+#### 4.3.1 侧栏菜单项的跳转行为
+
+各菜单项点击后执行路由跳转并关闭侧栏（[Sidebar.vue#L191-L205](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/components/Sidebar.vue#L191-L205)）：
+
+```ts
+toRoot() {
+  this.$router.push({ path: "/files" });
+  this.closeHovers();   // 跳转后立即关闭侧栏
+},
+
+toAccountSettings() {
+  this.$router.push({ path: "/settings/profile" });
+  this.closeHovers();
+},
+
+toGlobalSettings() {
+  this.$router.push({ path: "/settings/global" });
+  this.closeHovers();
+},
+```
+
+**设计特点**：
+- 跳转 + 关侧栏是原子操作，避免侧栏残留
+- 使用 `$router.push` 而非 `router-link`，因为需要在跳转后执行额外逻辑（关闭弹窗）
+
+#### 4.3.2 磁盘用量的路由响应式刷新
+
+侧栏底部显示磁盘使用量，该数据**只在文件页面才获取**，通过 `watch.$route` 实现（[Sidebar.vue#L208-L217](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/components/Sidebar.vue#L208-L217)）：
+
+```
+watch: {
+  $route: {
+    handler(to) {
+      if (to.path.includes("/files")) {
+        this.fetchUsage();   // 进入 /files 路径时获取用量
+      }
+    },
+    immediate: true,         // 组件挂载时立即执行一次
+  }
+}
+```
+
+**用量获取的细节**：
+
+| 特性 | 实现 | 作用 |
+|------|------|------|
+| **条件触发** | `to.path.includes("/files")` | 设置页等非文件页面不请求用量数据 |
+| **请求取消** | `AbortController` + `abortOngoingFetch()` | 路由快速切换时取消未完成的请求，避免竞态 |
+| **展示条件** | `isFiles && !disableUsedPercentage` | 只有文件页面且启用用量统计时才显示进度条 |
+
+#### 4.3.3 菜单项的权限控制
+
+侧栏菜单项根据用户权限动态显示/隐藏（[Sidebar.vue#L19-L51](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/components/Sidebar.vue#L19-L51)）：
+
+```
+已登录状态显示：
+  ├── 用户名（所有人）
+  ├── "我的文件"（所有人）
+  ├── 新建文件夹/新建文件（perm.create）
+  ├── 设置（perm.admin）
+  └── 退出登录（!noAuth && 配置允许注销）
+
+未登录状态显示：
+  ├── 登录按钮（!hideLoginButton）
+  └── 注册按钮（signup 启用）
+```
+
+这些权限条件通过 computed 属性从 `authStore.user` 派生，权限变化时菜单项会自动更新。
+
+### 4.4 路由变化：选择与多选状态的重置
+
+文件选择状态（`fileStore.selected`）和多选模式（`fileStore.multiple`）在路由切换时会被**多级重置**，确保不同页面/目录间选择状态不混淆。
+
+#### 4.4.1 重置触发点汇总
+
+| 层级 | 触发位置 | 重置内容 | 时机 |
+|------|----------|----------|------|
+| **布局层** | [Layout.vue#L47-L53](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/views/Layout.vue#L47-L53) | `selected = []`, 关闭非 success 弹窗 | 任意路由切换 |
+| **视图层** | [Files.vue#L146-L148](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/views/Files.vue#L146-L148) `fetchData()` | `selected = []`, `multiple = false`, 关闭 hover | 路径变化需重新获取数据时 |
+| **视图层** | [Share.vue#L394-L397](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/views/Share.vue#L394-L397) `fetchData()` | `selected = []`, `multiple = false`, 关闭 hover | 共享路径变化时 |
+| **列表层** | [FileListing.vue#L392-L394](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/views/files/FileListing.vue#L392-L394) `onBeforeRouteUpdate` | 隐藏右键菜单 | 路由更新前 |
+| **数据层** | [stores/file.ts#L41-L54](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/stores/file.ts#L41-L54) `updateRequest()` | `selected = []` 后尝试恢复同名项 | 请求数据更新时 |
+
+#### 4.4.2 Layout 层：全局路由监听重置
+
+最顶层的重置在 Layout.vue 的 `watch(route)` 中（[Layout.vue#L47-L53](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/views/Layout.vue#L47-L53)）：
+
+```ts
+watch(route, () => {
+  fileStore.selected = [];           // 清空所有选中项
+  fileStore.multiple = false;        // 退出多选模式
+  if (layoutStore.currentPromptName !== "success") {
+    layoutStore.closeHovers();       // 关闭非成功弹窗
+  }
+});
+```
+
+**作用范围**：所有嵌套在 Layout 下的路由（`/files/*`、`/settings/*`、`/share/*`）切换时都会触发。
+
+**注意**：`success` 弹窗不关闭，用于操作成功后的提示延续（如复制/移动成功提示）。
+
+#### 4.4.3 Files 视图层：数据获取时重置
+
+Files.vue 的 `fetchData()` 函数在每次获取数据前重置选择状态（[Files.vue#L143-L149](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/views/Files.vue#L143-L149)）：
+
+```ts
+const fetchData = async () => {
+  fileStore.reload = false;
+  fileStore.selected = [];     // 清空选择
+  fileStore.multiple = false;  // 退出多选
+  layoutStore.closeHovers();   // 关闭弹窗
+  // ... 发起 API 请求
+};
+```
+
+触发时机包括：
+- `watch(route)` 监听到路由变化
+- `watch(reload)` 监听到 `fileStore.reload = true`（操作后刷新）
+- 组件 `onMounted` 首次挂载
+
+#### 4.4.4 File Store 层：数据更新时的选择保留
+
+[stores/file.ts](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/stores/file.ts) 的 `updateRequest` 方法有一个巧妙的设计：**先清空再尝试按 URL 恢复选择**（[file.ts#L41-L54](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/stores/file.ts#L41-L54)）：
+
+```ts
+updateRequest(value: Resource | null) {
+  const selectedItems = this.selected.map((i) => this.req?.items[i]);
+  this.oldReq = this.req;
+  this.req = value;
+
+  this.selected = [];  // 先清空
+
+  if (!this.req?.items) return;
+  // 尝试按 URL 匹配恢复之前选中的项
+  this.selected = this.req.items
+    .filter((item) => selectedItems.some((rItem) => rItem?.url === item.url))
+    .map((item) => item.index);
+}
+```
+
+**应用场景**：刷新目录（如上传、删除文件后）时，相同文件名的文件会保持选中状态，提升操作连贯性。
+
+#### 4.4.5 目录切换后的预选（Preselection）
+
+Files.vue 的 `applyPreSelection` 函数（[Files.vue#L117-L141](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/views/Files.vue#L117-L141)）在目录切换后会预选一个文件，提供两种预选逻辑：
+
+```
+场景一：有 preselect 目标（操作后指定选中）
+  → fileStore.preselect 不为 null
+  → 在 req.items 中查找 path 匹配的项
+  → 将该项加入 selected
+
+场景二：从子目录返回父目录（oldReq 是子目录路径）
+  → fileStore.oldReq.path 以 req.path 开头
+  → 提取 oldReq 路径中紧接的下一级目录名
+  → 在 req.items 中查找并选中该项（高亮刚离开的子目录）
+```
+
+这个机制让用户在目录间导航时能保持视觉连续性，知道自己从哪里来。
+
+#### 4.4.6 FileListing 内的右键菜单重置
+
+[FileListing.vue](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/views/files/FileListing.vue) 使用 `onBeforeRouteUpdate` 钩子在路由更新前隐藏右键菜单（[FileListing.vue#L392-L394](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/views/files/FileListing.vue#L392-L394)）：
+
+```ts
+onBeforeRouteUpdate(() => {
+  hideContextMenu();
+});
+```
+
+这是更细粒度的重置，确保路由变化前上下文菜单被正确收起。
+
+---
+
+## 五、状态管理与路由布局的配合
+
+### 5.1 Pinia 注入 Router
 
 在 [stores/index.ts](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/stores/index.ts) 中，Pinia 通过插件把 `router` 实例注入到每个 store：
 
@@ -215,7 +510,7 @@ pinia.use(({ store }) => {
 
 这样所有 store 都可以通过 `this.router` 访问路由实例（当前代码中主要为预留能力）。
 
-### 4.2 Layout Store 控制全局 UI
+### 5.2 Layout Store 控制全局 UI
 
 [stores/layout.ts](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/stores/layout.ts) 管理跨页面共享的 UI 状态：
 
@@ -231,19 +526,19 @@ pinia.use(({ store }) => {
 - `currentPromptName` getter 取栈顶弹窗名
 - Prompts.vue 通过 `component :is="modal"` 动态渲染当前弹窗组件
 
-### 4.3 Auth Store 控制路由守卫
+### 5.3 Auth Store 控制路由守卫
 
 [stores/auth.ts](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/stores/auth.ts) 的 `isLoggedIn` getter 和 `user.perm.admin` 是路由守卫判断的核心依据。
 
-### 4.4 File Store 驱动视图切换
+### 5.4 File Store 驱动视图切换
 
 [stores/file.ts](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/stores/file.ts) 的 `req` 字段存储当前请求的文件资源对象。Files.vue 的 `currentView` computed 完全依赖 `req` 的属性（`isDir`、`type`、`extension`）决定渲染哪个子视图。
 
 ---
 
-## 五、路由切换的完整数据流
+## 六、路由切换的完整数据流
 
-### 5.1 场景一：用户从登录页进入文件浏览
+### 6.1 场景一：用户从登录页进入文件浏览
 
 ```
 用户点击登录
@@ -271,48 +566,67 @@ Files.vue onMounted
 currentView 计算 → req.isDir=true → 渲染 FileListing.vue
   ↓
 layoutStore.loading = false，页面展示文件列表
+  ↓
+Sidebar 监听到路由包含 /files
+  └── fetchUsage() 获取磁盘用量并显示
 ```
 
-### 5.2 场景二：在文件列表中点击子目录
+### 6.2 场景二：在文件列表中点击子目录
 
 ```
 用户点击目录 /documents
   ↓
-router.push("/files/documents")
+ListingItem.open() → router.push("/files/documents")
   ↓
 beforeResolve（from.name 非空，跳过 initAuth）
   ↓
 Layout.vue watch(route)
   ├── fileStore.selected = []（清空选择）
+  ├── fileStore.multiple = false（退出多选）
   └── layoutStore.closeHovers()（关闭弹窗）
+  ↓
+FileListing.vue onBeforeRouteUpdate → hideContextMenu()
   ↓
 Files.vue watch(route) → fetchData()
   ├── 中止上次请求（AbortController）
+  ├── fileStore.selected = []
+  ├── fileStore.multiple = false
   ├── 请求 /api/resources/documents
-  └── fileStore.updateRequest() 更新 req
+  └── fileStore.updateRequest() 更新 req + 预选旧目录
   ↓
 currentView 仍为 FileListing.vue，但数据已更新
   ↓
-Breadcrumbs 组件根据 route.params.path 自动更新面包屑
+Breadcrumbs 自动计算：/files/ + documents → 更新面包屑
+  ↓
+Sidebar 监听到路由仍在 /files 下
+  └── abortOngoingFetchUsage() + fetchUsage()（重新获取用量）
 ```
 
-### 5.3 场景三：从文件列表进入设置页
+### 6.3 场景三：从文件列表进入设置页
 
 ```
 Sidebar 点击 "设置" → router.push("/settings/global")
   ↓
+Sidebar.toGlobalSettings()
+  ├── $router.push({ path: "/settings/global" })
+  └── closeHovers()（关闭侧栏）
+  ↓
 Layout.vue watch(route)
   ├── fileStore.selected = []
-  └── fileStore.multiple = false
+  ├── fileStore.multiple = false
+  └── layoutStore.closeHovers()
   ↓
-Settings.vue 渲染（其 watch 会触发子路由数据加载）
+Settings.vue 渲染
   ↓
 Settings 内部导航高亮 "全局设置"（通过 $route.path 判断 active 类）
   ↓
 Settings > router-view → GlobalSettings.vue
+  ↓
+Sidebar 监听到路由不含 /files
+  └── 不请求磁盘用量，用量区域不显示
 ```
 
-### 5.4 场景四：未登录用户访问受保护路由
+### 6.4 场景四：未登录用户访问受保护路由
 
 ```
 直接访问 /settings/profile
@@ -322,18 +636,40 @@ beforeResolve 守卫
   ├── authStore.isLoggedIn 为 false
   └── next({ path: "/login", query: { redirect: "/settings/profile" } })
   ↓
-Login.vue 渲染
+Login.vue 渲染（独立布局，无 Sidebar）
   ↓
 用户登录成功 → router.push(query.redirect || "/files/")
   ↓
 回到场景一的流程
 ```
 
+### 6.5 场景五：侧栏开闭交互
+
+```
+点击 HeaderBar 菜单按钮
+  ↓
+Action @action → layoutStore.showHover('sidebar')
+  ↓
+prompts 栈压入 { prompt: "sidebar" }
+  ↓
+currentPromptName = "sidebar"
+  ↓
+Sidebar: active = true → 侧边栏滑入 + 遮罩显示
+  ↓
+（用户点击遮罩 / 点击菜单项 / 路由切换）
+  ↓
+layoutStore.closeHovers()
+  ↓
+prompts 栈弹出 → currentPromptName 变化
+  ↓
+Sidebar: active = false → 侧边栏滑出
+```
+
 ---
 
-## 六、关键设计模式总结
+## 七、关键设计模式总结
 
-### 6.1 嵌套路由 + 嵌套布局
+### 7.1 嵌套路由 + 嵌套布局
 
 整个应用通过三层嵌套 `router-view` 实现布局复用：
 
@@ -344,28 +680,37 @@ Login.vue 渲染
 | 第三层 | Files.vue / Settings.vue / Share.vue | 页面容器（导航栏、面包屑、子视图） |
 | 第四层 | FileListing / Editor / Preview / ProfileSettings... | 具体内容 |
 
-### 6.2 动态组件 + Pinia 驱动视图
+### 7.2 动态组件 + Pinia 驱动视图
 
 Files.vue 不使用子路由区分文件/目录/编辑器，而是通过 `fileStore.req` 的元数据动态 `<component :is="currentView">`，实现了**单路由多视图**的模式，避免了路由过度碎片化。
 
-### 6.3 弹窗栈（Prompt Stack）
+### 7.3 弹窗栈（Prompt Stack）
 
-全局弹窗不使用路由控制，而是通过 `layoutStore.prompts` 数组作为栈管理，Prompts.vue 作为统一容器渲染栈顶弹窗。优势：
+全局弹窗（包括 Sidebar、more 菜单、各种对话框）不使用路由控制，而是通过 `layoutStore.prompts` 数组作为栈管理，Prompts.vue 作为统一容器渲染栈顶弹窗。优势：
 - 弹窗状态与 URL 解耦，刷新不残留
 - 支持弹窗叠加（栈结构）
 - 统一的开关、回调机制
+- HeaderBar 和 Sidebar 通过同一状态联动
 
-### 6.4 路由守卫集中控制权限
+### 7.4 路由守卫集中控制权限
 
 所有权限检查集中在 `beforeResolve` 单一守卫中，通过 `meta.requiresAuth` 和 `meta.requiresAdmin` 声明式配置，避免每个组件重复鉴权逻辑。
 
-### 6.5 响应式路由监听驱动数据
+### 7.5 响应式路由监听驱动数据
 
 Files.vue、Share.vue、Sidebar.vue 均使用 `watch(route)` 触发数据重新获取，Layout.vue 用 watch(route) 做全局 UI 重置，确保路由变化时各组件能正确响应。
 
+### 7.6 多级状态重置保障一致性
+
+文件选择状态通过**布局层 → 视图层 → 数据层 → 列表层**四级重置，配合数据更新时的智能恢复，既保证了跨页面选择状态不混淆，又在同目录刷新时保留用户选择。
+
+### 7.7 面包屑的纯计算属性设计
+
+面包屑完全通过 `computed` 从 `route.path` 派生，无需任何手动同步逻辑，天然响应式且无副作用。
+
 ---
 
-## 七、核心文件速查
+## 八、核心文件速查
 
 | 文件 | 作用 |
 |------|------|
@@ -373,8 +718,12 @@ Files.vue、Share.vue、Sidebar.vue 均使用 `watch(route)` 触发数据重新�
 | [views/Layout.vue](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/views/Layout.vue) | 主布局框架（Sidebar + Main + Prompts） |
 | [views/Files.vue](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/views/Files.vue) | 文件浏览容器，动态切换 Listing/Editor/Preview |
 | [views/Settings.vue](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/views/Settings.vue) | 设置页容器 + 二级导航 |
-| [stores/layout.ts](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/stores/layout.ts) | 全局 UI 状态（弹窗栈、加载、Shell） |
-| [stores/file.ts](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/stores/file.ts) | 当前文件资源状态，驱动视图切换 |
-| [stores/auth.ts](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/stores/auth.ts) | 用户认证状态，驱动权限守卫 |
-| [components/Sidebar.vue](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/components/Sidebar.vue) | 侧边栏导航，根据权限显示菜单项 |
+| [components/Breadcrumbs.vue](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/components/Breadcrumbs.vue) | 面包屑路径生成 |
+| [components/Sidebar.vue](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/components/Sidebar.vue) | 侧边栏导航，根据权限显示菜单项，响应路由刷新用量 |
+| [components/header/HeaderBar.vue](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/components/header/HeaderBar.vue) | 顶部操作栏，菜单按钮触发侧栏 |
+| [components/header/Action.vue](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/components/header/Action.vue) | 通用按钮组件，支持 show 属性触发弹窗 |
 | [components/prompts/Prompts.vue](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/components/prompts/Prompts.vue) | 全局弹窗渲染容器 |
+| [views/files/FileListing.vue](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/views/files/FileListing.vue) | 文件列表，包含选择/多选/右键菜单逻辑 |
+| [stores/layout.ts](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/stores/layout.ts) | 全局 UI 状态（弹窗栈、加载、Shell） |
+| [stores/file.ts](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/stores/file.ts) | 当前文件资源状态，驱动视图切换，管理选择状态 |
+| [stores/auth.ts](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/stores/auth.ts) | 用户认证状态，驱动权限守卫 |

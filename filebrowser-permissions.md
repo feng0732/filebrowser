@@ -346,6 +346,7 @@ authToken {
 | `/api/users/{id}` | DELETE | withSelfOrAdmin | JSON Auth 需当前密码；唯一管理员不可删除 |
 | `/api/settings` | GET/PUT | withAdmin | — |
 | `/api/resources` | GET | withUser | `Download` 控制内容读取；NewFileInfo 内调用 Check(path) |
+| `/api/resources/recursive` | GET | withUser | **不显式检查 `Download` 权限**；根目录 `Fs.Stat` 校验；`afero.Walk` 递归遍历中对每个路径调用 `d.Check(path)`，拒绝目录则 SkipDir，拒绝文件则跳过（详见 §4.4） |
 | `/api/resources` | DELETE | withUser | `Delete` + 路径≠`/` |
 | `/api/resources` | POST | withUser | `Create` + `Check(path)`；覆盖需 `Modify` |
 | `/api/resources` | PUT | withUser | `Modify` + `Check(path)`；仅文件 |
@@ -458,6 +459,68 @@ Check() 不仅在 handler 中显式调用，还在 `files.NewFileInfo` 内部被
 ### 4.3 第三层：操作权限位（Permissions）
 
 即用户的 `Perm` 字段，8 个布尔位精确控制每个操作类型。详见上文 §1.2 和 §3.2。
+
+### 4.4 递归列举接口的过滤流程（GET /api/resources/recursive）
+
+递归列举接口（`http/resource.go` resourceGetRecursiveHandler）与普通 GET /api/resources 的实现方式不同，其权限检查流程也有差异。
+
+**与普通 GET 的核心差异**：
+
+| 维度 | GET /api/resources | GET /api/resources/recursive |
+|------|-------------------|------------------------------|
+| 实现方式 | 调用 `files.NewFileInfo` + `readListing` | 调用 `afero.Walk` 手动遍历 |
+| Download 权限 | 显式检查（`Content: d.user.Perm.Download`） | **不显式检查** |
+| 规则过滤位置 | NewFileInfo 入口 + readListing 子项遍历 | afero.Walk 回调中手动调用 `d.Check` |
+| 拒绝目录行为 | 子项跳过（continue） | 返回 `filepath.SkipDir`，整个子树跳过 |
+| 根路径检查 | NewFileInfo 内部 Check 入口校验 | `Fs.Stat` 存在性校验（**不调 Check**） |
+
+**完整过滤流程**：
+
+```
+阶段 1: withUser 中间件
+  ├─ JWT 验证 + 加载用户
+  └─ 不检查 Download 权限（仅 withUser，无额外权限校验）
+
+阶段 2: 根目录存在性校验
+  └─ d.user.Fs.Stat(rootPath)
+       ├─ ScopedFs 词法限制：路径无法逃逸用户 Scope
+       └─ ScopedFs.guard → within：符号链接目标无法逃逸用户 Scope
+       └─ 检查是否为目录，不是目录则 400
+       └─ ⚠️  注意：此处不调用 d.Check(rootPath)，
+               即使根目录被规则拒绝，仍能继续遍历
+
+阶段 3: afero.Walk 递归遍历
+  └─ 对每个子项调用 WalkFunc:
+       │
+       ├─ 跳过根目录本身（fPath == rootPath → return nil）
+       │
+       ├─ 调用 d.Check(fPath) 规则过滤
+       │   ├─ HideDotfiles 检查
+       │   ├─ 全局 Rules 匹配
+       │   └─ 用户 Rules 匹配
+       │
+       ├─ 规则拒绝 + 是目录 → return filepath.SkipDir
+       │   （整个子树被跳过，不再深入）
+       │
+       ├─ 规则拒绝 + 是文件 → return nil
+       │   （仅跳过该文件）
+       │
+       └─ 规则通过 → 加入 entries 列表
+            （Path / Name / Size / ModTime / IsDir）
+
+阶段 4: 返回结果
+  └─ renderJSON(w, r, entries)
+```
+
+**安全注意事项**：
+
+1. **根目录不检查规则**：若请求的根路径本身被规则拒绝（如规则拒绝 `/docs`），递归列举接口仍会进入 Walk 并列举 `/docs` 的子项。但每个子项会单独调用 `d.Check()`，例如 `/docs/secret` 会被规则过滤掉。也就是说，根目录本身的元数据（名称、大小等）可能泄露，但子内容受规则保护。
+
+2. **无 Download 权限检查**：普通 GET /api/resources 通过 `Content: d.user.Perm.Download` 控制是否返回文件内容（元数据始终返回），而递归列举接口完全不检查 Download 权限，所有通过规则过滤的条目都会返回元数据（Path / Name / Size / ModTime / IsDir）。但由于不返回文件内容，这一差异的实际影响有限。
+
+3. **SkipDir 优化**：目录被规则拒绝时返回 `filepath.SkipDir`，afero.Walk 会跳过整个子树，不会继续深入遍历，既安全又高效。
+
+4. **ScopedFs 仍然生效**：虽然根目录不调 Check，但 ScopedFs 的词法限制和符号链接保护仍然通过 `Fs.Stat` 和 `afero.Walk` 底层的 Fs 操作生效，无法逃逸用户 Scope。
 
 ---
 
@@ -693,7 +756,7 @@ HTTP 请求
 | 无认证 | `auth/none.go` | NoAuth、固定 ID=1、不创建用户 |
 | HTTP 认证中间件 | `http/auth.go` | withUser、withAdmin、JWT 处理、注册限制（Admin=false, Execute=false, Scope 主动清空） |
 | HTTP 数据上下文 | `http/data.go` | data 结构体、Check()（规则评估 + checkerPrefix 还原） |
-| 资源操作 | `http/resource.go` | CRUD handler 中的权限检查 |
+| 资源操作 | `http/resource.go` | CRUD handler、递归列举（resourceGetRecursiveHandler，无 Download 检查） |
 | 分享操作 | `http/share.go` | withPermShare、分享 CRUD（创建时不调 Check） |
 | 公开访问 | `http/public.go` | withHashFile、分享验证、Fs 重新绑定、checkerPrefix 设置 |
 | 文件下载 | `http/raw.go` | rawHandler、getFiles（递归 Check） |

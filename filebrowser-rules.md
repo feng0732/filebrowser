@@ -812,66 +812,67 @@ if !checker.Check(fPath) {
 | 删除 | `DELETE /api/resources/*` | NewFileInfo | 拦截式 | 403 Forbidden |
 | 原始文件下载 | `GET /api/raw/*`（文件） | NewFileInfo | 拦截式 | 403 Forbidden |
 | 打包下载（目录本身） | `GET /api/raw/*`（目录） | NewFileInfo | 拦截式 | 403 Forbidden |
-| 打包下载（子文件/目录） | 同上 | getFiles | 过滤式 | 当前目录静默跳过，子路径独立判定 |
-| 搜索（整体） | `GET /api/search` | search.Search | 过滤式 | 当前目录静默跳过，子路径继续遍历独立判定 |
+| 打包下载（子目录） | 同上 | getFiles | 过滤式 | 当前目录静默跳过，**不进入子树** |
+| 打包下载（子文件） | 同上 | getFiles | 过滤式 | 静默跳过 |
+| 搜索（目录） | `GET /api/search` | search.Search | 过滤式 | 当前目录静默跳过，**继续进入子路径** |
+| 搜索（文件） | `GET /api/search` | search.Search | 过滤式 | 静默跳过 |
 | 公共分享（根路径） | `GET /api/public/share/*` | 第一次 NewFileInfo | 拦截式 | 403 Forbidden |
 | 公共分享（子路径） | 同上 | 第二次 NewFileInfo | 拦截式 | 403 Forbidden |
-| 公共分享（目录列表子项） | 同上 | readListing | 过滤式 | 当前目录静默跳过，子路径用户触发时独立判定 |
-| 公共分享下载（子文件/目录） | `GET /api/public/dl/*` | getFiles | 过滤式 | 当前目录静默跳过，子路径独立判定 |
-| 递归列表 | `GET /api/resources/recursive` | Walk 回调 | 过滤式 | 当前目录静默跳过，子路径独立判定（SkipDir为遍历优化） |
-| 目录列表 | `GET /api/resources/*`（目录） | readListing | 过滤式 | 当前目录静默跳过，子路径用户触发时独立判定 |
+| 公共分享（目录列表子目录） | 同上 | readListing | 过滤式 | 当前目录静默跳过，子路径用户触发时独立判定 |
+| 公共分享（目录列表子文件） | 同上 | readListing | 过滤式 | 静默跳过 |
+| 公共分享下载（子目录） | `GET /api/public/dl/*` | getFiles | 过滤式 | 当前目录静默跳过，**不进入子树** |
+| 公共分享下载（子文件） | `GET /api/public/dl/*` | getFiles | 过滤式 | 静默跳过 |
+| 递归列表（目录） | `GET /api/resources/recursive` | Walk 回调 | 过滤式 | 当前目录静默跳过，**不进入子树** |
+| 递归列表（文件） | `GET /api/resources/recursive` | Walk 回调 | 过滤式 | 静默跳过 |
+| 目录列表（子目录） | `GET /api/resources/*`（目录） | readListing | 过滤式 | 当前目录静默跳过，子路径用户触发时独立判定 |
+| 目录列表（子文件） | `GET /api/resources/*`（目录） | readListing | 过滤式 | 静默跳过 |
 
-### 10.3 遍历场景目录被拒的统一模式
+### 10.3 三种递归遍历场景目录被拒的行为差异
 
-所有遍历场景（搜索、递归列表、打包下载、目录列表）在目录被规则拒绝时都遵循统一模式：
+根据代码实际实现，搜索、递归列表、打包下载三种递归遍历场景在目录被规则拒绝后的物理行为存在明确差异：
 
-| 场景 | 当前目录被拒时的表现 | 子路径处理 | 遍历层优化手段 | 代码位置 |
-|------|-------------------|-----------|--------------|---------|
-| **搜索** | 静默跳过（return nil） | 继续遍历，独立 Check | 无 | [search/search.go#L42-L44](file:///d:/fz/0601/solo-dogfeeding/code/175-filebrowser/search/search.go#L42-L44) |
-| **递归列表** | 静默跳过（SkipDir） | 独立判定（SkipDir 为遍历优化） | `filepath.SkipDir` | [http/resource.go#L426-L431](file:///d:/fz/0601/solo-dogfeeding/code/175-filebrowser/http/resource.go#L426-L431) |
-| **打包下载** | 静默跳过（return nil,nil） | 独立判定（提前 return 为遍历优化） | 提前 return 不递归 | [http/raw.go#L112-L115](file:///d:/fz/0601/solo-dogfeeding/code/175-filebrowser/http/raw.go#L112-L115) |
-| **目录列表** | 静默跳过（continue） | 用户触发访问时独立判定 | 无（本身不递归） | [files/file.go#L409-L411](file:///d:/fz/0601/solo-dogfeeding/code/175-filebrowser/files/file.go#L409-L411) |
+| 场景 | 当前目录被拒时的表现 | 子目录物理上是否被访问 | 关键代码 | 代码位置 |
+|------|-------------------|---------------------|----------|---------|
+| **搜索** | 静默跳过（return nil） | ✅ **是**，Walk 继续进入子路径 | `return nil` | [search/search.go#L42-L44](file:///d:/fz/0601/solo-dogfeeding/code/175-filebrowser/search/search.go#L42-L44) |
+| **递归列表** | 静默跳过（SkipDir） | ❌ **否**，SkipDir 跳过整个子树 | `return filepath.SkipDir` | [http/resource.go#L419-L423](file:///d:/fz/0601/solo-dogfeeding/code/175-filebrowser/http/resource.go#L419-L423) |
+| **打包下载** | 静默跳过（return nil,nil） | ❌ **否**，后续递归分支不执行 | `return nil, nil` | [http/raw.go#L112-L115](file:///d:/fz/0601/solo-dogfeeding/code/175-filebrowser/http/raw.go#L112-L115) |
 
-**统一结论**：目录被规则拒绝时**本身静默跳过**（不出现在结果中、不报错、不中断），**子路径层面继续遍历并独立进行规则判定**。递归列表的 `SkipDir` 和打包下载的提前 `return` 是遍历引擎层面的性能优化，不改变规则判定的最终效果。
+**结论（基于代码）**：
+- **搜索**会继续进入被拒目录的子路径，每个子路径独立进行规则判定
+- **递归列表**和**打包下载**不会进入被拒目录的子树，整个子目录被跳过
 
 ---
 
 ## 十一、目录被规则拒绝后的遍历逻辑深度分析
 
-### 11.1 统一处理模式概述
+### 11.1 基于代码的物理行为总览
 
-所有四种遍历场景（搜索、递归列表、打包下载、目录列表）在目录被规则拒绝时，都遵循以下统一模式：
+根据代码实际实现，目录被规则拒绝后的物理行为存在明确差异，核心结论如下：
 
-| 维度 | 统一行为 |
-|-----|---------|
-| **当前目录本身** | **静默跳过**：目录不出现在结果列表中，不报错，不中断整体操作 |
-| **子路径层面** | **继续遍历，独立判定**：每个子路径不会因为父目录被拒就自动被排除，而是继续被遍历到并独立执行 `checker.Check()` 规则检查 |
-
-各场景在遍历引擎的技术实现上存在差异（`afero.Walk`、手动递归、单层读取），但从规则生效的实际效果来看，都符合上述统一模式。
+| 场景 | 当前目录被拒 | 子目录物理上是否被访问 | 关键代码 |
+|------|------------|---------------------|----------|
+| **搜索** | ✅ 静默跳过 | ✅ **是**，继续进入子路径 | `return nil` |
+| **递归列表** | ✅ 静默跳过 | ❌ **否**，不进入子树 | `return filepath.SkipDir` |
+| **打包下载** | ✅ 静默跳过 | ❌ **否**，不进入子树 | `return nil, nil`，后续递归分支不执行 |
+| **目录列表** | ✅ 静默跳过 | ❌ 不自动递归，用户触发时独立判定 | `continue` |
 
 ---
 
-### 11.2 四种场景的逐行代码分析
+### 11.2 三种递归遍历场景的逐行代码对比
 
-#### 场景一：搜索（search.Search）
+#### 场景一：搜索（search.Search）—— 继续进入子路径
 
 **触发入口**：`GET /api/search?query=xxx`
-**代码位置**：[search/search.go#L29-L76](file:///d:/fz/0601/solo-dogfeeding/code/175-filebrowser/search/search.go#L29-L76)
+**代码位置**：[search/search.go#L42-L44](file:///d:/fz/0601/solo-dogfeeding/code/175-filebrowser/search/search.go#L42-L44)
 
 核心代码：
 ```go
-return afero.Walk(fs, scope, func(fPath string, f os.FileInfo, _ error) error {
-    // ...
-    if fPath == scope {
-        return nil           // 根目录：继续
-    }
-
-    if !checker.Check(fPath) {
-        return nil           // 规则拒绝：当前目录静默跳过
-    }
-    // ... 匹配成功 → 发送搜索结果
-})
+if !checker.Check(fPath) {
+    return nil  // 目录被拒 → return nil
+}
 ```
+
+**afero.Walk 语义**：`return nil` 表示正常继续遍历，包括进入当前目录的所有子目录。
 
 **执行过程详解**：
 
@@ -884,16 +885,16 @@ return afero.Walk(fs, scope, func(fPath string, f os.FileInfo, _ error) error {
       └── secret.txt
 ```
 
-遍历流程：
+Walk 执行流程：
 ```
 1. 访问 "/data"
    → fPath == scope → return nil
-   → 继续进入子目录
+   → ✅ Walk 继续进入子目录
 
 2. 访问 "/data/public"
    → Check("/data/public") → 通过
    → 加入搜索结果 → return nil
-   → 继续进入子目录
+   → ✅ Walk 继续进入子目录
 
 3. 访问 "/data/public/readme.txt"
    → Check 通过 → 加入搜索结果
@@ -901,51 +902,44 @@ return afero.Walk(fs, scope, func(fPath string, f os.FileInfo, _ error) error {
 4. 访问 "/data/private"
    → Check("/data/private") → 规则匹配 → Allow=false
    → return nil                     ← 当前目录静默跳过（不加入结果）
-   → 继续进入子目录                  ← 子路径继续遍历
+   → ✅ Walk **继续进入子目录**！    ← 关键行为
 
 5. 访问 "/data/private/secret.txt"
    → Check("/data/private/secret.txt") → 独立判定
-     → 路径规则前缀匹配：true → Allow=false
-   → return nil                     ← 子路径也被规则拒绝
+   → 结果取决于子路径是否被规则覆盖
 ```
 
-**关键特征**：
-- 使用 `afero.Walk` 实现遍历
-- 目录被拒时 `return nil`，Walk **继续进入**子目录
-- 子路径被独立调用 `Check()` 进行判定
-- 路径规则的前缀匹配机制会自动覆盖子路径
+**物理行为**：子目录被 Walk **物理访问**，每个子路径独立执行 `Check()`。
 
 ---
 
-#### 场景二：递归列表（resourceGetRecursiveHandler）
+#### 场景二：递归列表（resourceGetRecursiveHandler）—— 不进入子树
 
 **触发入口**：`GET /api/resources/recursive/*path`
-**代码位置**：[http/resource.go#L408-L434](file:///d:/fz/0601/solo-dogfeeding/code/175-filebrowser/http/resource.go#L408-L434)
+**代码位置**：[http/resource.go#L419-L423](file:///d:/fz/0601/solo-dogfeeding/code/175-filebrowser/http/resource.go#L419-L423)
 
 核心代码：
 ```go
-afero.Walk(d.user.Fs, rootPath, func(fPath string, info os.FileInfo, err error) error {
-    // ...
-    if !d.Check(fPath) {
-        if info.IsDir() {
-            return filepath.SkipDir   // 目录被拒：SkipDir（遍历优化）
-        }
-        return nil                   // 文件被拒：静默跳过
+if !d.Check(fPath) {
+    if info.IsDir() {
+        return filepath.SkipDir  // 目录被拒 → SkipDir
     }
-    entries = append(entries, ...)    // 通过 → 加入列表
-    return nil
-})
+    return nil                  // 文件被拒 → 静默跳过
+}
 ```
+
+**afero.Walk 语义**：`return filepath.SkipDir` 表示**不进入**当前目录的子目录，但继续同层级其他路径。
 
 **执行过程详解**：
 
+同样的目录结构，Walk 执行流程：
 ```
 1. 访问 "/data" → 跳过根目录自身 → return nil
-   → 继续进入子目录
+   → ✅ Walk 继续进入子目录
 
 2. 访问 "/data/public"
    → Check 通过 → 加入列表 → return nil
-   → 继续进入子目录
+   → ✅ Walk 继续进入子目录
 
 3. 访问 "/data/public/readme.txt"
    → Check 通过 → 加入列表
@@ -953,18 +947,16 @@ afero.Walk(d.user.Fs, rootPath, func(fPath string, info os.FileInfo, err error) 
 4. 访问 "/data/private"
    → Check 失败，info.IsDir() == true
    → return filepath.SkipDir         ← 当前目录静默跳过（不加入结果）
-                                      ← SkipDir 是遍历优化手段
+   → ❌ Walk **不进入** "/data/private" 的子目录！  ← 关键行为
+
+5. "/data/private/secret.txt" —— **根本不会被 Walk 访问**
 ```
 
-**关键特征**：
-- 使用 `afero.Walk` 实现遍历
-- 目录被拒时返回 `filepath.SkipDir`——这是**遍历引擎层面的优化**，目的是避免 Walk 访问物理上必然被同一前缀规则覆盖的子路径
-- 从规则生效的实际效果来看，与其他场景等价：当前目录本身不出现在结果中，子路径如果被独立访问（例如通过搜索或直接 URL），仍然会独立经过规则检查
-- 路径规则下，`SkipDir` 只是一个性能优化；正则规则如果只精确匹配目录本身，使用 `SkipDir` 可以避免子路径被 Walk 访问到
+**物理行为**：子目录不会被 Walk **物理访问**，整个子树被跳过。
 
 ---
 
-#### 场景三：打包下载（getFiles 手动递归）
+#### 场景三：打包下载（getFiles 手动递归）—— 不进入子树
 
 **触发入口**：`GET /api/raw/*path`（目标是目录时）
 **代码位置**：[http/raw.go#L112-L168](file:///d:/fz/0601/solo-dogfeeding/code/175-filebrowser/http/raw.go#L112-L168)
@@ -973,14 +965,14 @@ afero.Walk(d.user.Fs, rootPath, func(fPath string, info os.FileInfo, err error) 
 ```go
 func getFiles(d *data, path, commonPath string) ([]archives.FileInfo, error) {
     if !d.Check(path) {
-        return nil, nil           // 规则拒绝：当前路径静默跳过
+        return nil, nil           // 规则拒绝 → return nil, nil
     }
-    // ... 通过 → 加入归档列表
-    if info.IsDir() {
+    // ...
+    if info.IsDir() {              // ← 这个分支只有 Check 通过才会执行
         // ...
         for _, name := range names {
             fPath := filepath.Join(path, name)
-            subFiles, err := getFiles(d, fPath, commonPath)
+            subFiles, err := getFiles(d, fPath, commonPath)  // 递归调用
             // ...
         }
     }
@@ -988,8 +980,11 @@ func getFiles(d *data, path, commonPath string) ([]archives.FileInfo, error) {
 }
 ```
 
+**手动递归语义**：`return nil, nil` 直接退出函数，后续的 `if info.IsDir()` 递归分支**不会执行**。
+
 **执行过程详解**：
 
+同样的目录结构，`getFiles` 执行流程：
 ```
 1. getFiles("/data", ...)
    → Check("/data") → 通过
@@ -1003,23 +998,21 @@ func getFiles(d *data, path, commonPath string) ([]archives.FileInfo, error) {
    → Check 通过 → 加入归档
 
 4. getFiles("/data/private", ...)
-   → Check("/data/private") → Allow=false
+   → Check("/data/private") → 规则拒绝
    → return nil, nil                  ← 当前目录静默跳过（不加入归档）
-                                      ← 不触发本次递归的后续分支
+   → ❌ **后续递归分支不执行**，不会调用 getFiles("/data/private/secret.txt")  ← 关键行为
+
+5. "/data/private/secret.txt" —— **根本不会被递归访问**
 ```
 
-**关键特征**：
-- 使用手动递归（不使用 Walk）实现遍历
-- 目录被拒时直接 `return nil, nil`，本次递归不再向下调用——这是手动递归的等价优化手段
-- 从规则生效角度看，统一模式仍然成立：当前目录不出现，子路径独立判定
-- 如果子路径能通过其他入口被访问到（如直接 URL、搜索），仍然会独立经过规则检查
+**物理行为**：子目录不会被递归**物理访问**，整个子树被跳过。效果与 `filepath.SkipDir` 等价。
 
 ---
 
-#### 场景四：目录列表（readListing）
+### 11.3 场景四：目录列表（readListing）—— 不自动递归
 
-**触发入口**：每次进入目录时（`GET /api/resources/*path`，目标是目录）
-**代码位置**：[files/file.go#L393-L475](file:///d:/fz/0601/solo-dogfeeding/code/175-filebrowser/files/file.go#L393-L475)
+**触发入口**：`GET /api/resources/*path`（目标是目录时）
+**代码位置**：[files/file.go#L409-L411](file:///d:/fz/0601/solo-dogfeeding/code/175-filebrowser/files/file.go#L409-L411)
 
 核心代码：
 ```go
@@ -1037,85 +1030,24 @@ func (i *FileInfo) readListing(checker rules.Checker, ...) error {
 }
 ```
 
-**执行过程详解**：
-
-```
-1. 请求 "/data"
-   → NewFileInfo → Check("/data") → 通过
-   → readListing 枚举 ["public", "private"]
-     → "/data/public"  → Check 通过 → 显示在列表中
-     → "/data/private" → Check 失败 → continue  ← 当前目录静默跳过
-
-2. 用户逐层点击进入子目录
-   → 每次进入都会触发一次 NewFileInfo + readListing
-   → 每个被访问的路径都会独立经过 Check() 判定
-```
-
-**关键特征**：
-- 使用单层读取（不自动递归）实现遍历
-- 目录被拒时使用 `continue` 跳过当前条目
-- 子路径只有在用户主动点击进入时才会被访问，但每次访问都会独立执行 `Check()`
-- 这是最直观体现"子路径继续遍历，独立判定"的场景
+**执行过程**：
+- `readListing` 本身是单层读取，**不自动递归**
+- 目录被拒时 `continue`，不加入当前列表
+- 子目录只有在用户主动点击进入时，才会通过 `NewFileInfo` 做独立的 `Check()` 判定
 
 ---
 
-### 11.3 四种场景对比总表（统一视角）
+### 11.4 四种场景对比总表（基于代码物理行为）
 
 | 对比维度 | 搜索 | 递归列表 | 打包下载 | 目录列表 |
 |---------|------|---------|---------|---------|
 | **HTTP 路由** | `GET /api/search` | `GET /api/resources/recursive/*` | `GET /api/raw/*`（目录） | `GET /api/resources/*`（目录） |
 | **核心函数** | `search.Search` | `resourceGetRecursiveHandler` | `getFiles` | `FileInfo.readListing` |
-| **当前目录被拒** | ✅ 静默跳过（return nil） | ✅ 静默跳过（SkipDir） | ✅ 静默跳过（return nil,nil） | ✅ 静默跳过（continue） |
-| **子路径处理方式** | ✅ 继续遍历，独立 Check | ✅ 独立判定（SkipDir 为遍历优化） | ✅ 独立判定（提前 return 为遍历优化） | ✅ 用户触发访问时独立 Check |
+| **当前目录被拒** | 静默跳过（return nil） | 静默跳过（SkipDir） | 静默跳过（return nil,nil） | 静默跳过（continue） |
+| **子目录物理上是否被访问** | ✅ **是**，Walk 继续进入 | ❌ **否**，SkipDir 跳过子树 | ❌ **否**，递归分支不执行 | ❌ 不自动递归 |
+| **子路径判定方式** | Walk 访问，独立 Check | 不被访问，效果上整棵子树排除 | 不被访问，效果上整棵子树排除 | 用户主动访问时独立 Check |
 | **遍历引擎** | `afero.Walk` | `afero.Walk` | 手动递归 | 单层读取 |
-| **遍历层优化手段** | 无（物理上进入子目录） | `filepath.SkipDir` | 提前 `return` 不递归 | 无（本身不递归） |
-| **代码位置** | [search.go#L29-L76](file:///d:/fz/0601/solo-dogfeeding/code/175-filebrowser/search/search.go#L29-L76) | [resource.go#L408-L434](file:///d:/fz/0601/solo-dogfeeding/code/175-filebrowser/http/resource.go#L408-L434) | [raw.go#L112-L168](file:///d:/fz/0601/solo-dogfeeding/code/175-filebrowser/http/raw.go#L112-L168) | [file.go#L393-L475](file:///d:/fz/0601/solo-dogfeeding/code/175-filebrowser/files/file.go#L393-L475) |
-
-**总结**：所有场景下，目录被规则拒绝时本身都静默跳过，子路径都遵循独立规则判定的原则。递归列表的 `SkipDir` 和打包下载的提前 `return` 是遍历引擎层面的优化手段，不改变规则判定的最终效果。
-
----
-
-### 11.4 遍历层优化手段的技术细节
-
-虽然规则判定遵循统一模式，但遍历层的优化手段（`SkipDir` vs 提前 return vs 无优化）在物理层面确实存在差异。以下从技术实现角度详细说明：
-
-#### afero.Walk 的返回值语义
-
-| 返回值 | 物理行为 | 使用场景 |
-|-------|---------|---------|
-| `nil` | 继续遍历，物理上进入当前目录的所有子目录 | 搜索（无优化）、递归列表中的文件被拒 |
-| `filepath.SkipDir` | **不进入**当前目录的子目录，但继续同层级其他路径 | 递归列表中的目录被拒（性能优化） |
-| 其他 error | 立即终止整个 Walk | 上下文取消等异常情况 |
-
-#### 三种优化手段的等价关系
-
-```
-路径规则 {Path: "/data/private", Allow: false} 场景下：
-
-1. 搜索（return nil，无优化）
-   Walk 物理上进入 "/data/private" 子目录
-   → "/data/private/secret.txt" 被独立 Check
-   → 被同一规则的前缀匹配拒绝
-   → 最终结果：不出现在结果中 ✓
-
-2. 递归列表（filepath.SkipDir）
-   Walk 物理上不进入 "/data/private" 子目录
-   → "/data/private/secret.txt" 不被 Walk 访问
-   → 但路径规则本就会拒绝，效果等价
-   → 最终结果：不出现在结果中 ✓（性能更优）
-
-3. 打包下载（提前 return）
-   递归不进入 "/data/private" 的子项
-   → "/data/private/secret.txt" 不被递归访问
-   → 路径规则的覆盖效果等价
-   → 最终结果：不出现在归档中 ✓（性能更优）
-
-4. 目录列表（continue）
-   "/data/private" 不显示在列表中
-   → 用户无法点击进入
-   → 直接 URL 请求会被 NewFileInfo 独立 Check 拒绝
-   → 最终结果：无法访问 ✓
-```
+| **代码位置** | [search.go#L42-L44](file:///d:/fz/0601/solo-dogfeeding/code/175-filebrowser/search/search.go#L42-L44) | [resource.go#L419-L423](file:///d:/fz/0601/solo-dogfeeding/code/175-filebrowser/http/resource.go#L419-L423) | [raw.go#L112-L115](file:///d:/fz/0601/solo-dogfeeding/code/175-filebrowser/http/raw.go#L112-L115) | [file.go#L409-L411](file:///d:/fz/0601/solo-dogfeeding/code/175-filebrowser/files/file.go#L409-L411) |
 
 ---
 
@@ -1123,7 +1055,7 @@ func (i *FileInfo) readListing(checker rules.Checker, ...) error {
 
 #### 路径规则（Path Rule）的前缀覆盖
 
-路径规则天然具有前缀匹配能力，这是子路径能被同一规则覆盖的基础：
+路径规则天然具有前缀匹配能力，因此对于路径规则来说，搜索中子路径被继续访问实际上没有功能影响——子路径会被同一条规则自动覆盖。
 
 **代码位置**：[rules/rules.go#L29-L44](file:///d:/fz/0601/solo-dogfeeding/code/175-filebrowser/rules/rules.go#L29-L44)
 
@@ -1143,11 +1075,11 @@ func (r *Rule) Matches(path string) bool {
 | `/data/private` | `/data/private/` | `/data/private/secret.txt` | ✅（前缀匹配） |
 | `/data/private` | `/data/private/` | `/data/private_backup/file.txt` | ❌（斜杠避免兄弟前缀混淆） |
 
-只要使用路径规则，子路径天然被覆盖，这也是 `SkipDir` 和提前 return 等优化手段安全的前提。
+**路径规则下**：三种递归遍历场景的最终结果一致——都不会泄露子路径。差异仅在性能层面：搜索做了无用的子目录访问。
 
 #### 正则规则（Regex Rule）的完全匹配
 
-正则规则完全依赖表达式本身，没有自动前缀匹配：
+正则规则完全依赖表达式本身，没有自动前缀匹配。这是搜索与其他场景产生功能差异的唯一情况。
 
 ```go
 func (r *Rule) Matches(path string) bool {
@@ -1168,15 +1100,48 @@ func (r *Rule) Matches(path string) bool {
 
 ---
 
-### 11.6 遍历层优化与正则规则的交互
+### 11.6 精确匹配正则规则下的功能差异
 
-当正则规则只精确匹配目录本身（如 `^/data/private$`）时，不同遍历优化手段会产生不同的物理行为：
+当使用精确匹配的正则规则（如 `^/data/private$`，只匹配目录本身）时，搜索与其他场景会产生**功能上的差异**：
 
-| 场景 | 遍历优化 | "/data/private" 被正则拒绝后 | "/data/private/secret.txt" 物理上是否被访问 | 最终结果 |
-|------|---------|---------------------------|------------------------------------------|---------|
-| **搜索** | 无（return nil） | 当前目录静默跳过 | ✅ **是**，Walk 继续进入 | ⚠️ 取决于子路径是否有规则覆盖 |
-| **递归列表** | SkipDir | 当前目录静默跳过 | ❌ 否，SkipDir 跳过子树 | ✅ 子路径不被物理访问 |
-| **打包下载** | 提前 return | 当前目录静默跳过 | ❌ 否，不递归 | ✅ 子路径不被物理访问 |
-| **目录列表** | continue | 当前目录静默跳过 | ❌ 无入口，不显示 | ✅ 直接 URL 会被独立 Check |
+```
+规则（正则）：{regex: true, allow: false, regexp: {raw: "^/data/private$"}}
+```
 
-这个差异提示：当使用精确匹配的正则规则（不推荐）时，搜索场景中应额外关注子路径是否被正确覆盖。
+| 场景 | "/data/private" 被拒后 | "/data/private/secret.txt" 物理上是否被访问 | 规则检查结果 | 最终结果 |
+|------|----------------------|------------------------------------------|------------|---------|
+| **搜索** | 当前目录静默跳过 | ✅ **是**，Walk 继续进入 | 正则 `^/data/private$` 不匹配子路径 → 通过 | ⚠️ **泄露**：secret.txt 出现在搜索结果中 |
+| **递归列表** | 当前目录静默跳过 | ❌ 否，SkipDir 跳过子树 | 不被访问 | ✅ 安全：secret.txt 不出现 |
+| **打包下载** | 当前目录静默跳过 | ❌ 否，递归不执行 | 不被访问 | ✅ 安全：secret.txt 不加入归档 |
+| **目录列表** | 当前目录静默跳过 | ❌ 不自动递归 | 直接 URL 会独立 Check | ✅ 安全：secret.txt 无法通过直接 URL 访问（拦截式拒绝） |
+
+**代码验证（搜索泄露流程）**：
+```
+1. Walk 访问 "/data/private"
+   → Check("/data/private")
+     → 正则匹配："^/data/private$" 匹配 "/data/private" → true
+     → Allow = false → 拒绝
+   → return nil
+   → Walk 继续进入子目录
+
+2. Walk 访问 "/data/private/secret.txt"
+   → Check("/data/private/secret.txt")
+     → 正则匹配："^/data/private$" 不匹配 "/data/private/secret.txt" → false
+     → 无其他规则匹配 → allow 保持默认 true
+   → ✅ 规则检查通过！
+   → 关键词匹配 → 出现在搜索结果中！  ← 泄露！
+```
+
+**结论**：在使用精确匹配正则规则（不推荐）时，只有搜索场景存在子路径泄露风险。递归列表和打包下载由于不进入被拒目录的子树，不存在此风险。
+
+---
+
+### 11.7 afero.Walk 返回值与手动递归的语义对应
+
+| afero.Walk 返回值 | 语义 | 手动递归等价实现 | 使用场景 |
+|-----------------|------|----------------|---------|
+| `nil` | 继续遍历，进入子目录 | 正常执行后续递归调用 | 搜索（目录/文件被拒）、递归列表（文件被拒） |
+| `filepath.SkipDir` | 跳过当前目录的所有子目录 | 直接 return，不执行递归分支 | 递归列表（目录被拒） |
+| 其他 error | 终止整个 Walk | return error，向上传播 | 异常情况 |
+
+**打包下载的手动递归实现**：目录被拒时 `return nil, nil`，等价于 `filepath.SkipDir` 的语义——跳过当前目录及其所有子内容。

@@ -157,21 +157,120 @@ Auther {
 | **Download** | 来自 Defaults | 来自 Defaults | 由外部命令输出决定（`user.perm.download`）；若 Admin=true 则自动为 true |
 | **Commands** | 强制 `[]`（空数组） | 强制 `[]`（空数组） | 由外部命令输出决定（`user.commands`），空格分隔 |
 | **LockPassword** | 不设置（默认 false） | 强制 `true` | 强制 `true` |
-| **Scope** | 由 MakeUserDir 生成个人目录 | 由 MakeUserDir 生成个人目录 | 由 MakeUserDir 生成个人目录 |
+| **Scope** | 见下文 §2.2.1 详细流程 | 见下文 §2.2.1 详细流程 | 见下文 §2.2.1 详细流程 |
 | **Rules** | 不设置（默认 nil → 空） | 不设置（默认 nil → 空） | 不设置（hook 不支持设置 Rules） |
 | **其他偏好** | 来自 Defaults.Apply | 来自 Defaults.Apply | 来自 Defaults 初始值 + hook 字段覆盖 |
 
+### 2.2.1 Scope 确定流程详解
+
+在阅读具体流程之前，首先明确 `MakeUserDir` 的核心逻辑（`settings/dir.go`）：
+
+```go
+func (s *Settings) MakeUserDir(username, userScope, serverRoot string) (string, error) {
+    userScope = strings.TrimSpace(userScope)
+    // 只有当 Scope 为空 且 CreateUserDir 开启时，
+    // 才根据用户名生成个人目录
+    if userScope == "" && s.CreateUserDir {
+        username = cleanUsername(username)
+        userScope = path.Join(s.UserHomeBasePath, username)
+    }
+    userScope = path.Join("/", userScope)
+    // 无论 Scope 来源为何，都确保创建该目录
+    fs := afero.NewBasePathFs(afero.NewOsFs(), serverRoot)
+    fs.MkdirAll(userScope, os.ModePerm)
+    return userScope, nil
+}
+```
+
+> **重要提醒**：MakeUserDir 中的用户名生成个人目录逻辑（`path.Join(UserHomeBasePath, username)`），**仅在传入的 `userScope` 为空 且 `CreateUserDir` 为 true 的双重条件下才会触发**。如果 `userScope` 非空（如来自 Defaults.Scope 或 hook 字段），则直接使用该值，不会根据用户名生成个人目录。这一点极易被误解——并非所有自动创建的用户都会获得按用户名命名的个人目录。
+
+以下分述三种方式如何结合 Defaults、Hook 字段与 MakeUserDir 确定 Scope：
+
+---
+
+**Signup 注册（`http/auth.go` signupHandler）**
+
+```
+流程：
+1. 创建空 User，仅设置 Username
+2. Defaults.Apply(user)          → user.Scope = Defaults.Scope
+3. 强制 Admin=false, Execute=false, Commands=[]
+4. 检查 CreateUserDir:
+     CreateUserDir = true  → 强制 user.Scope = ""（覆盖 Defaults.Scope）
+     CreateUserDir = false → 保留 user.Scope = Defaults.Scope
+5. 调用 MakeUserDir(username, user.Scope, server.Root)
+6. user.Scope = MakeUserDir 返回值
+```
+
+**Signup 的特殊处理**：若 `CreateUserDir = true`，Signup 会**主动清空**用户的 Scope，强制让 MakeUserDir 走"根据用户名生成个人目录"分支。这意味着：
+- `CreateUserDir = true` + `Defaults.Scope = "/shared"` → 最终 Scope = `/users/<username>`（而非 `/shared`）
+- `CreateUserDir = false` + `Defaults.Scope = "/shared"` → 最终 Scope = `/shared`（不生成个人目录）
+
+---
+
+**Proxy Auth 自动创建（`auth/proxy.go` createUser）**
+
+```
+流程：
+1. 创建 User，设置 Username、Password、LockPassword=true
+2. Defaults.Apply(user)          → user.Scope = Defaults.Scope
+3. 强制 Admin=false, Execute=false, Commands=[]
+4. 调用 MakeUserDir(username, user.Scope, srv.Root)
+5. user.Scope = MakeUserDir 返回值
+```
+
+**Proxy Auth 不做 Scope 清空处理**，直接将 Defaults.Scope 传入 MakeUserDir。因此：
+- `Defaults.Scope = ""` + `CreateUserDir = true` → 最终 Scope = `/users/<username>`
+- `Defaults.Scope = "/shared"` + `CreateUserDir = true` → 最终 Scope = `/shared`（不生成个人目录）
+- `Defaults.Scope = "/shared"` + `CreateUserDir = false` → 最终 Scope = `/shared`
+
+---
+
+**Hook Auth action=auth 创建（`auth/hook.go` SaveUser + GetUser）**
+
+```
+流程：
+1. 创建 User，逐个字段从 Defaults 复制 → user.Scope = Defaults.Scope
+2. 调用 GetUser(d) 应用 Hook 字段覆盖:
+     a.Fields.GetString("user.scope", d.Scope)
+     → 若 hook 输出了 user.scope 则覆盖，否则保留 Defaults.Scope
+3. 调用 MakeUserDir(u.Username, u.Scope, a.Server.Root)
+4. u.Scope = MakeUserDir 返回值
+```
+
+**Hook Auth 的 Scope 优先级**：hook 输出的 `user.scope` 字段 > Defaults.Scope > MakeUserDir 生成。示例：
+- `Defaults.Scope = "/shared"`，hook 输出 `user.scope = ""`，`CreateUserDir = true` → 最终 Scope = `/users/<username>`
+- `Defaults.Scope = "/shared"`，hook 输出 `user.scope = "/projects"`，`CreateUserDir = true` → 最终 Scope = `/projects`（不生成个人目录）
+- `Defaults.Scope = "/shared"`，hook 无输出，`CreateUserDir = true` → 最终 Scope = `/shared`（不生成个人目录）
+
+---
+
+**三种方式 Scope 决策树汇总**：
+
+| 决策点 | Signup | Proxy Auth | Hook Auth |
+|--------|--------|------------|-----------|
+| 初始值来源 | Defaults.Scope | Defaults.Scope | Defaults.Scope |
+| 中间覆盖 | `CreateUserDir=true` 时强制清空为 `""` | 无 | hook 输出的 `user.scope`（可选） |
+| 传入 MakeUserDir 的值 | 可能被清空 | Defaults.Scope 原值 | Defaults.Scope 或 hook 覆盖值 |
+| 是否能根据用户名生成个人目录 | 只要 `CreateUserDir=true` 就一定能（因为主动清空了 Scope） | 仅当 `Defaults.Scope=""` 且 `CreateUserDir=true` | 仅当最终传入 `""` 且 `CreateUserDir=true` |
+
+---
+
 **关键差异总结**：
 
-1. **Signup 与 Proxy Auth 的权限限制策略一致**——都强制剥夺 Admin 和 Execute，清空 Commands，其余权限继承 Defaults。区别仅在于 LockPassword：Proxy Auth 锁密码（随机生成），Signup 不锁（用户自设）。
+1. **Signup 与 Proxy Auth 的权限限制策略基本一致**——都强制剥夺 Admin 和 Execute，清空 Commands，其余权限继承 Defaults。区别有两点：① LockPassword：Proxy Auth 锁密码（随机生成），Signup 不锁（用户自设）；② Scope 处理：Signup 在 `CreateUserDir=true` 时主动清空 Scope 以强制生成个人目录，Proxy Auth 直接使用 Defaults.Scope。
 
 2. **Hook Auth 不强制剥夺任何权限**——所有权限位由外部命令输出决定。但存在隐式规则：若 `user.perm.admin=true`，则 `auth/hook.go` GetUser 中所有其他权限位自动置为 true（`isAdmin || GetBoolean(...)`）。因此 Hook Auth 下 Admin 一定拥有全部权限。
 
-3. **NoAuth 不创建用户**——它仅查找 ID=1 的用户，该用户必须在初始化或管理操作中预先存在。其权限完全取决于 ID=1 用户在数据库中的记录。
+3. **关于 Scope 的特别提醒**——MakeUserDir 的"根据用户名生成个人目录"逻辑仅在 `userScope == "" && CreateUserDir == true` 的双重条件下触发。非空的 Defaults.Scope 或 hook 输出的 `user.scope` 都会阻止个人目录生成，直接使用传入的值。
 
-4. **JSON Auth 不创建用户**——仅在数据库中查找已有用户并验证密码。用户必须由管理员通过 API 或其他认证方式预先创建。
+4. **Signup 的 Scope 覆盖行为**——Signup 在 `CreateUserDir=true` 时会**主动清空** Defaults.Scope（即使它非空），因此 Signup 创建的用户一定会获得按用户名命名的个人目录（如 `/users/alice`）。这是 Signup 独有的行为，Proxy Auth 和 Hook Auth 都不会做这个清空。
 
-5. **Rules 从不被自动创建流程设置**——所有四种认证方式中，新用户的 Rules 字段均为空（nil），不受 Defaults 或外部命令影响。Rules 只能由管理员后续手动配置。
+5. **NoAuth 不创建用户**——它仅查找 ID=1 的用户，该用户必须在初始化或管理操作中预先存在。其权限完全取决于 ID=1 用户在数据库中的记录。
+
+6. **JSON Auth 不创建用户**——仅在数据库中查找已有用户并验证密码。用户必须由管理员通过 API 或其他认证方式预先创建。
+
+7. **Rules 从不被自动创建流程设置**——所有四种认证方式中，新用户的 Rules 字段均为空（nil），不受 Defaults 或外部命令影响。Rules 只能由管理员后续手动配置。
 
 ### 2.3 JWT 令牌机制
 
@@ -592,7 +691,7 @@ HTTP 请求
 | 代理认证 | `auth/proxy.go` | ProxyAuth、自动创建用户（Admin=false, Execute=false, LockPassword=true） |
 | Hook 认证 | `auth/hook.go` | HookAuth、外部命令、管理员自动获得全部权限、LockPassword=true |
 | 无认证 | `auth/none.go` | NoAuth、固定 ID=1、不创建用户 |
-| HTTP 认证中间件 | `http/auth.go` | withUser、withAdmin、JWT 处理、注册限制（Admin=false, Execute=false） |
+| HTTP 认证中间件 | `http/auth.go` | withUser、withAdmin、JWT 处理、注册限制（Admin=false, Execute=false, Scope 主动清空） |
 | HTTP 数据上下文 | `http/data.go` | data 结构体、Check()（规则评估 + checkerPrefix 还原） |
 | 资源操作 | `http/resource.go` | CRUD handler 中的权限检查 |
 | 分享操作 | `http/share.go` | withPermShare、分享 CRUD（创建时不调 Check） |
@@ -605,6 +704,6 @@ HTTP 请求
 | 分享模型 | `share/share.go` | Link 结构体 |
 | 全局配置 | `settings/settings.go` | Settings、Server 结构体 |
 | 默认值 | `settings/defaults.go` | UserDefaults.Apply() |
-| 用户目录 | `settings/dir.go` | MakeUserDir（自动创建用户主目录） |
+| 用户目录 | `settings/dir.go` | MakeUserDir（仅在 Scope 为空且 CreateUserDir 开启时按用户名生成个人目录） |
 | 用户存储 | `users/storage.go` | 唯一管理员保护、用户 CRUD |
 | 错误定义 | `errors/errors.go` | ErrPermissionDenied、ErrShareRequiresDownload 等 |

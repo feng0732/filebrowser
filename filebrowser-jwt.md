@@ -149,6 +149,16 @@ const logoutPage: string = window.FileBrowser.LogoutPage;
 | Proxy + 自定义登出页 | `"proxy"` | `"https://sso.example.com/logout"` | ✅ **禁用** |
 | 其他 + 自定义登出页 | `"json"` | `"https://..."` | ❌ 不禁用 |
 
+> **三个独立判断条件对比（Proxy 认证场景下极易混淆）**：
+>
+> | 判断位置 | 判断变量 | 触发条件 | 效果 |
+> |---------|---------|---------|------|
+> | `initAuth()` 分支 | `loginPage` (bool) | `ProxyAuth.LoginPage()` → 恒 `false`，**与 logoutPage 无关** | 走 `login("", "", "")` 空凭据登录获取 Token |
+> | `parseToken()` 计时器禁用 | `authMethod` + `logoutPage` | `authMethod==="proxy" && logoutPage!=="/login"` | 禁用前端空闲登出计时器 |
+> | `renewableErr()` 过期宽容 | `AuthMethod` + `LogoutPage` + `err` | proxy + 自定义登出页 + 仅 Token 过期 | 后端放行过期 JWT |
+>
+> **核心区别**：`initAuth()` 是否显示登录页只取决于**认证器类型**（Proxy 认证永远不显示登录页），而计时器禁用和过期宽容还额外要求**配置了自定义登出页**（暗示外部有 SSO 统一会话管理）。因此 Proxy+默认登出页场景下，前端仍会走空凭据登录获取 Token，但计时器不会被禁用，过期 JWT 也不会被后端宽容放行。
+
 **签发路径完整流程图**：
 
 ```
@@ -488,18 +498,37 @@ export function logout(reason?: string) {
 ```typescript
 async function initAuth() {
   if (loginPage) {
-    // 有登录页（JSON/Hook/Proxy+默认登出页）：用 localStorage 中 JWT 续期
+    // loginPage=true：JSON/Hook 认证 → 尝试用 localStorage 中 JWT 续期
     await validateLogin();
   } else {
-    // 无登录页（Proxy+自定义登出页 / No Auth）：
-    // 直接 POST /api/login 空凭据，后端通过 ProxyAuth.Auth() 从请求头
-    // 读取代理注入的用户名，自动签发新 JWT。
+    // loginPage=false：Proxy 认证（所有登出页配置）/ No Auth →
+    // 直接 POST /api/login 空凭据。Proxy 认证下后端通过
+    // ProxyAuth.Auth() 从反向代理注入的请求头（如 X-Remote-User）
+    // 读取用户名，自动签发新 JWT。
     await login("", "", "");
   }
 }
 ```
 
-> **注意**：`loginPage` 变量（[utils/constants.ts L14](frontend/src/utils/constants.ts#L14)）来自后端的 `Auther.LoginPage()` 返回值。Proxy 认证下 [ProxyAuth.LoginPage()](auth/proxy.go#L68-L71) 返回 `false`，因此**只要是 Proxy 认证就走 `login("","","")` 分支**，不管 logoutPage 是否自定义。
+> **关键澄清（修正前混淆了 loginPage 与 logoutPage）**：
+>
+> `loginPage` 和 `logoutPage` 是**两个完全独立**的配置项：
+>
+> | 变量 | 后端注入位置 | 来源 | 含义 |
+> |-----|------------|------|------|
+> | `loginPage` (bool) | [http/static.go L44](http/static.go#L44) | `auther.LoginPage()` | 认证器是否需要显示登录页 |
+> | `logoutPage` (string) | [http/static.go L43](http/static.go#L43) | `d.settings.LogoutPage` | 用户配置的登出跳转 URL |
+>
+> 各认证器的 `LoginPage()` 返回值（**与 logoutPage 完全无关**）：
+>
+> | 认证器 | LoginPage() | initAuth() 走哪条分支 |
+> |-------|------------|---------------------|
+> | JSONAuth | `true` | `validateLogin()` |
+> | HookAuth | `true` | `validateLogin()` |
+> | **ProxyAuth** | **`false`** | **`login("", "", "")`（所有登出页配置，包括默认 /login）** |
+> | NoAuth | `false` | `login("", "", "")` |
+>
+> **修正前的错误理解**：曾误以为 Proxy+默认登出页走 `validateLogin()`、只有 Proxy+自定义登出页才走 `login("","","")`。实际上 Proxy 认证的 `LoginPage()` 恒为 `false`，**无论 logoutPage 配置什么**，Proxy 认证都会空凭据登录获取令牌。
 
 [utils/auth.ts](frontend/src/utils/auth.ts#L40-L49) 中的 `validateLogin()`：
 
@@ -573,31 +602,36 @@ export async function validateLogin() {
 
 ## 四、Proxy 认证 + 自定义登出页分支专项总结
 
-### 4.1 三处代码改动 + 一处恒成立逻辑的协同关系
+### 4.1 Proxy 认证下的四处分层逻辑 + 一处恒成立判断
 
-Proxy 认证 + 自定义登出页配置同时触发前后端**三处独立但互相配合**的逻辑分支，再结合 `expiresSoon` 的固有行为，共同完成过期令牌续签：
+Proxy 认证下，**前端初始化走空凭据登录**是所有 Proxy 配置的共同行为，与登出页无关；而**过期宽容、计时器禁用、外部登出跳转**三处需要 Proxy + 自定义登出页同时满足：
 
-| 位置 | 代码点 | 作用 |
-|------|-------|------|
-| 后端校验 | [`renewableErr()`](http/auth.go#L69-L83) | 过期 JWT 仍可通过校验，不返回 401 |
-| 后端刷新 | [`expiresSoon`](http/auth.go#L98) | 过期后恒为 `true`（负数 < 1h），触发 `X-Renew-Token: true` |
-| 前端解析 | [`parseToken()` early return](frontend/src/utils/auth.ts#L22-L25) | 禁用 JWT 自身的空闲登出计时器，交还给外部 SSO 管理 |
-| 前端登出 | [`logout()` redirect](frontend/src/utils/auth.ts#L127-L128) | 登出时跳转到外部 SSO 统一登出端点 |
+| 判断位置 | 触发条件 | 作用 | Proxy+默认登出页 | Proxy+自定义登出页 |
+|---------|---------|------|----------------|------------------|
+| `initAuth()` 分支 | `ProxyAuth.LoginPage()=false`（恒成立，与登出页无关） | 跳过登录页，空凭据 `login("","","")` 获取 Token | ✅ 触发 | ✅ 触发 |
+| 后端过期宽容 | `AuthMethod==proxy && LogoutPage!=default && err==expired` | 过期 JWT 仍通过 `withUser` 校验 | ❌ 不触发（401） | ✅ 触发 |
+| `expiresSoon` 判断 | `time.Until(ExpiresAt) < 1h`（过期后负数恒成立） | 触发 `X-Renew-Token: true` 刷新提示 | ✅ 触发 | ✅ 触发 |
+| 前端计时器禁用 | `authMethod=="proxy" && logoutPage!="/login"` | 禁用 JWT 自身 exp 驱动的登出计时器 | ❌ 不禁用（到点登出） | ✅ 禁用 |
+| 前端登出跳转 | `logoutPage != "/login"` | 登出时跳转到外部 SSO 统一登出 URL | ❌ 跳内部 /login | ✅ 跳外部 |
 
 > **注意**：`renewHandler` 的形参名是 `tokenExpireTime`（无 'a'），与 `printToken` 的 `tokenExpirationTime`（有 'a'）不同，调用时需保持参数名一致：`printToken(..., tokenExpireTime)`。
+>
+> **关键修正**：`initAuth()` 走空凭据登录只取决于 `loginPage`（即认证器类型），Proxy 认证下 **无论 logoutPage 是默认还是自定义**，都会 `login("", "", "")`。之前混淆了"不显示登录页"与"自定义登出页"两个独立概念。
 
-### 4.2 为什么需要三处同时改动？
+### 4.2 SSO 集成体验三处必须同时配置
 
-1. **只改后端（renewableErr）不改前端计时器**：
+`initAuth()` 空凭据登录和 `expiresSoon` 恒成立是 Proxy 认证的固有行为，无需额外配置。但要实现完整的 SSO 集成体验，**另外三处必须同时满足**（authMethod=proxy + logoutPage=外部URL），否则单边修改无效：
+
+1. **只有后端过期宽容（renewableErr）但不禁用前端计时器**：
    前端 `logoutTimer` 会在 `exp` 时刻准时调用 `logout("inactivity")`，即使后端仍接受过期 Token，用户仍会被前端强制登出——**单边修改无效**。
 
-2. **只改前端计时器不改后端校验**：
+2. **只禁用前端计时器但后端不过期宽容**：
    前端不主动登出了，但 API 请求到达后端后，`withUser` 仍返回 401，`fetchURL` 检测到 401 照样调用 `logout()`——**单边修改无效**。
 
-3. **只改前两处不改 logout 跳转**：
-   用户从外部 SSO 登出后，File Browser 登出仍只跳内部 `/login`，用户得手动从外部 SSO 登出，形成**幽灵会话**。
+3. **前两处生效但 logout 不跳外部 SSO**：
+   用户从 File Browser 登出后仍只跳内部 `/login`，没有同时从外部 SSO 登出，形成**幽灵会话**（SSO Cookie 仍有效，再次访问自动登录）。
 
-因此三处必须**同时配置**（authMethod=proxy + logoutPage=外部URL）才能形成完整的 SSO 集成体验。
+因此三处（过期宽容 + 禁用计时器 + 外部跳转）必须**同时配置**（authMethod=proxy + logoutPage=外部URL）才能形成完整的 SSO 闭环。
 
 ### 4.3 Proxy + 自定义登出页的完整会话生命周期
 
@@ -613,14 +647,18 @@ Proxy 认证 + 自定义登出页配置同时触发前后端**三处独立但互
                      File Browser 后端
                      ┌───────────────────────────────┐
    首次请求 /        │                               │
- ───────────────────→│  initAuth() 走 login("","","") │
+ ───────────────────→│  initAuth() 判断 loginPage     │
+                     │    (ProxyAuth.LoginPage()=false)│
+                     │    → 走 login("","","")        │
                      │    POST /api/login             │
                      │      ProxyAuth.Auth() 读头     │
                      │      → 自动创建/获取用户       │
                      │      → printToken() 发 JWT     │
                      │  parseToken()                  │
+                     │    独立判断：                  │
                      │    proxy + 自定义登出页         │
                      │    → ★ 禁用空闲计时器          │
+                     │    （Proxy+默认登出页则不禁用）  │
                      └───────────────┬───────────────┘
                                      ↓
             用户活跃操作（N 次 API 请求）
@@ -664,6 +702,7 @@ Proxy 认证 + 自定义登出页配置同时触发前后端**三处独立但互
 | **双触发刷新** | 即将过期 + 用户信息变更 | 兼顾会话续期与数据一致性 |
 | **双通道传输** | X-Auth Header + Cookie (GET fallback) | 兼顾 SPA API 调用与浏览器原生资源请求 |
 | **前端三重存储** | Pinia + localStorage + Cookie | 运行时高效、刷新可恢复、GET 请求兜底 |
+| **Proxy 静默登录** | `initAuth()` 读 `loginPage=false`，空凭据 `login("", "", "")` | 信任反向代理注入的用户头，无需用户手动登录 |
 | **Proxy 过期宽容** | `renewableErr()` 三条件判断 | 与外部 SSO 会话保持一致，避免伪登出 |
 | **Proxy 禁用计时** | `parseToken()` 条件 return | 不让 JWT 自身的 exp 干扰 SSO 会话管理 |
 | **Proxy 外部登出** | `logout()` redirect 分支 | 登出闭环，消除幽灵会话 |

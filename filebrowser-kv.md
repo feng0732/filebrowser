@@ -101,13 +101,13 @@ func (st usersBackend) GetBy(i interface{}) (user *users.User, err error) {
 `db.One("ID", uint(1), user)` 底层流程：
 1. 开启 bbolt 只读事务
 2. 获取 `User` bucket
-3. 因为 `ID` 是主键字段，**直接用 `bucket.Get(toBytes(1))` 读取数据**
+3. 因为 `ID` 是主键字段（`IsID=true`），**跳过索引查找，直接用 `bucket.Get(toBytes(1))` 读取数据**（即使 `__storm_index_ID` 存在也不使用）
 4. JSON 反序列化为 `users.User`
 
 `db.One("Username", "admin", user)` 底层流程：
 1. 开启 bbolt 只读事务
 2. 获取 `User` bucket
-3. 获取嵌套的 `__storm_index_Username` 唯一索引子 bucket
+3. 因为 `Username` 不是主键（`IsID=false`）但有唯一索引（`Index="unique"`），获取嵌套的 `__storm_index_Username` 唯一索引子 bucket
 4. `indexBucket.Get([]byte("admin"))` 得到数据 key `[1]`
 5. 用数据 key 从 `User` bucket 读取值并反序列化
 
@@ -126,6 +126,44 @@ storm 的 `Save` 方法在单个写事务内完成「数据写入 + 所有索引
 ### 2.5 索引结构原理深度解析
 
 根据 storm v3 源码核实，索引系统有两种核心实现：`UniqueIndex` 和 `ListIndex`。
+
+#### 2.5.0 storm 标签解析顺序（关键）
+
+storm 标签的解析逻辑在 `extract.go` 的 `extractField` 函数中。标签按逗号拆分后**顺序处理，后面的覆盖前面的**：
+
+```go
+tags := strings.Split(tag, ",")   // e.g. "id,index" → ["id", "index"]
+for _, tag := range tags {
+    switch tag {
+    case "id":
+        f.IsID = true
+        f.Index = tagUniqueIdx    // ← "id" 隐式设置 Index = "unique"
+    case tagUniqueIdx, tagIdx:
+        f.Index = tag             // ← "unique" 或 "index" 覆盖 Index 值
+    case tagInline:
+        // ...
+    default:
+        // increment 处理
+    }
+}
+```
+
+**关键规则**：
+
+| 标签写法 | 解析结果 | 实际创建的索引 |
+|----------|----------|--------------|
+| `storm:"id"` | `IsID=true, Index="unique"` | UniqueIndex（但 One 查询时 IsID=true 会跳过索引，直接用数据 key） |
+| `storm:"id,increment"` | `IsID=true, Index="unique", Increment=true` | UniqueIndex（同上，索引冗余） |
+| `storm:"id,index"` | `IsID=true, Index="index"` | **ListIndex**（"id" 先设 Index="unique"，"index" 后覆盖为 "index"） |
+| `storm:"id,unique"` | `IsID=true, Index="unique"` | UniqueIndex（两次设置一致，无覆盖效果） |
+| `storm:"unique"` | `IsID=false, Index="unique"` | UniqueIndex |
+| `storm:"index"` | `IsID=false, Index="index"` | ListIndex |
+
+**核心发现**：
+1. `storm:"id"` 隐式将 `Index` 设为 `"unique"`，即使没有显式写 `unique`
+2. `storm:"id,index"` 中 "index" **覆盖**了 "id" 设置的 `Index="unique"`，最终创建的是 **ListIndex**
+3. 对于 `IsID=true` 的字段，`One` 查询时 `skipIndex=true`，直接用字段值作为数据 key，**不经过索引 bucket**，所以索引类型不影响主键查询
+4. `storm:"id,increment"` 的 User.ID 会创建 `__storm_index_ID` UniqueIndex，但该索引几乎不被使用（因为 IsID=true），属于**冗余索引**
 
 #### 2.5.1 UniqueIndex（唯一索引）
 
@@ -376,15 +414,16 @@ type Link struct {
 
 **各标签的精确含义**：
 
-| 标签组合 | 含义 | bbolt 映射 |
-|----------|------|-----------|
-| `storm:"id,index"` | 业务主键 + 额外索引 | 数据 bucket 的 key 是 Hash 值；同时在主 bucket 内创建嵌套的 Hash 索引子 bucket（名称 `__storm_index_Hash`） |
-| `storm:"index"` | 普通（列表）索引 | 创建嵌套的 Path 索引子 bucket（名称 `__storm_index_Path`），使用 ListIndex 结构，一个 Path 值可对应多个 Link |
+| 标签组合 | 解析结果 | bbolt 映射 |
+|----------|----------|-----------|
+| `storm:"id,index"` | `IsID=true, Index="index"` → **ListIndex** | 数据 bucket 的 key 是 Hash 值；同时在主 bucket 内创建嵌套的 Hash 列表索引子 bucket（名称 `__storm_index_Hash`），使用 ListIndex 结构 |
+| `storm:"index"` | `IsID=false, Index="index"` → ListIndex | 创建嵌套的 Path 列表索引子 bucket（名称 `__storm_index_Path`），使用 ListIndex 结构，一个 Path 值可对应多个 Link |
 
 **为什么 Hash 既是 id 又是 index**：
-- `id` 让 Hash 成为数据 bucket 的 key，按 Hash 直接查询最快
-- `index` 额外创建索引 bucket，支持 `Prefix("Hash", ...)` 等基于索引的前缀查询
-- 对于自增 ID 的实体（如 User），通常不需要 `id,index` 组合，因为 id 本身就是天然索引
+- `id` 让 Hash 成为数据 bucket 的 key，按 Hash 直接查询最快（`One("Hash", ...)` 因 IsID=true 跳过索引，直接用 bucket.Get）
+- `index` 额外创建 ListIndex，支持 `Prefix("Hash", ...)` 等基于索引的前缀/范围查询
+- **注意**：由于标签解析顺序，`id,index` 的 `Index` 最终值为 `"index"`（ListIndex），而非 `"unique"`（UniqueIndex）。实际上 Hash 值天然唯一，但索引结构是 ListIndex（可一对多），这是一个语义上的不一致
+- 对于自增 ID 的实体（如 User 的 `id,increment`），Index 值为 `"unique"`，创建的 `__storm_index_ID` 几乎不被使用（冗余索引）
 
 ### 4.2 bbolt 中的 Link 索引结构（嵌套 bucket）
 
@@ -394,11 +433,17 @@ Bucket: "Link"                                                ← 主数据 buck
   ├─ Key: "u1-abc"                                             → Value: JSON(Link{Hash:"u1-abc", Path:"/abc", UserID:1, ...})
   ├─ Key: "u2-a"                                               → Value: JSON(Link{Hash:"u2-a", Path:"/a", UserID:2, ...})
   │
-  ├─ Sub-Bucket: "__storm_index_Hash" (indexPrefix+"Hash")     ← Hash 唯一索引子 bucket (id,index)
-  │     ├─ Key: "u1-a"                                          → Value: "u1-a" (数据 key，与主键相同)
-  │     └─ Key: "u2-a"                                          → Value: "u2-a"
+  ├─ Sub-Bucket: "__storm_index_Hash" (indexPrefix+"Hash")     ← Hash 列表索引子 bucket (id,index → ListIndex)
+  │     ├─ Key: "u1-a__u1-a"                                    → Value: "u1-a"  (value__targetID，此处 value=targetID)
+  │     ├─ Key: "u1-abc__u1-abc"                                → Value: "u1-abc"
+  │     ├─ Key: "u2-a__u2-a"                                    → Value: "u2-a"
+  │     │
+  │     └─ Sub-Bucket: "storm__ids"                             ← ListIndex 内部的 IDs 唯一索引
+  │           ├─ Key: "u1-a"                                    → Value: "u1-a__u1-a"
+  │           ├─ Key: "u1-abc"                                  → Value: "u1-abc__u1-abc"
+  │           └─ Key: "u2-a"                                    → Value: "u2-a__u2-a"
   │
-  └─ Sub-Bucket: "__storm_index_Path" (indexPrefix+"Path")     ← Path 列表索引子 bucket (index)
+  └─ Sub-Bucket: "__storm_index_Path" (indexPrefix+"Path")     ← Path 列表索引子 bucket (index → ListIndex)
         ├─ Key: "/a__u1-a"                                      → Value: "u1-a"
         ├─ Key: "/a__u2-a"                                      → Value: "u2-a"
         ├─ Key: "/abc__u1-abc"                                  → Value: "u1-abc"
@@ -409,10 +454,12 @@ Bucket: "Link"                                                ← 主数据 buck
               └─ Key: "u1-abc"                                  → Value: "/abc__u1-abc"
 ```
 
-**ListIndex 的内部结构详解**：
-- `ListIndex.IndexBucket`：顶层索引 bucket（即 `__storm_index_Path`），key 格式为 `value__targetID`（如 `/a__u1-a`），value 是数据 ID
+**重要修正**：`storm:"id,index"` 的 Hash 字段创建的是 **ListIndex**（而非 UniqueIndex），因为标签解析时 "index" 覆盖了 "id" 设置的 `Index="unique"`。因此 Hash 索引 bucket 使用 ListIndex 的 `value__targetID` key 格式和嵌套 `storm__ids` 反向索引。虽然 Hash 值天然唯一，但索引结构是一对多映射的 ListIndex，存在语义不一致。
+
+**ListIndex 的内部结构详解**（Hash 和 Path 索引都是 ListIndex）：
+- `ListIndex.IndexBucket`：索引 bucket（如 `__storm_index_Hash` 或 `__storm_index_Path`），key 格式为 `value__targetID`，value 是数据 ID
 - `ListIndex.IDs *UniqueIndex`：嵌套在 IndexBucket 内的子 bucket，名为 `storm__ids`，是一个反向唯一索引
-  - key 是数据 ID（如 `u1-a`），value 是 IndexBucket 中的完整 key（如 `/a__u1-a`）
+  - key 是数据 ID（如 `u1-a`），value 是 IndexBucket 中的完整 key（如 `u1-a__u1-a` 或 `/a__u1-a`）
 - 设计目的：支持「一个索引值 → 多个数据 ID」的一对多映射，同时支持通过 ID 快速反查索引值（用于更新/删除时清理旧索引）
 
 ### 4.3 查询方式与索引使用（关键修正）
@@ -421,12 +468,12 @@ Bucket: "Link"                                                ← 主数据 buck
 
 | 方法 | storm API | 索引使用 | 性能特征 |
 |------|-----------|----------|----------|
-| `GetByHash(hash)` | `db.One("Hash", hash, &v)` | ✅ 走 Hash 索引 | O(1)，精确匹配 |
+| `GetByHash(hash)` | `db.One("Hash", hash, &v)` | ✅ IsID=true 跳过索引，直接 `bucket.Get(hash)` | O(1)，主键直接查找 |
 | `FindByUserID(id)` | `db.Select(q.Eq("UserID", id)).Find(&v)` | ❌ 全表扫描 + 内存过滤 | O(n)，UserID 无索引且 Select 不走索引 |
 | `GetPermanent(path, id)` | `db.Select(q.Eq("Path", path), q.Eq("Expire", 0), q.Eq("UserID", id)).First(&v)` | ❌ 全表扫描 + 内存过滤 | O(n)，Select 系统不走索引 |
 | `Gets(path, id)` | `db.Select(q.Eq("Path", path), q.Eq("UserID", id)).Find(&v)` | ❌ 全表扫描 + 内存过滤 | O(n)，同上 |
 | `All()` | `db.All(&v)` | ❌ 全表遍历 | O(n)，顺序扫描 |
-| `DeleteWithPathPrefix(prefix, uid)` | `db.Prefix("Path", prefix, &links)` | ✅ 走 Path 索引前缀扫描 | O(k)，k 为前缀匹配数量 |
+| `DeleteWithPathPrefix(prefix, uid)` | `db.Prefix("Path", prefix, &links)` | ✅ 走 Path ListIndex 前缀扫描 | O(k)，k 为前缀匹配数量 |
 
 > **重要修正**：
 > 1. `db.Select(q.Eq("Path", value)).Find()` **不走索引**，即使 `Path` 字段有 `index` 标签。`Select` + `Matcher` 是通用查询机制，通过反射遍历每条记录并调用 `Matcher.Match()` 在内存中判断是否匹配，官方文档明确说明 "Doesn't use indexes"。
@@ -537,7 +584,8 @@ func save(db *storm.DB, name string, from interface{}) error {
 
 | 上层调用 | storm API | bbolt 操作 | 事务类型 | 有索引时 | 无索引时 |
 |----------|-----------|-----------|----------|----------|----------|
-| `st.db.One("ID", 1, user)` | 按主键查 | `bucket.Get(idBytes)` + Unmarshal | 只读事务 | ✅ 主键天然索引 | —（主键始终可用） |
+| `st.db.One("ID", 1, user)` | 按主键查 | `bucket.Get(idBytes)` + Unmarshal | 只读事务 | ✅ IsID=true 跳过索引，直接 bucket.Get | —（主键始终可用） |
+| `st.db.One("Hash", "u1-a", &link)` | 按字符串主键查 | `bucket.Get([]byte("u1-a"))` + Unmarshal | 只读事务 | ✅ IsID=true 跳过 Hash ListIndex，直接 bucket.Get | —（主键始终可用） |
 | `st.db.One("Username", "admin", user)` | 按唯一索引查 | `__storm_index_Username` 嵌套索引子 bucket Get → 数据 bucket Get + Unmarshal | 只读事务 | ✅ 走唯一索引 | ❌ fallback 到 `q.StrictEq` 全表扫描 |
 | `st.db.All(&allUsers)` | 全量遍历 | `bucket.Cursor()` 遍历所有键值 + 逐条 Unmarshal | 只读事务 | — | ❌ 全表扫描 |
 | `st.db.Save(user)` | 新增保存 | `bucket.NextSequence()` + `bucket.Put(seq, data)` + 更新所有索引 | 写事务 | — | — |
@@ -849,6 +897,9 @@ filebrowser.db
 ├─ Bucket: "User"                                        ← 用户实体存储（顶层 bucket）
 │   ├─ Key: [1]                                           → JSON(User{ID:1, Username:"admin", ...})
 │   ├─ Key: [2]                                           → JSON(User{ID:2, Username:"user1", ...})
+│   ├─ Sub-Bucket: "__storm_index_ID"                    ← ID 冗余唯一索引（id,increment 隐式创建，One 跳过）
+│   │     ├─ Key: [1]                                     → Value: [1]  （key == value，冗余）
+│   │     └─ Key: [2]                                     → Value: [2]
 │   └─ Sub-Bucket: "__storm_index_Username"              ← 唯一索引（嵌套子 bucket）
 │         ├─ Key: "admin"                                 → Value: [1]
 │         └─ Key: "user1"                                 → Value: [2]
@@ -856,10 +907,13 @@ filebrowser.db
 └─ Bucket: "Link"                                        ← 分享链接实体存储（顶层 bucket）
     ├─ Key: "u1-a"                                        → JSON(Link{Hash:"u1-a", Path:"/a", UserID:1, ...})
     ├─ Key: "u1-abc"                                      → JSON(Link{Hash:"u1-abc", Path:"/abc", UserID:1, ...})
-    ├─ Sub-Bucket: "__storm_index_Hash"                   ← Hash 唯一索引（嵌套子 bucket，id,index）
-    │     ├─ Key: "u1-a"                                  → Value: "u1-a"
-    │     └─ Key: "u1-abc"                                → Value: "u1-abc"
-    └─ Sub-Bucket: "__storm_index_Path"                   ← Path 列表索引（嵌套子 bucket，index）
+    ├─ Sub-Bucket: "__storm_index_Hash"                   ← Hash 列表索引（id,index → ListIndex，非 UniqueIndex！）
+    │     ├─ Key: "u1-a__u1-a"                             → Value: "u1-a"
+    │     ├─ Key: "u1-abc__u1-abc"                         → Value: "u1-abc"
+    │     └─ Sub-Bucket: "storm__ids"                     ← ListIndex 内部反向索引
+    │           ├─ Key: "u1-a"                             → Value: "u1-a__u1-a"
+    │           └─ Key: "u1-abc"                           → Value: "u1-abc__u1-abc"
+    └─ Sub-Bucket: "__storm_index_Path"                   ← Path 列表索引（index → ListIndex）
           ├─ Key: "/a__u1-a"                               → Value: "u1-a"
           ├─ Key: "/a__u2-a"                               → Value: "u2-a"
           ├─ Key: "/abc__u1-abc"                           → Value: "u1-abc"
@@ -869,7 +923,10 @@ filebrowser.db
                 └─ Key: "u1-abc"                           → Value: "/abc__u1-abc"
 ```
 
-> **说明**：索引 bucket 名称使用 `indexPrefix + fieldName` 格式（`indexPrefix = "__storm_index_"` 为 storm 内部常量），且**嵌套在对应的数据 bucket 内部**，而非顶层独立 bucket。
+> **说明**：
+> 1. 索引 bucket 名称使用 `indexPrefix + fieldName` 格式（`indexPrefix = "__storm_index_"` 为 storm 内部常量），且**嵌套在对应的数据 bucket 内部**，而非顶层独立 bucket。
+> 2. `storm:"id,index"` 创建的是 **ListIndex**（而非 UniqueIndex），因为标签解析时 "index" 覆盖了 "id" 设置的 `Index="unique"`。Hash 索引虽然数据唯一，但结构是一对多的 ListIndex。
+> 3. User 的 `__storm_index_ID`（由 `storm:"id,increment"` 隐式创建的 UniqueIndex）属于冗余索引，`One("ID", ...)` 因 IsID=true 会跳过此索引。
 
 ### 9.2 存储路径与代码对照
 
@@ -880,9 +937,11 @@ filebrowser.db
 | Auther | `config` | `"auther"` | [auth.go](storage/bolt/auth.go#L34-L36) | [auth.go](storage/bolt/auth.go#L15-L32) |
 | Version | `config` | `"version"` | [bolt.go](storage/bolt/bolt.go#L20-L23) | 无读取 |
 | User | `User` | 自增 `[N]` | [users.go](storage/bolt/users.go#L77-L83) | [users.go](storage/bolt/users.go#L19-L42) |
+| User ID 索引 | `User/__storm_index_ID` | ID 字节 | Save 时自动维护 | **冗余**（One("ID",...) 跳过索引） |
 | User Username 索引 | `User/__storm_index_Username` | 用户名 | Save 时自动维护 | `One("Username", ...)` |
 | Link | `Link` | `Hash` 值 | [share.go](storage/bolt/share.go#L68-L70) | [share.go](storage/bolt/share.go#L38-L46) |
-| Link Path 索引 | `Link/__storm_index_Path` | `路径值__Hash` | Save 时自动维护 | `Prefix("Path", ...)` / `Find("Path", ...)` |
+| Link Hash 索引 | `Link/__storm_index_Hash` | `Hash值__Hash值` | Save 时自动维护 | `Prefix("Hash", ...)` / `Find("Hash", ...)` （ListIndex） |
+| Link Path 索引 | `Link/__storm_index_Path` | `路径值__Hash值` | Save 时自动维护 | `Prefix("Path", ...)` / `Find("Path", ...)` （ListIndex） |
 
 ### 9.3 查询 API 与索引使用对照
 

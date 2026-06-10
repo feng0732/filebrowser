@@ -2,15 +2,24 @@
 
 ## 一、整体架构概览
 
-File Browser 使用 **Cobra + Viper + BoltDB** 三层配置体系：
+File Browser 使用 **Cobra + Viper + BoltDB** 三层配置体系，配置来源分两个阶段生效：
 
-| 层级 | 技术 | 职责 | 优先级（高→低） |
-|------|------|------|----------------|
-| 命令行参数 | Cobra (pflag) | 运行时即时覆盖 | 1（最高） |
-| 环境变量 | Viper | 容器/部署场景注入 | 2 |
-| 配置文件 | Viper (.json/.yaml/.toml) | 持久化静态配置 | 3 |
-| 数据库 | BoltDB (Storm) | 业务配置持久化 | 4 |
-| 代码默认值 | Flag 默认值 | 兜底 | 5（最低） |
+**阶段 1 — Viper 内部合并（优先级高→低）**：
+
+| 层级 | 技术 | 职责 |
+|------|------|------|
+| 1（最高） | 命令行显式参数 | Cobra pflag，`Changed==true` 才生效 |
+| 2 | 环境变量 | Viper，`FB_*` 前缀 |
+| 3 | 配置文件 | Viper 加载 `.json/.yaml/.toml` |
+| 4（最低） | pflag 默认值 | 兜底值，不会触发 IsSet |
+
+**阶段 2 — 数据库与 Viper 的合并（仅 root 主命令）**：
+
+| 层级 | 技术 | 职责 |
+|------|------|------|
+| 基础值 | BoltDB（Storm） | `getServerSettings()` 先从 DB 读取已持久化的 Server 配置 |
+| 覆盖层 | Viper `IsSet()==true` 的值 | 命令行显式参数 / 环境变量 / 配置文件，任一生效即覆盖 DB 对应字段 |
+| 不覆盖 | Viper pflag 默认值（`IsSet()==false`） | 保留 DB 原值 |
 
 ```
 用户启动命令
@@ -49,7 +58,7 @@ rootCmd.RunE 回调 ◄───────────────────
 
 ### 2.1 程序入口
 
-[main.go](cmd/root.go) 极简，直接调用 `cmd.Execute()`：
+[main.go](main.go) 极简，直接调用 `cmd.Execute()`：
 
 ```go
 func main() {
@@ -114,7 +123,7 @@ func initViper(cmd *cobra.Command) (*viper.Viper, error) {
         generateEnvKeyReplacements(cmd)...
     ))
 
-    // Step 3: 绑定命令行 Flags（仅绑定用户显式设置的 flag）
+    // Step 3: 绑定命令行 Flags（通过 VisitAll 绑定所有 flag，但仅 Changed=true 的才会被 IsSet 视为已设置）
     v.BindPFlags(cmd.Flags())
 
     // Step 4: 读取配置文件（失败仅记录日志，不中断）
@@ -141,16 +150,29 @@ flag: disablePreviewResize
 
 Viper 的 `GetXxx()` 调用时按以下顺序查找（先命中即返回）：
 
-1. **命令行 Flag**（通过 `BindPFlags` 绑定——仅用户显式设置的 flag 才会被绑定）
-2. **环境变量**（通过 `AutomaticEnv` + `EnvKeyReplacer`）
-3. **配置文件**（通过 `ReadInConfig` 加载）
-4. **pflag 默认值**（pflag 未显式设置时 `BindPFlags` 不会绑定该 key，此时 Viper 回退到 pflag 默认值）
+1. **显式 Override**（通过 `viper.Set()` 设置，本项目未使用）
+2. **命令行 Flag**（仅 `Changed==true` 的 flag，即用户显式传入的参数）
+3. **环境变量**（通过 `AutomaticEnv` + `EnvKeyReplacer` 解析的 `FB_*`）
+4. **配置文件**（通过 `ReadInConfig` 加载的 `.filebrowser.json/yaml/toml` 等）
+5. **Key/Value Store**（本项目未使用）
+6. **pflag 默认值**（即使用户未传入，Viper 通过绑定的 pflag 仍可拿到默认值）
 
-> **关键机制**：`v.BindPFlags(cmd.Flags())` 只绑定 `Changed=true` 的 flag 到 Viper。用户未显式设置的 flag 不会被绑定，Viper 对该 key 调用 `IsSet()` 返回 `false`。因此 Viper 的 `GetXxx()` 实际查找链是：
-> - 用户显式设置的 flag 值（绑定到 Viper）
-> - 环境变量
-> - 配置文件值
-> - pflag 默认值（通过 `v.GetString()` 等最终仍可取到，因为 Viper 会 fallback 到 pflag）
+> **Viper 的 pflag 处理机制（关键）**：
+> - `v.BindPFlags(cmd.Flags())` 内部通过 `VisitAll` **绑定所有 flag**（包括未显式设置的），存入 `v.pflags` map。
+> - 但 Viper 的 `find()` 方法在查询 pflag 值时，会先检查 `flag.HasChanged()`。只有 `Changed==true` 的 flag 才会返回有效值；否则视为该来源无值，继续向下查找（环境变量 → 配置文件 → pflag 默认值）。
+> - 因此 `v.IsSet(key)` 返回 `true` 的条件是：该 key 被以下任一来源显式设置过——
+>   1. 命令行显式传入了该 flag（`Changed==true`）
+>   2. 存在对应的环境变量（如 `FB_PORT`）
+>   3. 配置文件中定义了该 key
+
+> **各来源覆盖数据库配置的最终关系**：
+> 在 `getServerSettings()` 中，数据库是**基础值**，Viper 中**任一来源显式设置**（通过 `IsSet()` 判断为 true）的配置项都会**覆盖**数据库中的对应值。具体来说：
+> - 命令行显式参数（`--port 9000`）：覆盖 DB
+> - 环境变量（`FB_PORT=9090`）：覆盖 DB
+> - 配置文件（`.filebrowser.json` 中的 `"port": "8080"`）：覆盖 DB
+> - pflag 默认值（`--port` 默认 `8080`，但用户未传）：**不**覆盖 DB，保留 DB 原值
+>
+> 这是因为 pflag 默认值不会使 `v.IsSet()` 返回 true。
 
 > **注意**：Viper 不会自动将配置写回数据库。配置文件/环境变量/Flags 仅影响当前运行时，不会持久化到 BoltDB。
 
@@ -306,7 +328,7 @@ func getServerSettings(v *viper.Viper, st *storage.Storage) (*settings.Server, e
 
 > **关键设计**：使用 `v.IsSet(key)` 而非直接 `v.GetXxx`，确保只有**用户明确提供**的来源（flag/env/config file）才覆盖 DB。
 >
-> **为什么这能工作？** 因为 `v.BindPFlags(cmd.Flags())` 仅绑定 `Changed=true` 的 flag（即用户在命令行上显式传入的）。pflag 的默认值（如 `--port=8080`）不会触发 `Changed=true`，因此 Viper 对该 key 的 `IsSet()` 返回 `false`，不会误覆盖 DB 中的自定义值。
+> **为什么这能工作？** Viper 的 `IsSet()` 底层调用 `find()` 方法，对 pflag 会检查 `HasChanged()`。用户未在命令行显式传入的 flag（其值为 pflag 默认值）不会触发 `HasChanged()==true`，因此 `v.IsSet()` 返回 `false`，不会误覆盖 DB 中的自定义值。
 
 ### 5.3 quickSetup()：首次启动的 DB 初始化
 
@@ -562,7 +584,8 @@ filebrowser --port 9000 --root /data --noauth
 2. initViper()
    ├─ 未指定 --config，搜索 ./.filebrowser.* → 无
    ├─ 环境变量 FB_* → 未设置
-   ├─ BindPFlags：仅绑定 port=9000, root=/data, noauth=true
+   ├─ BindPFlags：通过 VisitAll 绑定所有 flag 到 v.pflags map
+   │   （但 find() 时仅 Changed=true 的 port/root/noauth 会被视为有效来源）
    └─ ReadInConfig → 无文件
 
 3. withViperAndStore
@@ -575,15 +598,15 @@ filebrowser --port 9000 --root /data --noauth
    ├─ databaseExisted=false → 触发 quickSetup(v, Storage)
    │   ├─ v.GetBool("noauth")=true → AuthMethod=noauth
    │   ├─ Server{Port: "9000", Root: "/data", ...}  ← v.GetString() 取到用户值
-   │   │   （注意：v.GetString("port")="9000"，因为 BindPFlags 绑定了用户传入的值）
+   │   │   （v.GetString("port") 返回 "9000"：pflag Changed==true，find() 返回显式值）
    │   ├─ 创建 admin 用户（随机密码）
    │   └─ 全部存入 BoltDB
-   ├─ v.GetInt("imageProcessors")=4（pflag 默认值，未 Changed，Viper 未绑定，回退取 pflag 默认）
+   ├─ v.GetInt("imageProcessors")=4（pflag 默认值；find() 中 HasChanged()==false，继续向下查 env/config 均无，最后返回 pflag 默认值）
    ├─ v.GetString("cacheDir")=""（pflag 默认值）
    ├─ getServerSettings(v, Storage)
    │   ├─ 从 DB 读 Server（刚写入，含 Port="9000"）
-   │   ├─ v.IsSet("port")=true（BindPFlags 绑定了）→ server.Port = "9000"（相同）
-   │   └─ v.IsSet("root")=true → server.Root = "/data"
+   │   ├─ v.IsSet("port")=true（pflag 的 Changed==true，find() 返回有效值）→ server.Port = "9000"（相同）
+   │   └─ v.IsSet("root")=true（同理 Changed==true）→ server.Root = "/data"
    └─ 启动 HTTP 监听 :9000
 ```
 
@@ -600,7 +623,8 @@ filebrowser
 
 2. initViper()
    ├─ 环境变量 FB_PORT=9090 → Viper 通过 AutomaticEnv 注册
-   ├─ BindPFlags：无 flag 被 Changed，无任何绑定
+   ├─ BindPFlags：通过 VisitAll 绑定所有 flag 到 v.pflags map
+   │   （但所有 flag Changed==false，pflag 不视为有效来源）
    └─ ReadInConfig → 无文件
 
 3. withViperAndStore

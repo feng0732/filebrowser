@@ -33,11 +33,106 @@ File Browser 项目中的 WebSocket 功能用于**交互式命令执行（Intera
 
 ---
 
-## 二、代码路径详解
+## 二、两种关闭方式的本质区别（对准 gorilla/websocket 行为）
 
-### 2.1 前端部分
+这是理解连接收尾语义的核心前提。项目使用的库是 [gorilla/websocket v1.5.3](http/go.mod)，它在 RFC 6455 基础上提供的两个关闭 API 语义完全不同：
 
-#### 2.1.1 WebSocket API 封装 —— [commands.ts](frontend/src/api/commands.ts)
+### 2.1 `Conn.Close()` —— 只关底层 TCP，不发 WebSocket Close 帧
+
+```go
+// gorilla/websocket 官方语义：Close() 关闭底层网络连接。
+// 它不会发送 WebSocket 协议层的 Close 控制帧。
+defer conn.Close()  // commands.go L51
+```
+
+**行为**：
+- 调用 `net.Conn.Close()`，直接关闭 TCP 连接
+- 浏览器 WebSocket API 感知：TCP FIN/RST → 触发 `onclose`
+- 客户端 `onclose.code` = **1006 (CloseAbnormalClosure)** 或 **1005 (CloseNoStatusReceived)** —— 因为没收到任何 Close 帧
+- 这是**"暴力关闭"**，不参与 WebSocket 协议层的关闭握手
+
+### 2.2 `WriteControl(CloseMessage, ...)` —— 发 Close 帧，不关 TCP，也不等待握手
+
+```go
+// wsErr 内部调用，commands.go L33
+ws.WriteControl(websocket.CloseInternalServerErr, []byte(txt), deadline)
+```
+
+**行为**：
+- 向连接写入一个 WebSocket Close 控制帧（Opcode = 0x8），携带关闭码和原因文本
+- **不**关闭底层 TCP 连接
+- **不**等待对端回 Close 帧（WebSocket 关闭握手需要双方交换 Close 帧才完整）
+- 写入成功后，Close 帧在 TCP 缓冲区里，等待发送出去
+- 这只是**"半关闭握手"**的第一步
+
+### 2.3 RFC 6455 标准关闭握手 vs 当前代码的实际做法
+
+**标准流程（RFC 6455 §1.4 / §5.5.1）**：
+
+```
+服务器                                    浏览器
+  │                                         │
+  │  WriteControl(CloseNormalClosure, 1000) │  ← ① 服务器发 Close 帧
+  │────────────────────────────────────────▶│
+  │                                         │
+  │  （库默认 CloseHandler 自动回）           │
+  │◀────────────────────────────────────────│  ← ② 浏览器回 Close 帧
+  │                                         │
+  │  等待收到后再调用                        │
+  │  conn.Close()                           │  ← ③ 双方都完成后才关 TCP
+  │─────── TCP FIN ────────────────────────▶│
+```
+
+客户端 `onclose.code = 1000 (CloseNormalClosure)`，`wasClean = true`。
+
+**当前代码的做法（所有路径）**：
+
+```
+服务器                                    浏览器
+  │                                         │
+  │  WriteControl(CloseInternalServerErr,   │  ← ① wsErr 发 Close 帧 (1011)
+  │         1011, "Internal Server Error") │
+  │────────────────────────────────────────▶│
+  │                                         │
+  │  ❌ 不等待对端回 Close 帧                │
+  │      立即 return → defer conn.Close()    │  ← ② 立即关 TCP
+  │─────── TCP FIN ────────────────────────▶│
+  │                                         │
+  │  （浏览器可能还没来得及回 Close 帧）        │
+```
+
+客户端 `onclose.code` 的结果取决于时序：
+- 如果 Close 帧在 TCP FIN 前到达：`code = 1011`（收到了关闭码）
+- 如果 TCP FIN 先到达：`code = 1006`（Abnormal Closure，协议没有完成握手）
+
+### 2.4 正常结束路径（cmd.Wait 返回 nil）完全跳过了协议层关闭
+
+```go
+// commands.go L287-L292
+if err := cmd.Wait(); err != nil {
+    wsErr(conn, r, http.StatusInternalServerError, err)   // 只有错误才走 wsErr
+}
+
+return 0, nil   // 正常退出：❌ 不调用 wsErr
+// defer conn.Close() → 直接关 TCP，不发任何 Close 帧
+```
+
+**这意味着：命令正常执行成功（退出码 0）时，客户端看到的反而是异常关闭。**
+
+客户端 `onclose` 结果（几乎必然）：
+- `code = 1006` (CloseAbnormalClosure) 或 `code = 1005` (CloseNoStatusReceived)
+- `reason = ""`
+- `wasClean = false`
+
+这不是 bug，这就是 gorilla/websocket `Conn.Close()` 的定义行为。
+
+---
+
+## 三、代码路径详解
+
+### 3.1 前端部分
+
+#### 3.1.1 WebSocket API 封装 —— [commands.ts](frontend/src/api/commands.ts)
 
 ```typescript
 import { baseURL } from "@/utils/constants";
@@ -62,16 +157,17 @@ export default function command(
 }
 ```
 
-**关键点：**
+**关键点**：
 
 - **协议选择**：根据当前页面协议自动选择 `ws:` 或 `wss:`
 - **URL 构建**：`${protocol}//${host}${baseURL}/api/command${当前路径}`
 - **连接建立后立即发送命令**：`onopen` 触发时通过 `conn.send(command)` 发送要执行的命令
-- **一次性使用**：每次调用 `command()` 都会创建新的 WebSocket 连接，命令执行完毕后关闭
+- **一次性使用**：每次调用 `command()` 都会创建新的 WebSocket 连接
+- **onclose 不区分关闭码**：Shell.vue 的 `onclose` 回调没有读取 `event.code`，所以即使 `code = 1006` 异常关闭，前端也不会报错，只是清理 ANSI 码后继续允许输入
 
-#### 2.1.2 UI 组件 —— [Shell.vue](frontend/src/components/Shell.vue)
+#### 3.1.2 UI 组件 —— [Shell.vue](frontend/src/components/Shell.vue)
 
-**调用流程：**
+**调用流程**：
 
 1. 用户在终端输入命令后按回车，触发 `submit()` 方法（第144行）
 2. 特殊命令处理：
@@ -79,7 +175,7 @@ export default function command(
    - `exit`：关闭终端窗口
 3. 普通命令：调用 `commands()` API（第174-190行）
 4. `onmessage` 回调：实时追加命令输出到终端显示
-5. `onclose` 回调：清理 ANSI 颜色码，重新允许输入
+5. `onclose` 回调：清理 ANSI 颜色码，重新允许输入（**不检查 code，任何关闭都视为正常**）
 
 ```javascript
 commands(
@@ -89,7 +185,7 @@ commands(
     results.text += `${event.data}\n`;
     this.scroll();
   },
-  () => {              // onclose: 连接关闭
+  () => {              // onclose: 连接关闭（任何 code 都走到这里）
     results.text = results.text
       .replace(/\u001b\[[0-9;]+m/g, "")  // 过滤 ANSI 颜色码
       .trimEnd();
@@ -102,9 +198,9 @@ commands(
 
 ---
 
-### 2.2 后端路由注册
+### 3.2 后端路由注册
 
-#### 2.2.1 HTTP 路由 —— [http.go](http/http.go#L85)
+#### 3.2.1 HTTP 路由 —— [http.go](http/http.go#L85)
 
 ```go
 api.PathPrefix("/command").Handler(monkey(commandsHandler, "/api/command")).Methods("GET")
@@ -114,7 +210,7 @@ api.PathPrefix("/command").Handler(monkey(commandsHandler, "/api/command")).Meth
 - HTTP 方法：`GET`（WebSocket 握手必须使用 GET）
 - 处理函数：`commandsHandler`，被 `monkey()` 包装
 
-#### 2.2.2 Handle 包装器 —— [data.go](http/data.go#L66-L101)
+#### 3.2.2 Handle 包装器 —— [data.go](http/data.go#L66-L101)
 
 ```go
 func handle(fn handleFunc, prefix string, store *storage.Storage, server *settings.Server) http.Handler {
@@ -144,9 +240,9 @@ func handle(fn handleFunc, prefix string, store *storage.Storage, server *settin
 
 ---
 
-### 2.3 后端认证中间件
+### 3.3 后端认证中间件
 
-#### 2.3.1 withUser 中间件 —— [auth.go](http/auth.go#L85-L111)
+#### 3.3.1 withUser 中间件 —— [auth.go](http/auth.go#L85-L111)
 
 WebSocket 连接走标准的 JWT 认证流程：
 
@@ -157,7 +253,7 @@ WebSocket 连接走标准的 JWT 认证流程：
 5. 从数据库加载完整用户信息到 `d.user`
 6. 检查是否需要刷新 token
 
-**Token 提取器 extractor —— [auth.go](http/auth.go#L49-L67)：**
+**Token 提取器 extractor —— [auth.go](http/auth.go#L49-L67)**：
 
 ```go
 func (e extractor) ExtractToken(r *http.Request) (string, error) {
@@ -172,9 +268,9 @@ func (e extractor) ExtractToken(r *http.Request) (string, error) {
 
 ---
 
-### 2.4 WebSocket 核心处理逻辑
+### 3.4 WebSocket 核心处理逻辑
 
-#### 2.4.1 Upgrader 配置与错误工具 —— [commands.go](http/commands.go#L18-L39)
+#### 3.4.1 Upgrader 配置与错误工具 —— [commands.go](http/commands.go#L18-L39)
 
 ```go
 const (
@@ -189,9 +285,7 @@ var upgrader = websocket.Upgrader{
 var cmdNotAllowed = []byte("Command not allowed.")
 ```
 
-**`wsErr` 函数 —— [commands.go](http/commands.go#L31-L39)：**
-
-这是所有错误场景下统一使用的 WebSocket 关闭函数：
+**`wsErr` 函数 —— [commands.go](http/commands.go#L31-L39)**：
 
 ```go
 func wsErr(ws *websocket.Conn, r *http.Request, status int, err error) {
@@ -199,20 +293,20 @@ func wsErr(ws *websocket.Conn, r *http.Request, status int, err error) {
     if err != nil || status >= 400 {
         log.Printf("%s: %v %s %v", r.URL.Path, status, r.RemoteAddr, err)
     }
+    // WriteControl: 只发 Close 帧，不关 TCP，不等待对端回 Close 帧
     if err := ws.WriteControl(websocket.CloseInternalServerErr, []byte(txt), time.Now().Add(WSWriteDeadline)); err != nil {
-        log.Print(err)
+        log.Print(err)  // Close 帧也发不出去？只打日志，不再重试
     }
 }
 ```
 
-它做的事情：
+**行为总结**：
 1. 条件性日志：当 `err != nil` 或 `status >= 400` 时打印请求路径、状态码、客户端地址和错误
-2. **尝试发送 Close 控制帧**：使用 `WriteControl` 发送 `CloseInternalServerErr`（关闭码 1011），消息体为 HTTP 状态文本，写入截止时间 10 秒
-3. 如果 Close 帧本身写入失败，仅打印日志，不再做进一步处理
+2. 调用 `WriteControl` 尝试发送 Close 帧（关闭码 1011，消息体 HTTP 状态文本），设置 10 秒写超时
+3. 如果 WriteControl 失败，仅 `log.Print(err)`，**不做任何恢复**，客户端收不到这个 Close 帧
+4. **注意：wsErr 不关闭连接**。调用方 return 后由 `defer conn.Close()` 关 TCP
 
-**关键事实**：`wsErr` 内部的 `WriteControl` 也可能失败。失败时只是 `log.Print(err)`，没有任何恢复机制，客户端不会收到这个 Close 帧。
-
-#### 2.4.2 commandsHandler 完整流程 —— [commands.go](http/commands.go#L41-L120)
+#### 3.4.2 commandsHandler 完整流程 —— [commands.go](http/commands.go#L41-L120)
 
 ```go
 var commandsHandler = withUser(func(w http.ResponseWriter, r *http.Request, d *data) (int, error) {
@@ -220,7 +314,7 @@ var commandsHandler = withUser(func(w http.ResponseWriter, r *http.Request, d *d
     if err != nil {
         return http.StatusInternalServerError, err
     }
-    defer conn.Close()
+    defer conn.Close()   // ← 所有路径最终都会执行这个：只关 TCP，不发 Close 帧
 
     var raw string
     for {
@@ -280,23 +374,23 @@ var commandsHandler = withUser(func(w http.ResponseWriter, r *http.Request, d *d
     s := bufio.NewScanner(io.MultiReader(stdout, stderr))
     for s.Scan() {
         if err := conn.WriteMessage(websocket.TextMessage, s.Bytes()); err != nil {
-            log.Print(err)
+            log.Print(err)   // ← 输出推送失败：只打日志，不中断，不发 Close 帧
         }
     }
 
     if err := cmd.Wait(); err != nil {
-        wsErr(conn, r, http.StatusInternalServerError, err)
+        wsErr(conn, r, http.StatusInternalServerError, err)  // ← 非零退出码：走 wsErr
     }
 
-    return 0, nil
+    return 0, nil   // ← 正常退出（退出码 0）：❌ 不发任何 Close 帧
 })
 ```
 
 ---
 
-## 三、stdout 与 stderr 读取顺序精确分析
+## 四、stdout 与 stderr 读取顺序精确分析
 
-### 3.1 io.MultiReader 的读取语义
+### 4.1 io.MultiReader 的读取语义
 
 核心代码位于 [commands.go#L108](http/commands.go#L108)：
 
@@ -304,7 +398,7 @@ var commandsHandler = withUser(func(w http.ResponseWriter, r *http.Request, d *d
 s := bufio.NewScanner(io.MultiReader(stdout, stderr))
 ```
 
-**`io.MultiReader(stdout, stderr)` 的工作方式：**
+**`io.MultiReader(stdout, stderr)` 的工作方式**：
 
 `io.MultiReader` 将多个 `io.Reader` 串联成一个逻辑 Reader。它的读取规则是**严格的串行顺序**：
 
@@ -314,7 +408,7 @@ s := bufio.NewScanner(io.MultiReader(stdout, stderr))
 
 **这意味着：stdout 的所有输出被读完后，才开始读 stderr。两者不是交叉合并，而是顺序拼接。**
 
-### 3.2 这带来了什么行为
+### 4.2 这带来了什么行为
 
 假设一个命令同时向 stdout 和 stderr 写入：
 
@@ -335,7 +429,7 @@ s := bufio.NewScanner(io.MultiReader(stdout, stderr))
 
 stderr 的输出 `err1` 即使在 `line2` 之前产生，也要等到 stdout 管道关闭（进程 stdout 写端关闭或进程退出）后才会被读取。
 
-### 3.3 为什么 stdout 不会无限阻塞
+### 4.3 为什么 stdout 不会无限阻塞
 
 关键在于 `cmd.StdoutPipe()` 和 `cmd.StderrPipe()` 返回的管道在进程退出时会被关闭：
 
@@ -346,7 +440,7 @@ stderr 的输出 `err1` 即使在 `line2` 之前产生，也要等到 stdout 管
 
 **但如果子进程持续向 stdout 写入而不关闭，stderr 中的内容将一直积压，直到 stdout 管道关闭为止。**
 
-### 3.4 对实际使用的影响
+### 4.4 对实际使用的影响
 
 大多数命令行工具的行为模式是：
 - 正常输出 → stdout
@@ -359,11 +453,11 @@ stderr 的输出 `err1` 即使在 `line2` 之前产生，也要等到 stdout 管
 
 ---
 
-## 四、三类发送操作的失败表现（对准代码事实）
+## 五、三类发送操作的失败表现（对准代码事实）
 
 整个 WebSocket 处理流程中存在三种不同的发送操作，它们的失败处理逻辑**完全不同**，客户端能否收到消息的表现也截然不同。
 
-### 4.1 第一类：普通错误消息（TextMessage）
+### 5.1 第一类：普通错误消息（TextMessage）
 
 这类发送出现在权限拒绝、命令解析失败、命令不在白名单三种场景中，代码结构完全一致，以权限拒绝为例 [commands.go#L64-L69](http/commands.go#L64-L69)：
 
@@ -381,26 +475,26 @@ if !d.server.EnableExec || !d.user.Perm.Execute {
 #### 分支 A：`WriteMessage` 成功（`err == nil`）
 
 - `if` 不进入，直接 `return 0, nil`
-- 函数返回时 `defer conn.Close()` 执行，发送 Close 帧
+- 函数返回时 `defer conn.Close()` 执行，**只关 TCP，不发 Close 帧**
 - **客户端能收到**：
   1. 一条 TextMessage：内容为 `"Command not allowed."`（或解析错误文本）
-  2. 一条 Close 帧（正常关闭）
+  2. TCP 断开 → `onclose.code = 1006`（异常关闭，因为没发 Close 帧）
 
 #### 分支 B：`WriteMessage` 失败（`err != nil`）
 
 - 进入 `if`，调用 `wsErr`
 - `wsErr` 内部尝试 `WriteControl(CloseInternalServerErr, ...)`，**这一步同样可能失败**：
-  - **子分支 B1：WriteControl 成功** → 客户端收到 Close 帧（1011, "Internal Server Error"），**但收不到那条 TextMessage 错误消息**（因为 WriteMessage 已经失败了）
-  - **子分支 B2：WriteControl 也失败** → `wsErr` 仅 `log.Print(err)`，不再重试。客户端此时什么控制消息都收不到，只能等待底层 TCP 连接断开或浏览器的 WebSocket 超时机制
-- 最终 `return 0, nil` → `defer conn.Close()` 执行（如果 TCP 连接还可用，会再尝试底层关闭；如果连接已不可用，什么都不会发送）
+  - **子分支 B1：WriteControl 成功** → Close 帧发出 → 随后 `defer conn.Close()` 关 TCP。客户端：收不到错误文本（WriteMessage 已失败），`onclose.code = 1011`（Close 帧到达时）或 `1006`（TCP 先关了）
+  - **子分支 B2：WriteControl 也失败** → `wsErr` 仅 `log.Print(err)`。客户端：既收不到错误文本，也收不到 Close 帧。只能靠 `defer conn.Close()` 产生的 TCP 断开或浏览器超时来感知，最终 `onclose.code = 1006`
+- 最终 `return 0, nil` → `defer conn.Close()` 执行
 
-**重要结论：WriteMessage 失败时，客户端一定收不到那条错误文本消息。之前把此场景描述成"之前已收到"是错误的。**
+**重要结论：WriteMessage 失败时，客户端一定收不到那条错误文本消息。**
 
 同样的分析适用于：
 - 命令解析失败 [commands.go#L73-L78](http/commands.go#L73-L78)
 - 命令不在白名单 [commands.go#L80-L86](http/commands.go#L80-L86)
 
-### 4.2 第二类：Close 帧（通过 wsErr 直接调用）
+### 5.2 第二类：Close 帧（通过 wsErr 直接调用）
 
 这类发送出现在：读取命令失败、管道创建失败、命令启动失败、cmd.Wait 返回错误四种场景。它们不尝试发 TextMessage，直接调用 `wsErr`。以 StdoutPipe 失败为例 [commands.go#L91-L95](http/commands.go#L91-L95)：
 
@@ -416,22 +510,25 @@ if err != nil {
 
 #### 分支 A：`wsErr` 内部 `WriteControl` 成功
 
-- 客户端收到 Close 帧（关闭码 1011，消息体 "Internal Server Error"）
-- `defer conn.Close()` 随后执行（幂等，不会重复发送）
+- Close 帧（1011, "Internal Server Error"）写入 TCP 缓冲区
+- 随后 `return 0, nil` → `defer conn.Close()` 关 TCP
+- 时序决定结果：
+  - Close 帧在 TCP FIN 前到达：`onclose.code = 1011`，`reason = "Internal Server Error"`
+  - TCP 先关（罕见但可能）：`onclose.code = 1006`
 
 #### 分支 B：`wsErr` 内部 `WriteControl` 失败
 
-- 仅服务端打一条日志，客户端**收不到任何 Close 帧**
-- 后续 `defer conn.Close()` 执行时，如果 TCP 已不可用则什么都不会发生
-- 客户端只能靠 WebSocket 协议层的超时或底层 TCP 的断开（FIN/RST）来感知连接出了问题
+- 仅服务端打一条日志，Close 帧**没发出去**
+- `defer conn.Close()` 执行 → 直接关 TCP
+- 客户端：`onclose.code = 1006`，`reason = ""`，完全不知道具体错误
 
-**同样属于第二类的位置：**
+**同样属于第二类的位置**：
 - ReadMessage 失败 [commands.go#L52-L55](http/commands.go#L52-L55)
 - StderrPipe 创建失败 [commands.go#L97-L101](http/commands.go#L97-L101)
 - cmd.Start 失败 [commands.go#L103-L106](http/commands.go#L103-L106)
 - cmd.Wait 返回错误 [commands.go#L115-L117](http/commands.go#L115-L117)（注意：此场景之前命令输出的 TextMessage 可能已部分成功发送）
 
-### 4.3 第三类：命令输出逐行推送（Scanner 循环中）
+### 5.3 第三类：命令输出逐行推送（Scanner 循环中）
 
 代码位于 [commands.go#L108-L113](http/commands.go#L108-L113)：
 
@@ -439,7 +536,7 @@ if err != nil {
 s := bufio.NewScanner(io.MultiReader(stdout, stderr))
 for s.Scan() {
     if err := conn.WriteMessage(websocket.TextMessage, s.Bytes()); err != nil {
-        log.Print(err)
+        log.Print(err)   // 注意：不 break，不发 Close 帧，不做任何恢复
     }
 }
 ```
@@ -451,7 +548,9 @@ for s.Scan() {
 - **仅 `log.Print(err)`，不 break 循环，不调用 wsErr，不发送 Close 帧**
 - 下一次 `s.Scan()` 继续读取 stdout/stderr，再尝试 `WriteMessage`，大概率再次失败，再次打日志……
 - 直到 Scanner 把输出读完（两个管道都 EOF），循环才结束
-- 然后才走到 `cmd.Wait()`，如果退出码非零再调用 `wsErr`
+- 然后才走到 `cmd.Wait()`：
+  - `cmd.Wait()` 返回 err → 调用 wsErr（见第二类分析）
+  - `cmd.Wait()` 返回 nil → 不发任何 Close 帧，`defer conn.Close()` 直接关 TCP
 
 #### 客户端视角收到的内容
 
@@ -459,8 +558,8 @@ for s.Scan() {
 - 失败的**那一行**以及之后继续失败的所有行：**全部丢失，收不到**
 - 循环期间不会收到 Close 帧
 - 循环结束后：
-  - 若 cmd.Wait 返回 nil → defer conn.Close() → 客户端可能收到正常 Close 帧（如果连接此时已恢复可用的话）
-  - 若 cmd.Wait 返回 err → wsErr 尝试发 1011 Close 帧（这一步同样可能再次失败）
+  - cmd.Wait 返回 nil → TCP 断开 → `onclose.code = 1006`
+  - cmd.Wait 返回 err → wsErr 尝试发 1011 Close 帧（见第二类分析）
 
 #### 为什么不中断循环
 
@@ -468,33 +567,38 @@ for s.Scan() {
 
 ---
 
-## 五、各阶段退出路径对照表（含成功/失败分支）
+## 六、所有路径的客户端可见结果对照表（含 onclose.code）
 
-以下是 `commandsHandler` 中所有退出位置及其**对代码事实的精确描述**，不再把"尝试发送"误写成"已接收"：
+以下是 `commandsHandler` 中所有退出位置**对准 gorilla/websocket 行为**的精确描述：
 
-| 代码行 | 触发条件 | 发送操作顺序 | 客户端最终能收到什么 |
-|--------|----------|-------------|----------------------|
-| L52-55 | ReadMessage 失败 | 直接调用 wsErr → return → defer Close | A: wsErr 的 Close 帧成功 → 收到 1011 Close 帧<br>B: wsErr 的 Close 帧也失败 → 仅靠 TCP 断开感知 |
-| L64-69 | 权限不足 | ① 尝试 WriteMessage("Command not allowed") | A1: ①成功 → 收到错误文本 + 正常 Close 帧 |
-| | | ② 若①失败则调用 wsErr → return → defer Close | A2: ①失败 + wsErr 的 Close 帧成功 → 收不到错误文本，收到 1011 Close 帧<br>A3: ①失败 + wsErr 的 Close 帧也失败 → 仅靠 TCP 断开感知 |
-| L73-78 | 命令解析失败 | ① 尝试 WriteMessage(错误文本) | B1: ①成功 → 收到错误文本 + 正常 Close 帧 |
-| | | ② 若①失败则调用 wsErr → return → defer Close | B2: ①失败 + wsErr 的 Close 帧成功 → 收不到错误文本，收到 1011 Close 帧<br>B3: ①失败 + wsErr 的 Close 帧也失败 → 仅靠 TCP 断开感知 |
-| L80-86 | 命令不在白名单 | ① 尝试 WriteMessage("Command not allowed") | C1: ①成功 → 收到错误文本 + 正常 Close 帧 |
-| | | ② 若①失败则调用 wsErr → return → defer Close | C2: ①失败 + wsErr 的 Close 帧成功 → 收不到错误文本，收到 1011 Close 帧<br>C3: ①失败 + wsErr 的 Close 帧也失败 → 仅靠 TCP 断开感知 |
-| L92-94 | StdoutPipe 创建失败 | 直接调用 wsErr → return → defer Close | D1: wsErr 的 Close 帧成功 → 收到 1011 Close 帧<br>D2: wsErr 的 Close 帧也失败 → 仅靠 TCP 断开感知 |
-| L98-100 | StderrPipe 创建失败 | 直接调用 wsErr → return → defer Close | E1: wsErr 的 Close 帧成功 → 收到 1011 Close 帧<br>E2: wsErr 的 Close 帧也失败 → 仅靠 TCP 断开感知 |
-| L103-105 | cmd.Start 失败 | 直接调用 wsErr → return → defer Close | F1: wsErr 的 Close 帧成功 → 收到 1011 Close 帧<br>F2: wsErr 的 Close 帧也失败 → 仅靠 TCP 断开感知 |
-| L108-113 + L115-117 | Scanner 循环结束后 cmd.Wait 返回 err | 循环中每行 WriteMessage 失败仅打日志<br>循环结束后调用 wsErr → return → defer Close | 循环中成功发送的行：能收到；失败的行：全部丢失<br>G1: wsErr 的 Close 帧成功 → 额外收到 1011 Close 帧<br>G2: wsErr 的 Close 帧也失败 → 仅靠 TCP 断开感知 |
-| L108-113 + L119 | Scanner 循环结束后 cmd.Wait 返回 nil | 循环中每行 WriteMessage 失败仅打日志<br>return → defer Close | 循环中成功发送的行：能收到；失败的行：全部丢失<br>→ 收到正常 Close 帧（TCP 仍可用时） |
+| 代码行 | 触发条件 | 协议层发送 | 底层操作 | 客户端可见结果 |
+|--------|----------|-----------|---------|---------------|
+| L52-55 | ReadMessage 失败 | wsErr → WriteControl(1011) | defer Close() 关 TCP | TextMessage: 无<br>Close 帧: A1=成功 → code=1011(到达时)或1006(TCP先关); A2=失败→code=1006 |
+| L64-69 | 权限不足, WriteMessage 成功 | ✗ 不调 wsErr | defer Close() 关 TCP | TextMessage: 收到"Command not allowed."<br>onclose.code=1006(无Close帧) |
+| L65-68 | 权限不足, WriteMessage 失败 | wsErr → WriteControl(1011) | defer Close() 关 TCP | TextMessage: ❌ 一定收不到<br>Close 帧: B1=成功→code=1011或1006; B2=失败→code=1006 |
+| L73-78 | 解析失败, WriteMessage 成功 | ✗ 不调 wsErr | defer Close() 关 TCP | TextMessage: 收到错误文本<br>onclose.code=1006 |
+| L74-76 | 解析失败, WriteMessage 失败 | wsErr → WriteControl(1011) | defer Close() 关 TCP | TextMessage: ❌ 一定收不到<br>Close 帧: 成功→code=1011或1006; 失败→code=1006 |
+| L80-86 | 白名单拒绝, WriteMessage 成功 | ✗ 不调 wsErr | defer Close() 关 TCP | TextMessage: 收到"Command not allowed."<br>onclose.code=1006 |
+| L81-83 | 白名单拒绝, WriteMessage 失败 | wsErr → WriteControl(1011) | defer Close() 关 TCP | TextMessage: ❌ 一定收不到<br>Close 帧: 成功→code=1011或1006; 失败→code=1006 |
+| L92-94 | StdoutPipe 创建失败 | wsErr → WriteControl(1011) | defer Close() 关 TCP | TextMessage: 无<br>Close 帧: 成功→code=1011或1006; 失败→code=1006 |
+| L98-100 | StderrPipe 创建失败 | wsErr → WriteControl(1011) | defer Close() 关 TCP | TextMessage: 无<br>Close 帧: 成功→code=1011或1006; 失败→code=1006 |
+| L103-105 | cmd.Start 失败 | wsErr → WriteControl(1011) | defer Close() 关 TCP | TextMessage: 无<br>Close 帧: 成功→code=1011或1006; 失败→code=1006 |
+| L108-113 + L115-117 | 推送后 cmd.Wait 返回 err (非零退出码) | 循环中每行尝试 WriteMessage<br>循环结束后 wsErr→WriteControl(1011) | defer Close() 关 TCP | TextMessage: 成功发送的行收到, 失败的行丢失<br>Close 帧: 成功→code=1011或1006; 失败→code=1006 |
+| L108-113 + L119 | 推送后 cmd.Wait 返回 nil (正常退出) | 循环中每行尝试 WriteMessage<br>❌ 之后不发任何 Close 帧 | defer Close() 关 TCP | TextMessage: 成功发送的行收到, 失败的行丢失<br>**onclose.code=1006 (正常退出反而是异常关闭码)** |
+
+**核心规律**：
+- 所有走 `defer conn.Close()` 但没有 Close 帧的路径 → `code = 1006`
+- 走 `wsErr` 且 WriteControl 成功的路径 → `code = 1011` 或 `1006`（取决于时序）
+- 没有任何路径能产生 `code = 1000`（真正的正常关闭）
 
 ---
 
-## 六、命令结束后的关闭路径详解
+## 七、命令结束后的关闭路径详解
 
-### 6.1 正常结束的关闭路径
+### 7.1 正常结束的关闭路径（cmd.Wait 返回 nil）
 
 ```
-命令执行完成
+命令执行完成 (退出码 0)
     │
     ▼
 stdout 管道关闭 (EOF)  ──▶  MultiReader 切换到 stderr
@@ -506,52 +610,79 @@ stderr 管道关闭 (EOF)  ──▶  MultiReader 返回 EOF
 bufio.Scanner s.Scan() 返回 false，循环退出
     │
     ▼
-cmd.Wait() 被调用（L115）
+cmd.Wait() → 返回 nil
     │
-    ├── Wait() 返回 nil  ──▶  不调用 wsErr
-    │                         直接 return 0, nil
-    │                            │
-    │                            ▼
-    │                      defer conn.Close() 执行
-    │                      发送正常 Close 帧
+    ▼
+❌ 不调用 wsErr （不发任何 Close 帧）
     │
-    └── Wait() 返回 err  ──▶  调用 wsErr()
-                               尝试发送 Close 帧 (CloseInternalServerErr)
-                                  │
-                                  ├── 成功 → 客户端收到 1011 Close 帧
-                                  │
-                                  └── 失败 → 仅打日志，客户端无感知
-                                          │
-                                          ▼
-                                     return 0, nil
-                                     defer conn.Close() 执行
-                                     （此时连接可能已由 wsErr 关闭，
-                                       Close() 是幂等的，不会报错）
+    ▼
+return 0, nil
+    │
+    ▼
+defer conn.Close() 执行
+    │
+    └──▶  只关 TCP (FIN/RST)
+             ❌ 不参与关闭握手
+                    │
+                    ▼
+              浏览器 onclose.code = 1006
+              (CloseAbnormalClosure)
 ```
 
-### 6.2 关闭路径的重要细节
+### 7.2 错误结束的关闭路径（cmd.Wait 返回 err / 管道失败 / 启动失败）
 
-**1. 权限拒绝时"双重消息"只在 WriteMessage 成功时才成立**
+```
+错误触发点（任意）
+    │
+    ▼
+调用 wsErr(...)
+    │
+    ├── WriteControl(Close1011, "Internal Server Error")
+    │       │
+    │       ├── 成功 → Close 帧进入 TCP 发送缓冲区
+    │       └── 失败 → log.Print，不重试
+    │
+    ▼
+return 0, nil
+    │
+    ▼
+defer conn.Close() 执行 → 立即关 TCP
+    │
+    └──▶  TCP FIN 发出
+        ┌───────────────────────────────────────┐
+        │  时序竞态：                            │
+        │  · Close 帧在 FIN 前到达 → code=1011  │
+        │  · FIN 先于 Close 帧到达 → code=1006  │
+        └───────────────────────────────────────┘
+```
 
-当 WriteMessage 成功时，客户端先收到 TextMessage，再收到 defer 产生的 Close 帧，共两条消息。但如果 WriteMessage 本身就失败了，客户端至多只能收到 Close 帧，错误文本是丢失的。
+### 7.3 关闭路径的重要细节
 
-**2. 命令非零退出码 ≠ 连接异常**
+**1. 正常退出（code=0）一定产生 1006**
 
-当 `cmd.Wait()` 返回错误时（命令以非零退出码结束），代码调用 `wsErr` 发送 `CloseInternalServerErr`（关闭码 1011）。这意味着即使命令只是业务语义上的失败（如 `ls` 找不到文件返回退出码 1），WebSocket 也被标为"服务器内部错误"关闭，语义不精确。
+这是最反直觉的一点。代码中只有 `cmd.Wait() != nil` 时才调用 `wsErr`，所以命令正常成功执行完毕时，完全没有 Close 帧发送，直接关 TCP。客户端必然看到 `code = 1006`。
 
-**3. `defer conn.Close()` 是所有路径的最后一道防线**
+**2. 权限拒绝的 WriteMessage 成功路径：先收文本，再收 1006**
 
-无论中间是否调用过 `wsErr`，所有路径最终都会执行 `defer conn.Close()`。gorilla/websocket 的 `Close()` 方法是幂等的，多次调用安全。
+用户在终端看到了 "Command not allowed."，然后 onclose 触发，一切看起来正常。但 WebSocket 协议层实际是异常关闭（1006），只是 Shell.vue 不检查 code，用户感知不到差别。
 
-**4. wsErr 的 WriteControl 失败是"静默失败"**
+**3. wsErr 的 1011 有竞态条件**
 
-客户端此时只能依赖 WebSocket 内部的超时检测或 TCP 层的连接断开（FIN/RST）来感知。不会有任何额外的通知。
+`WriteControl` 写入成功只代表数据进了内核 TCP 发送缓冲区。`defer conn.Close()` 立即执行会马上调 `net.Conn.Close()`，如果 Close 帧还在缓冲区没发出去，TCP 可能用 RST 而不是 FIN 关闭（取决于 SO_LINGER 设置和数据量），Close 帧就丢了。这种情况下客户端看到的也是 1006。
+
+**4. `Conn.Close()` 的幂等性**
+
+无论是否调用过 wsErr、WriteControl 是否成功，`defer conn.Close()` 都会执行。gorilla/websocket 的 `Close()` 内部只是调底层 `net.Conn.Close()`，多次调用安全（Go 的 `net.TCPConn.Close()` 是幂等的，多调返回相同错误）。
+
+**5. gorilla/websocket 默认 CloseHandler 没机会发挥作用**
+
+gorilla/websocket 文档中说"默认 close handler sends a close message to the peer"，但这只有在应用层调用 `ReadMessage` / `NextReader` 收到了对端的 Close 帧时才会触发。commandsHandler 在读取完命令后就进入 Scanner 循环读管道了，不再读 WebSocket，所以这条自动回 Close 帧的逻辑永远不会被触发。
 
 ---
 
-## 七、连接生命周期完整时序
+## 八、连接生命周期完整时序
 
-### 7.1 正常命令执行（全部发送成功）
+### 8.1 正常命令执行（全部发送成功，退出码 0）
 
 ```
 浏览器                                    服务器
@@ -570,7 +701,7 @@ cmd.Wait() 被调用（L115）
   │  4. onopen 触发                         │
   │     conn.send("ls -la")                 │
   │────────────────────────────────────────▶│
-  │                                         │  5. ReadMessage 读取命令
+  │                                         │  5. ReadMessage 收到命令
   │                                         │     权限校验通过
   │                                         │     cmd.Start()
   │                                         │
@@ -583,14 +714,17 @@ cmd.Wait() 被调用（L115）
   │                                         │
   │                                         │  Scanner 循环结束
   │                                         │  cmd.Wait() → 退出码 0
+  │                                         │  ❌ 不发任何 Close 帧
   │                                         │  return 0, nil
   │                                         │  defer conn.Close()
+  │                                         │    └── 只关 TCP
   │                                         │
-  │  7. onclose 触发 (正常)                 │  正常 Close 帧
+  │  7. onclose 触发                        │
+  │     code = 1006 (Abnormal)              │◀── TCP FIN
   │◀────────────────────────────────────────│
 ```
 
-### 7.2 权限不足 + WriteMessage 失败
+### 8.2 权限不足 + WriteMessage 失败 + wsErr 的 WriteControl 也失败
 
 ```
 浏览器                                    服务器
@@ -601,52 +735,48 @@ cmd.Wait() 被调用（L115）
   │                                         │  检查权限不足
   │                                         │
   │                                         │  WriteMessage("Command not allowed.")
-  │                                         │    → 返回 err（连接刚断）
+  │                                         │    → err（连接已异常）
   │                                         │
-  │  ✕ 用户网络已断开                        │  进入 if: 调用 wsErr
+  │  ✕ 网络异常/客户端已断连                  │  进入 if: 调用 wsErr
   │                                         │    WriteControl(Close 1011)
-  │                                         │      → 再次失败（连接仍断）
+  │                                         │      → err（写入同样失败）
   │                                         │      log.Print(err)
   │                                         │  return 0, nil
-  │                                         │  defer conn.Close()
+  │                                         │  defer conn.Close() → 关 TCP
   │
-  │  客户端视角：                            │
-  │  无任何 onmessage 收到                  │
-  │  无任何 onclose 收到（短时间内）         │
-  │  最终靠浏览器 WS 超时 / TCP RST 感知    │
+  │  客户端视角：
+  │  onmessage: 无任何消息                  │
+  │  onclose.code = 1006                    │◀── TCP FIN / RST
+  │  完全不知道失败原因                      │
 ```
 
-### 7.3 命令输出推送中 WriteMessage 失败（客户端提前断开）
+### 8.3 命令非零退出码（wsErr 的 Close 帧成功到达）
 
 ```
 浏览器                                    服务器
   │                                         │
-  │  ... 输出推送中，已收到前 10 行          │
-  │  ✕ 用户关闭页面                          │
+  │  ... 命令输出已推送完毕                  │
+  │                                         │  Scanner 循环结束
+  │                                         │  cmd.Wait() → err (退出码 1)
   │                                         │
-  │                                         │  L110: WriteMessage(第11行) → err
-  │                                         │         log.Print(err) ← 仅日志
-  │                                         │  s.Scan() → 继续读第12行
-  │                                         │  L110: WriteMessage(第12行) → err
-  │                                         │         log.Print(err) ← 重复
-  │                                         │  ... 循环继续，每行都失败都打日志 ...
+  │                                         │  wsErr() 调用:
+  │                                         │  WriteControl(Close, [1011, "ISE"])
+  │  ◀─── Close 帧 (1011) ─────────────────│  ← 这一步先到达
   │                                         │
-  │                                         │  Scanner 读完全部输出，循环结束
-  │                                         │  cmd.Wait() → 回收子进程
-  │                                         │  return 0, nil
-  │                                         │  defer conn.Close()
+  │  (浏览器准备回 Close 帧，但还没发)        │  defer conn.Close()
+  │                                         │    └── TCP FIN
+  │  ◀─── TCP FIN ─────────────────────────│  ← 可能与 Close 帧同包
   │
-  │  客户端视角：                            │
-  │  onmessage: 仅收到前 10 行              │
-  │  第 11 行及之后：全部丢失                │
-  │  onclose: 页面已销毁，回调不会执行       │
+  │  onmessage: 已收到全部输出行             │
+  │  onclose.code = 1011                    │
+  │  reason = "Internal Server Error"       │
 ```
 
 ---
 
-## 八、消息格式
+## 九、消息格式
 
-### 8.1 客户端 → 服务器
+### 9.1 客户端 → 服务器
 
 只有**文本消息（TextMessage）**：命令字符串
 
@@ -655,7 +785,7 @@ cmd.Wait() 被调用（L115）
 "ls -la"
 ```
 
-### 8.2 服务器 → 客户端
+### 9.2 服务器 → 客户端
 
 **文本消息（TextMessage）**：命令输出的每一行，或权限/解析错误消息
 
@@ -669,15 +799,18 @@ cmd.Wait() 被调用（L115）
 - `"Command not allowed."` — 权限不足或命令不在白名单
 - 其他错误文本 — 命令解析失败时的错误信息
 
-**Close 帧**（仅在对应 WriteControl 成功时收到）：
-- 正常关闭：由 `defer conn.Close()` 产生
-- 错误关闭：关闭码 1011（CloseInternalServerErr），消息体为 HTTP 状态文本如 `"Internal Server Error"`，由 `wsErr` 函数产生
+**Close 帧**（仅在对应 WriteControl 成功且先于 TCP FIN 到达时收到）：
+- 关闭码 1011（CloseInternalServerErr），消息体 `"Internal Server Error"` —— 由 `wsErr` 函数产生
+- ❌ 代码中不存在关闭码 1000（正常关闭）的发送路径
+
+**底层 TCP 断开**（所有路径都会发生，可能伴随 Close 帧也可能没有）：
+- 触发浏览器 `onclose`，`code = 1005 / 1006`（未收到 Close 帧时）
 
 ---
 
-## 九、安全机制
+## 十、安全机制
 
-### 9.1 多层权限校验
+### 10.1 多层权限校验
 
 | 层级 | 检查点 | 代码位置 |
 |------|--------|----------|
@@ -685,7 +818,7 @@ cmd.Wait() 被调用（L115）
 | 2 | 用户执行权限 `d.user.Perm.Execute` | [commands.go#L64](http/commands.go#L64) |
 | 3 | 用户允许的命令列表 `d.user.Commands` | [commands.go#L80](http/commands.go#L80) |
 
-### 9.2 工作目录限制
+### 10.2 工作目录限制
 
 ```go
 cmd.Dir = d.user.FullPath(r.URL.Path)
@@ -693,15 +826,15 @@ cmd.Dir = d.user.FullPath(r.URL.Path)
 
 命令执行的工作目录被限制在用户当前浏览的路径下，结合用户的 Scope 限制。
 
-### 9.3 JWT 认证
+### 10.3 JWT 认证
 
 WebSocket 握手阶段就完成了用户身份认证。
 
 ---
 
-## 十、命令解析流程
+## 十一、命令解析流程
 
-### 10.1 ParseCommand —— [parser.go](runner/parser.go#L10-L25)
+### 11.1 ParseCommand —— [parser.go](runner/parser.go#L10-L25)
 
 ```go
 func ParseCommand(s *settings.Settings, raw string) (command []string, name string, err error) {
@@ -722,14 +855,14 @@ func ParseCommand(s *settings.Settings, raw string) (command []string, name stri
 - 无 Shell 配置时：直接调用二进制文件 + 参数
 - 有 Shell 配置时：`["bash", "-c", "原始命令"]`，由 Shell 解释执行
 
-### 10.2 跨平台命令拆分 —— [commands.go](runner/commands.go#L34-L58)
+### 11.2 跨平台命令拆分 —— [commands.go](runner/commands.go#L34-L58)
 
 - **Windows**：自定义解析器，处理反斜杠路径和引号转义
 - **Unix/Linux**：使用 `go-shlex` 库解析
 
 ---
 
-## 十一、关键文件索引
+## 十二、关键文件索引
 
 | 文件 | 作用 |
 |------|------|
@@ -745,7 +878,7 @@ func ParseCommand(s *settings.Settings, raw string) (command []string, name stri
 
 ---
 
-## 十二、设计特点与改进空间
+## 十三、设计特点与改进空间
 
 ### 现有设计特点
 
@@ -753,14 +886,16 @@ func ParseCommand(s *settings.Settings, raw string) (command []string, name stri
 2. **实时性**：使用 `io.MultiReader` + `bufio.Scanner` 实现逐行推送
 3. **安全性**：三层权限校验 + 工作目录限制
 4. **资源安全**：即使客户端断开，也保证 `cmd.Wait()` 被调用，避免僵尸进程
+5. **前端容错**：Shell.vue 的 onclose 不区分关闭码，天然屏蔽了服务端未做关闭握手的问题
 
 ### 潜在改进点
 
-1. **stdout/stderr 串行读取**：`io.MultiReader` 导致 stderr 延迟到 stdout EOF 后才发送。可用两个 goroutine 分别读取 stdout/stderr，通过 channel 合并实现真正的交叉推送
-2. **TextMessage 失败时错误消息丢失**：权限/解析场景下 WriteMessage 失败，错误文本就丢了。可考虑把错误信息塞进 Close 帧的 reason 字段，客户端从 onclose 中读取
-3. **wsErr 的 WriteControl 静默失败**：Close 帧发送失败时客户端无感知。可考虑设置 SetPongHandler / 心跳，结合合理的超时时间
-4. **输出推送 WriteMessage 失败不中断**：Scanner 循环期间客户端断开会产生大量重复错误日志。可引入失败计数器，连续失败 N 次后主动 break，但仍保证后续走 `cmd.Wait()` 路径
-5. **命令非零退出码的关闭语义**：`cmd.Wait()` 返回错误时以 1011 关闭码关闭 WebSocket，语义不够精确。可考虑用自定义关闭码（如 4xxx 范围）携带退出码信息，或通过一条 TextMessage 先传递退出码再正常关闭
-6. **心跳机制缺失**：没有 ping/pong 心跳，网络异常时可能无法及时感知断连
-7. **输入支持**：当前只支持单向输出推送，不支持交互输入（如 `sudo` 密码输入）
-8. **ANSI 转义序列处理**：前端只简单过滤颜色码，可考虑完整的终端仿真
+1. **完成 RFC 6455 关闭握手**：正常退出时也应发送 CloseNormalClosure(1000)，并简短等待对端回 Close 帧（可设置较短超时如 100ms）后再关 TCP。当前实现导致所有正常退出都走 1006 异常码
+2. **wsErr + defer Close 的竞态**：WriteControl 成功后立即关 TCP 可能导致 Close 帧丢失。可在 wsErr 和 defer 之间加一个短暂的 ReadTimeout + 读循环（读不到就放弃），或者用 `SetLinger` 控制 TCP 关闭行为
+3. **stdout/stderr 串行读取**：`io.MultiReader` 导致 stderr 延迟到 stdout EOF 后才发送。可用两个 goroutine 分别读取 stdout/stderr，通过 channel 合并实现真正的交叉推送
+4. **TextMessage 失败时错误消息丢失**：权限/解析场景下 WriteMessage 失败，错误文本就丢了。可考虑把错误信息塞进 Close 帧的 reason 字段（即使 WriteMessage 失败，Close 帧可能因为更小而发送成功），客户端从 `onclose.reason` 中读取
+5. **输出推送 WriteMessage 失败不中断**：Scanner 循环期间客户端断开会产生大量重复错误日志。可引入失败计数器，连续失败 N 次后主动 break（仍保证后续走 `cmd.Wait()` 路径）
+6. **命令非零退出码的关闭语义**：`cmd.Wait()` 返回错误时以 1011 关闭码关闭 WebSocket，语义不精确。可考虑用自定义关闭码（4xxx 范围）携带退出码信息，或先通过一条 TextMessage 传递退出码再用 1000 正常关闭
+7. **心跳机制缺失**：没有 ping/pong 心跳，网络异常时可能无法及时感知断连
+8. **输入支持**：当前只支持单向输出推送，不支持交互输入（如 `sudo` 密码输入）
+9. **ANSI 转义序列处理**：前端只简单过滤颜色码，可考虑完整的终端仿真

@@ -345,11 +345,11 @@ if link.Expire != 0 && link.Expire <= time.Now().Unix() { ... }
 ```
 （`Expire == 0` 代表永久分享，永远不清理）
 
-### 4.2 ⚠️ 批量列表场景下的边界问题：连续过期链接漏删
+### 4.2 ⚠️ 批量列表场景下的边界问题：range 遍历删除导致数据错乱 + panic
 
 #### 问题描述
 
-**`All()`、`FindByUserID()`、`Gets()` 三个批量方法存在「连续过期链接漏删」的边界 bug。**
+**`All()`、`FindByUserID()`、`Gets()` 三个批量方法存在「原地修改切片 + range 遍历」的严重 bug。**
 
 当前实现 [share/storage.go#L39-L46](share/storage.go#L39-L46)：
 
@@ -359,84 +359,87 @@ for i, link := range links {
         if err := s.Delete(link.Hash); err != nil {
             return nil, err
         }
-        links = append(links[:i], links[i+1:]...)  // 从切片中移除
+        links = append(links[:i], links[i+1:]...)  // 原地修改切片
     }
 }
 ```
 
-#### 根本原因
+#### 根本原因（Go range 语义精确分析）
 
-Go 的 `for range` 循环在开始时就确定了迭代次数（初始 `len(links)`），且索引 `i` 持续递增。当删除第 `i` 个元素后，后续元素**前移填补空位**，但下一次迭代 `i` 变成 `i+1`，导致**前移到 i 位置的那个元素被跳过**。
+Go 语言规范中 `for i, v := range slice` 的行为：
 
-#### 复现场景（连续过期）
+1. **循环开始时求值一次**：`range links` 在循环开始时对 `links` 求值，得到一个**临时切片副本**（含底层数组指针、长度、容量）
+2. **迭代次数固定**：循环次数 = 临时副本的初始 `len(links)`，后续修改 `links` 变量不影响迭代次数
+3. **`link` 来自临时副本**：每次迭代的 `link = temp_slice[i]`，始终是原始切片的元素
+4. **切片操作使用修改后的 `links`**：`links = append(links[:i], links[i+1:]...)` 修改的是 `links` 变量本身，后续的切片操作使用修改后的长度
 
-```
-初始状态：links = [A(过期), B(过期), C(正常), D(过期)]
-          len = 4
+**矛盾点**：`i` 按原始长度递增，但 `links[:i]` 的切片边界检查使用修改后的长度。
 
-┌───────┬────────────────────────────────────────────────┬─────────────┐
-│  i=0  │ 检查 A → 过期，DB Delete                       │ links = [B, C, D] │
-│       │ links = append(links[:0], links[1:]...)        │             │
-├───────┼────────────────────────────────────────────────┼─────────────┤
-│  i=1  │ 检查 links[1] = C → 正常，跳过                 │ 🔴 B 被跳过 │
-│       │                                                │ （现在在 i=0）│
-├───────┼────────────────────────────────────────────────┼─────────────┤
-│  i=2  │ 检查 links[2] = D → 过期，DB Delete            │ links = [B, C] │
-├───────┼────────────────────────────────────────────────┼─────────────┤
-│  i=3  │ 超出 len=2，循环结束                           │             │
-└───────┴────────────────────────────────────────────────┴─────────────┘
+#### 复现场景（精确到每一步）
 
-最终结果：B 这个过期链接残留，既没从 DB 删除，也没从返回列表过滤！
-```
+场景：`links = [A(过期), B(过期), C(正常), D(过期)]`，初始 len=4
 
-#### 更极端情况：全部连续过期
+range 开始：临时副本 `temp = [A, B, C, D]`，迭代次数固定为 4
 
-```
-links = [A(过期), B(过期), C(过期)]
+| i | link (temp[i]) | 过期 | DB 删除 | 切片操作（使用修改后的 links） | 结果 links | 问题 |
+|---|---------------|------|---------|-----------------------------|-----------|------|
+| 0 | A | ✅ 是 | Delete(A.Hash) ✅ | `append(links[:0], links[1:])` | `[B, C, D]` <br> len=3 | 正确 |
+| 1 | B | ✅ 是 | Delete(B.Hash) ✅ | 当前 links=`[B,C,D]` <br> `links[:1]` = `[B]` <br> `links[2:]` = `[D]` <br> → `[B, D]` | `[B, D]` <br> len=2 | ❌ C 被误删！<br>（C 是正常的但被移除）<br> ❌ B 残留！<br>（DB 已删但切片中还在） |
+| 2 | C | ❌ 否 | - | 无操作 | `[B, D]` | - |
+| 3 | D | ✅ 是 | Delete(D.Hash) ✅ | 当前 links=`[B,D]`, len=2 <br> `links[:3]` → **越界！** | 💥 | **Runtime Panic** <br> `slice bounds out of range [:3] with length 2` |
 
-i=0: 删除 A → [B, C]
-i=1: 检查 C → 删除 C → [B]
-i=2: 超出范围，结束
+**最终结果**：
+- ✅ DB 删除是正确的（A、B、D 都从 DB 删除了）
+- ❌ 返回切片 = `[B, D]`（但 B、D 在 DB 中已不存在）
+- ❌ 正常元素 C 被错误地从返回切片中移除
+- 💥 大概率触发 runtime panic
 
-结果：B 残留！
-```
+#### 全部连续过期场景
+
+`links = [A(过期), B(过期), C(过期)]`, len=3
+
+| i | link | DB 删除 | 切片操作 | 结果 links |
+|---|------|---------|----------|-----------|
+| 0 | A | ✅ | `append(links[:0], links[1:])` | `[B, C]`, len=2 |
+| 1 | B | ✅ | `append(links[:1], links[2:])` <br> links[:1]=`[B]`, links[2:]=`[]` → `[B]` | `[B]`, len=1 |
+| 2 | C | ✅ | `links[:3]` → len=1, 越界 | 💥 panic |
+
+#### 非连续过期场景（中间有正常元素）
+
+`links = [A(过期), B(正常), C(过期)]`, len=3
+
+| i | link | 过期 | DB 删除 | 切片操作 | 结果 links |
+|---|------|------|---------|----------|-----------|
+| 0 | A | ✅ | ✅ | `append(links[:0], links[1:])` | `[B, C]`, len=2 |
+| 1 | B | ❌ | - | 无 | `[B, C]` |
+| 2 | C | ✅ | ✅ | `links[:3]` → len=2, 越界 | 💥 panic |
+
+**即使非连续也会 panic！** 只要有过期元素导致切片缩短，后续 i 超过新长度就会越界。
 
 #### 受影响的 API
 
 | API 端点 | 调用的方法 | 影响程度 |
 |----------|-----------|---------|
-| `GET /api/shares` | `All()` | 🔴 严重 - 管理员/用户查看分享列表时漏删 |
-| `GET /api/share/{path}` | `Gets()` | 🔴 严重 - 查看某路径的分享列表时漏删 |
-| （内部）删除文件级联 | `DeleteWithPathPrefix` | 🟡 间接 - All() 被调用来过滤路径 |
-| `GET /api/public/share/{hash}` | `GetByHash()` | 🟢 安全 - 单条查询无循环 |
+| `GET /api/shares` | `All()` [share/storage.go#L32-L49](share/storage.go#L32-L49) | 🔴 严重 - 可能 panic + 返回数据错乱 |
+| `GET /api/share/{path}` | `Gets()` [share/storage.go#L94-L111](share/storage.go#L94-L111) | 🔴 严重 - 同上 |
+| `GetsByPath()` | 内部调用 `All()` | 🔴 严重 - 同上 |
+| `GET /api/public/share/{hash}` | `GetByHash()` [share/storage.go#L72-L86](share/storage.go#L72-L86) | 🟢 安全 - 单条查询无循环 |
+| 删除文件级联 | `DeleteWithPathPrefix()` [storage/bolt/share.go#L80-L104](storage/bolt/share.go#L80-L104) | 🟢 安全 - Bolt 底层实现，不经过 Storage 包装层 |
 
-#### 实际表现
+#### 实际表现总结
 
-- 非连续过期链接：能正确清理（中间的未过期链接阻止了跳过）
-- 连续过期链接：每次调用只能清理第 1、3、5... 条（隔一个删一个）
-- 最终一致性：多次调用该方法可以逐步清理完（每次清理一部分），但单次调用不保证完全清理
+| 现象 | 说明 |
+|------|------|
+| ✅ DB 删除 | 总是正确（`link` 来自原始切片） |
+| ❌ 返回切片 | 可能缺失正常元素 + 残留已删除元素 |
+| 💥 Runtime Panic | 只要有过期元素且迭代 i 超过新长度就会发生 |
+| 🔄 最终一致性 | 如果没 panic，下次调用重新从 DB 读取，会得到正确结果（因为 DB 已删） |
 
 #### 修复方案
 
-**方案 A：反向遍历（推荐，最小改动）**
+**方案 A：收集而非原地删除（推荐，最清晰，无副作用）**
 
-从后往前遍历，删除元素不影响尚未检查的索引：
-
-```go
-for i := len(links) - 1; i >= 0; i-- {
-    link := links[i]
-    if link.Expire != 0 && link.Expire <= time.Now().Unix() {
-        if err := s.Delete(link.Hash); err != nil {
-            return nil, err
-        }
-        links = append(links[:i], links[i+1:]...)
-    }
-}
-```
-
-**方案 B：收集而非原地删除（更清晰，无副作用）**
-
-构建新切片，只保留未过期的，过期的单独删除：
+构建新切片，永远不修改正在遍历的切片：
 
 ```go
 var filtered []*Link
@@ -452,9 +455,25 @@ for _, link := range links {
 return filtered, nil
 ```
 
-**方案 C：不修改原切片，删除后继续检查 i 位置**
+**方案 B：反向遍历（最小改动）**
 
-删除后手动 `i--` 回退索引：
+从后往前遍历，删除元素不影响未检查的索引：
+
+```go
+for i := len(links) - 1; i >= 0; i-- {
+    link := links[i]
+    if link.Expire != 0 && link.Expire <= time.Now().Unix() {
+        if err := s.Delete(link.Hash); err != nil {
+            return nil, err
+        }
+        links = append(links[:i], links[i+1:]...)
+    }
+}
+```
+
+**方案 C：使用普通 for 循环 + 手动索引控制**
+
+不使用 range，动态检查 `len(links)`，删除后回退索引：
 
 ```go
 for i := 0; i < len(links); i++ {
@@ -464,7 +483,7 @@ for i := 0; i < len(links); i++ {
             return nil, err
         }
         links = append(links[:i], links[i+1:]...)
-        i--  // 回退，下次循环继续检查当前位置
+        i--  // 回退，下次继续检查当前位置
     }
 }
 ```
@@ -539,7 +558,7 @@ type Link struct {
 | 8 | checkerPrefix 规则补偿 | [http/data.go#L42-L43](http/data.go#L42-L43) | 分享子目录绕过所有者 deny 规则 |
 | 9 | 删除分享只能本人或 Admin | [http/share.go#L92-L93](http/share.go#L92-L93) | 普通用户删别人的分享 |
 | 10 | DeleteWithPathPrefix 精确路径 + UserID 过滤 | [storage/bolt/share.go#L93-L99](storage/bolt/share.go#L93-L99) | 删除级联误删他人链接 |
-| 11 | ⚠️ 批量清理连续过期漏删 | [share/storage.go#L39-L46](share/storage.go#L39-L46) | 连续过期的分享链接残留（待修复） |
+| 11 | ⚠️ range 遍历删除导致数据错乱 + panic | [share/storage.go#L39-L46](share/storage.go#L39-L46) | 返回切片数据错乱 + runtime panic（待修复） |
 
 ---
 

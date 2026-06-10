@@ -423,6 +423,8 @@ watch(route, () => {
 
 **注意**：`success` 弹窗不关闭，用于操作成功后的提示延续（如复制/移动成功提示）。
 
+**Layout 层的清理边界**：Layout 只负责 `selected`、`multiple`、`prompts` 这三类 UI 状态的重置，**不清理 `fileStore.req`（文件资源数据）**。`req` 的生命周期完全由各子页面（Files / Share / Settings）自己管理——这是有意的分层：Layout 管框架 UI 状态，子页面管业务数据状态。
+
 #### 4.4.3 Files 视图层：数据获取时重置
 
 Files.vue 的 `fetchData()` 函数在每次获取数据前重置选择状态（`frontend/src/views/Files.vue` 第 143–149 行）：
@@ -715,7 +717,7 @@ onBeforeUnmount(() => {
 });
 ```
 
-#### 4.6.5 Share.vue：仅清理键盘监听，无 AbortController
+#### 4.6.5 Share.vue：仅清理键盘监听，无 AbortController，req 残留
 
 `frontend/src/views/Share.vue` 的 `fetchData` 函数**没有使用 `AbortController`**（第 393–425 行）。它直接调用 `api.fetch(url, password.value)` 发起请求，不传入 signal，也没有任何请求中止机制。
 
@@ -730,12 +732,21 @@ Share 页面只做了两项清理：
 | AbortController | ✅ 有（路由切换 + 组件卸载双重中止） | ❌ 无 |
 | 键盘监听清理 | ✅ 有（F1 帮助键） | ✅ 有（Esc 取消选择） |
 | onBeforeUnmount/onUnmounted | ✅ 两者都有 | ✅ 只有 onBeforeUnmount |
-| 卸载时清空 fileStore.req | ✅ 有 | ❌ 没有（依赖 Layout 外层清理） |
+| 卸载时清空 `fileStore.req` | ✅ 有（`updateRequest(null)`） | ❌ 没有（req 会残留在全局 store 中） |
+| Layout 层清理 `selected`/`multiple` | ✅ 有 | ✅ 有 |
 
-**为什么 Share 不需要 AbortController？**
-- Share 页面是公开访问，数据量通常较小，请求较快完成
-- Share 组件卸载后，即使请求回调触发，由于响应式状态已与 DOM 解绑，不会造成视觉错误
-- 这是一个有意的简化设计：共享页功能较少，牺牲了少量竞态安全性换取代码简洁
+**离开 Share 页后文件资源状态的归属**：
+
+`fileStore` 是全局 Pinia store（`frontend/src/stores/file.ts`），不随任何组件销毁。离开 Share 页面后：
+
+1. **`fileStore.req` 不会被清空**——Share.vue 的 `onBeforeUnmount` 只移除了键盘监听，没有调用 `fileStore.updateRequest(null)`；Layout.vue 的 `watch(route)` 也只重置 `selected` 和 `multiple`，不碰 `req`。
+2. **异步请求返回后仍会写入 store**——因为没有 AbortController，如果用户在请求返回前跳转离开，`api.fetch()` 的 Promise 仍然会 resolve，随后执行 `fileStore.updateRequest(file)` 把数据写入全局 store。此时组件已卸载，不会触发 DOM 更新，但 store 状态被污染了。
+3. **Layout 层不承担 req 清理**——之前"依赖布局层清理"的说法不准确。Layout 只清理选择状态和弹窗，`req` 的清理完全由各页面自己负责，Share 页恰好没做这件事。
+
+**这是不是 bug？**
+- 从功能角度看，影响有限：下次进入 Files 或 Share 页面时，`fetchData()` 会调用 `updateRequest()` 覆盖旧的 `req`
+- 从竞态安全角度看，存在隐患：如果在 Share 页发起了一个很慢的请求，跳转到 Files 页后请求才返回，会把 Files 页的 `req` 意外覆盖成 Share 的数据
+- 对比 Files.vue 的严谨处理（双重 AbortController + 卸载时清空 req），Share.vue 确实在清理上做得不够完整
 
 #### 4.6.6 各组件清理对照表
 
@@ -981,12 +992,22 @@ Files.vue、Share.vue、Sidebar.vue 均使用 `watch(route)` 触发数据重新�
 
 编辑器通过 `onBeforeRouteUpdate` 拦截 Vue Router 导航（自定义弹窗），通过 `beforeunload` 拦截浏览器关闭/刷新（原生确认框），两层拦截互补，确保未保存修改在任何离开场景下都不会静默丢失。
 
-### 7.9 组件卸载时的分级清理
+### 7.9 组件卸载时的分级清理与状态残留
 
-注册了 `window.addEventListener` 的组件都在 `onBeforeUnmount` / `onUnmounted` 中移除监听，避免内存泄漏和幽灵回调。网络请求中止则按页面重要性分级：
-- **Files 页**：使用 `AbortController`，路由切换 + 组件卸载双重中止，防止快速导航竞态
-- **Share 页**：不使用 `AbortController`，依赖组件卸载后响应式状态失效自然忽略回调
-- **Sidebar 用量**：使用 `AbortController`，只在文件页显示时请求
+注册了 `window.addEventListener` 的组件都在 `onBeforeUnmount` / `onUnmounted` 中移除监听，避免内存泄漏和幽灵回调。但全局 store 状态的清理并不一致：
+
+| 清理维度 | Files 页 | Share 页 | Layout 层 |
+|----------|----------|----------|-----------|
+| 键盘事件监听 | ✅ 清理 | ✅ 清理 | — |
+| 网络请求中止 | ✅ AbortController（路由切换 + 卸载双重） | ❌ 无 | — |
+| `fileStore.selected` | ✅ 重置（fetchData 内） | ✅ 重置（fetchData 内） | ✅ 重置（watch route） |
+| `fileStore.multiple` | ✅ 重置（fetchData 内） | ✅ 重置（fetchData 内） | ✅ 重置（watch route） |
+| `fileStore.req` | ✅ 卸载时设为 null | ❌ 残留 | ❌ 不清理 |
+
+**要点**：
+- Layout 层只统一清理 `selected`、`multiple` 和弹窗，**不清理 `req`**
+- `req` 的清理是各页面自己的责任，Files 页做了，Share 页没做
+- Share 页没有 AbortController + 不清理 req，可能导致慢速请求返回时污染全局 store
 
 ---
 

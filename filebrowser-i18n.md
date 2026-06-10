@@ -738,11 +738,11 @@ i18n.global.t("buttons.reportIssue")
 | lv | ✅ lv.json | ✅ "lv" | ✅ "lv" | ✅ lv | ❌ | ✅ 是 |
 | nl | ✅ nl.json | ✅ "nl" | ✅ "nl" | ✅ nl | ❌ | ✅ 是 |
 | **nl-be** | ✅ nl-be.json | ⚠️ 被nl截断 | ✅ "nl-be" | ✅ nl-be | ❌ | ⚠️ 仅手动 |
-| no | ✅ no.json | ✅ "no"(nb/no) | ✅ "no" | ✅ nb | ❌ | ⚠️ 部分(dayjs不匹配) |
+| no | ✅ no.json | ✅ "no"(nb/no) | ✅ "no" | ⚠️ 加载了nb（代码不匹配） | ❌ | ⚠️ 日期不本地化 |
 | pl | ✅ pl.json | ✅ "pl" | ✅ "pl" | ✅ pl | ❌ | ✅ 是 |
-| **pt** | ✅ pt.json | ⚠️ 映射到pt-pt | ❌ 不存在 | ✅ pt | ❌ | ❌ 不可达 |
+| **pt** | ✅ pt.json | ⚠️ 映射到pt-pt | ❌ 不存在 | ✅ pt | ❌ | ❌ 不可达（冗余） |
 | pt-br | ✅ pt-br.json | ✅ "pt-br" | ✅ "pt-br" | ✅ pt-br | ❌ | ✅ 是 |
-| pt-pt | ✅ pt-pt.json | ✅ "pt-pt" | ✅ "pt-pt" | ❌ 未加载 | ❌ | ⚠️ 日期不本地化 |
+| pt-pt | ✅ pt-pt.json | ✅ "pt-pt" | ✅ "pt-pt" | ⚠️ 加载了pt（代码不匹配） | ❌ | ⚠️ 日期不本地化 |
 | ro | ✅ ro.json | ✅ "ro" | ✅ "ro" | ✅ ro | ❌ | ✅ 是 |
 | ru | ✅ ru.json | ✅ "ru" | ✅ "ru" | ✅ ru | ❌ | ✅ 是 |
 | sk | ✅ sk.json | ✅ "sk" | ✅ "sk" | ✅ sk | ❌ | ✅ 是 |
@@ -1275,61 +1275,73 @@ const initVideoPlayer = async () => {
 
 ### 16.2 languageImports 映射表
 
-[VideoPlayer.vue L149-L179](file:///d:/fz/0601/solo-dogfeeding/code/178-filebrowser/frontend/src/components/files/VideoPlayer.vue#L149-L179) 定义了 29 种语言的动态导入映射：
+[VideoPlayer.vue L149-L179](file:///d:/fz/0601/solo-dogfeeding/code/178-filebrowser/frontend/src/components/files/VideoPlayer.vue#L149-L179) 定义了 29 个 key 的动态导入映射（注意：其中 `nb` 这个 key 永远不会被访问，因为 locale 值是 `"no"`）：
 
-| locale 代码 | video.js 语言包路径 | 说明 |
-|------------|-------------------|------|
-| ar | `video.js/dist/lang/ar.json` | ✅ 匹配 |
-| bg | `video.js/dist/lang/bg.json` | ✅ 匹配 |
-| cs | `video.js/dist/lang/cs.json` | ✅ 匹配 |
-| de | `video.js/dist/lang/de.json` | ✅ 匹配 |
-| el | `video.js/dist/lang/el.json` | ✅ 匹配 |
-| en | `video.js/dist/lang/en.json` | ✅ 匹配 |
-| es | `video.js/dist/lang/es.json` | ✅ 匹配 |
-| fr | `video.js/dist/lang/fr.json` | ✅ 匹配 |
-| he | `video.js/dist/lang/he.json` | ✅ 匹配 |
-| hr | `video.js/dist/lang/hr.json` | ✅ 匹配 |
-| hu | `video.js/dist/lang/hu.json` | ✅ 匹配 |
-| it | `video.js/dist/lang/it.json` | ✅ 匹配 |
-| ja | `video.js/dist/lang/ja.json` | ✅ 匹配 |
-| ko | `video.js/dist/lang/ko.json` | ✅ 匹配 |
-| lv | `video.js/dist/lang/lv.json` | ✅ 匹配 |
-| nb | `video.js/dist/lang/nb.json` | ⚠️ 用于 locale "no"（挪威语） |
-| nl | `video.js/dist/lang/nl.json` | ✅ 匹配 |
-| **nl-be** | `video.js/dist/lang/nl.json` | ⚠️ 回退到 nl（比利时荷兰语无独立包） |
-| pl | `video.js/dist/lang/pl.json` | ✅ 匹配 |
-| pt-br | `video.js/dist/lang/pt-BR.json` | ⚠️ 大小写不同 |
-| pt-pt | `video.js/dist/lang/pt-PT.json` | ⚠️ 大小写不同 |
-| ro | `video.js/dist/lang/ro.json` | ✅ 匹配 |
-| ru | `video.js/dist/lang/ru.json` | ✅ 匹配 |
-| sk | `video.js/dist/lang/sk.json` | ✅ 匹配 |
-| tr | `video.js/dist/lang/tr.json` | ✅ 匹配 |
-| uk | `video.js/dist/lang/uk.json` | ✅ 匹配 |
-| vi | `video.js/dist/lang/vi.json` | ✅ 匹配 |
-| zh-cn | `video.js/dist/lang/zh-CN.json` | ⚠️ 大小写不同 |
-| zh-tw | `video.js/dist/lang/zh-TW.json` | ⚠️ 大小写不同 |
+| languageImports 的 key | video.js 语言包路径 | 能否被实际访问 | 说明 |
+|-----------------------|-------------------|:---:|------|
+| ar | `video.js/dist/lang/ar.json` | ✅ | 匹配 locale "ar" |
+| bg | `video.js/dist/lang/bg.json` | ✅ | 匹配 locale "bg" |
+| cs | `video.js/dist/lang/cs.json` | ✅ | 匹配 locale "cs" |
+| de | `video.js/dist/lang/de.json` | ✅ | 匹配 locale "de" |
+| el | `video.js/dist/lang/el.json` | ✅ | 匹配 locale "el" |
+| en | `video.js/dist/lang/en.json` | ✅ | 匹配 locale "en"（fallback） |
+| es | `video.js/dist/lang/es.json` | ✅ | 匹配 locale "es" |
+| fr | `video.js/dist/lang/fr.json` | ✅ | 匹配 locale "fr" |
+| he | `video.js/dist/lang/he.json` | ✅ | 匹配 locale "he" |
+| hr | `video.js/dist/lang/hr.json` | ✅ | 匹配 locale "hr" |
+| hu | `video.js/dist/lang/hu.json` | ✅ | 匹配 locale "hu" |
+| it | `video.js/dist/lang/it.json` | ✅ | 匹配 locale "it" |
+| ja | `video.js/dist/lang/ja.json` | ✅ | 匹配 locale "ja" |
+| ko | `video.js/dist/lang/ko.json` | ✅ | 匹配 locale "ko" |
+| lv | `video.js/dist/lang/lv.json` | ✅ | 匹配 locale "lv" |
+| **nb** | `video.js/dist/lang/nb.json` | ❌ 死代码 | key 是 "nb" 但 locale 是 "no"，永远访问不到 |
+| nl | `video.js/dist/lang/nl.json` | ✅ | 匹配 locale "nl" |
+| **nl-be** | `video.js/dist/lang/nl.json` | ✅ | 匹配 locale "nl-be"，回退到 nl 包 |
+| pl | `video.js/dist/lang/pl.json` | ✅ | 匹配 locale "pl" |
+| pt-br | `video.js/dist/lang/pt-BR.json` | ✅ | 匹配 locale "pt-br"，文件名与 video.js 官方一致 |
+| pt-pt | `video.js/dist/lang/pt-PT.json` | ✅ | 匹配 locale "pt-pt"，文件名与 video.js 官方一致 |
+| ro | `video.js/dist/lang/ro.json` | ✅ | 匹配 locale "ro" |
+| ru | `video.js/dist/lang/ru.json` | ✅ | 匹配 locale "ru" |
+| sk | `video.js/dist/lang/sk.json` | ✅ | 匹配 locale "sk" |
+| tr | `video.js/dist/lang/tr.json` | ✅ | 匹配 locale "tr" |
+| uk | `video.js/dist/lang/uk.json` | ✅ | 匹配 locale "uk" |
+| vi | `video.js/dist/lang/vi.json` | ✅ | 匹配 locale "vi" |
+| zh-cn | `video.js/dist/lang/zh-CN.json` | ✅ | 匹配 locale "zh-cn"，文件名与 video.js 官方一致 |
+| zh-tw | `video.js/dist/lang/zh-TW.json` | ✅ | 匹配 locale "zh-tw"，文件名与 video.js 官方一致 |
+
+**实际可访问 key 数**：28 个（29 个 key 减去 1 个死代码 `nb`）；**唯一 video.js 语言包数**：27 个（`nl-be` 与 `nl` 共用同一语言包）
 
 ### 16.3 缺失的语言
 
-以下 5 种语言在 VideoPlayer 中完全没有语言包支持，播放视频时控件将显示英语：
+以下 6 种 vue-i18n 支持的语言在 VideoPlayer 中没有可直接访问的映射，播放视频时控件将显示英语：
 
 | 语言代码 | 缺失原因 | 实际效果 |
 |---------|---------|---------|
 | **ca** | `languageImports` 无 ca 键 | 视频控件英语 |
 | **fa** | `languageImports` 无 fa 键 | 视频控件英语 |
 | **is** | `languageImports` 无 is 键 | 视频控件英语 |
-| **pt** | `languageImports` 无 pt 键 | （但 pt 本身也不可达） |
+| **no** | `languageImports` 只有 "nb" 键，没有 "no" 键 | 视频控件英语（死代码问题） |
+| **pt** | `languageImports` 无 pt 键 | （但 pt 本身也不可达，影响为 0） |
 | **sv-se** | `languageImports` 无 sv-se 键 | 视频控件英语 |
 
 ### 16.4 特殊映射说明
 
-1. **挪威语（no）**：video.js 中挪威语的代码是 `nb`（挪威书面语），而非 `no`。但由于 `document.documentElement.lang` 会是 `"no"`（detectLocale 返回值），查找 `languageImports["no"]` 不存在 → 回退英语。
+1. **挪威语（no）——死代码 BUG**：
+   - video.js 中挪威书面语的代码是 `nb`
+   - 代码中写了 `nb: () => import("video.js/dist/lang/nb.json")`
+   - 但 `document.documentElement.lang` 的值是 `"no"`（来自 `detectLocale()`）
+   - 查找 `languageImports["no"]` → undefined → 回退英语
+   - **`nb` 这个 key 永远不会被访问到，属于死代码**
 
-   **问题**：挪威用户播放视频时，界面是挪威语，但视频控件显示英语。
+   **实际效果**：挪威用户播放视频时，界面是挪威语，但视频控件显示英语。
 
 2. **荷兰语比利时（nl-be）**：video.js 没有独立的 nl-be 语言包，代码中显式映射到 `nl.json`（荷兰本土）。这是合理的，因为两种变体在视频控件的简单术语上差异极小。
 
-3. **大小写问题**：video.js 的语言包文件名使用大写地区代码（如 `pt-BR.json`、`zh-CN.json`），而 `languageImports` 的 key 是小写（如 `"pt-br"`、`"zh-cn"`）。由于文件系统在 Windows/macOS 上不区分大小写，这在运行时不会出错，但在 Linux 上可能失败。
+3. **地区代码大小写**：
+   - video.js 官方语言包文件名使用大写地区代码（`pt-BR.json`、`pt-PT.json`、`zh-CN.json`、`zh-TW.json`）
+   - 代码中的 import 路径写法与 video.js 官方完全一致，**不存在大小写错误**
+   - Vite 构建时会按照实际文件路径解析，在所有平台上都能正常工作
+   - 之前认为"大小写不同可能在 Linux 上失败"是错误判断
 
 ---
 
@@ -1555,7 +1567,7 @@ export function setHtmlLocale(locale: string) {
 | lv | ✅ lv.json | ✅ "lv" | ✅ "lv" | ✅ lv | ✅ 匹配 | ✅ lv.json | ❌ | ✅ 生效 | ✅ 正常 |
 | nl | ✅ nl.json | ✅ "nl" | ✅ "nl" | ✅ nl | ✅ 匹配 | ✅ nl.json | ❌ | ✅ 生效 | ✅ 正常 |
 | **nl-be** | ✅ nl-be.json | ⚠️ 被nl截断→"nl" | ✅ "nl-be" | ✅ nl-be | ✅ 匹配 | ✅ nl.json(回退) | ❌ | ✅ 生效 | ⚠️ 自动检测时用nl，手动正常 |
-| no | ✅ no.json | ✅ "no"(nb/no) | ✅ "no" | ✅ nb(挪威) | ❌ no→nb | ⚠️ nb(映射错) | ❌ | ✅ 生效 | ⚠️ 日期/视频控件英语 |
+| no | ✅ no.json | ✅ "no"(nb/no) | ✅ "no" | ✅ nb(挪威) | ❌ no→nb | ❌ 无（nb key是死代码） | ❌ | ✅ 生效 | ⚠️ 日期/视频控件均英语 |
 | pl | ✅ pl.json | ✅ "pl" | ✅ "pl" | ✅ pl | ✅ 匹配 | ✅ pl.json | ❌ | ✅ 生效 | ✅ 正常 |
 | **pt** | ✅ pt.json | ⚠️ 映射到pt-pt | ❌ 无 | ✅ pt | ❌ pt→pt-pt | ❌ 无 | ❌ | ✅ 但不可达 | ❌ 不可达（冗余） |
 | pt-br | ✅ pt-br.json | ✅ "pt-br" | ✅ "pt-br" | ✅ pt-br | ✅ 匹配 | ✅ pt-BR.json | ❌ | ✅ 生效 | ✅ 正常 |
@@ -1643,16 +1655,18 @@ export function setHtmlLocale(locale: string) {
 
 | 优先级 | 问题 | 影响语言 | 修复复杂度 | 涉及文件 |
 |:---:|-----|---------|:---:|---------|
-| 🔴 高 | 波斯语 fa 完全不可达（4处缺失） | fa | 低（四处添加） | i18n/index.ts ×3, Languages.vue |
-| 🔴 高 | body.rtl 样式选择器永不生效 | he, ar | 极低（一行代码） | i18n/index.ts |
-| 🟠 中 | 瑞典语四层标识符错位 | sv-se | 低（映射表） | i18n/index.ts |
-| 🟠 中 | 荷兰语比利时正则顺序BUG | nl-be | 极低（调换两行） | i18n/index.ts |
-| 🟠 中 | dayjs 无映射层导致日期不本地化 | sv-se, pt-pt, no, fa | 低（映射表） | i18n/index.ts |
-| 🟡 低 | 挪威语 no 与 dayjs nb 不匹配 | no | 低（映射表） | i18n/index.ts |
-| 🟡 低 | VideoPlayer 缺少 5 种语言包 | ca, fa, is, pt, sv-se | 中（按需导入） | VideoPlayer.vue |
-| 🟡 低 | 加泰罗尼亚语 ca 无 detectLocale 分支 | ca | 极低（加一行case） | i18n/index.ts |
-| 🟡 低 | pt.json 冗余不可达 | pt | 低（删除或映射） | 资源文件 |
-| 🟡 低 | video.js 语言包大小写可能在 Linux 失败 | pt-br, pt-pt, zh-cn, zh-tw | 低（修正大小写） | VideoPlayer.vue |
+| 🔴 高 | 波斯语 fa 完全不可达（4处缺失：检测分支、下拉选项、dayjs加载、RTL列表） | fa | 低 | i18n/index.ts ×3, Languages.vue |
+| 🔴 高 | body.rtl 样式选择器永不生效（2处CSS死代码） | he, ar | 极低 | i18n/index.ts |
+| 🟠 中 | 瑞典语四层标识符错位（检测返回"sv"但资源是"sv-se"，dayjs也是"sv"） | sv-se | 低 | i18n/index.ts |
+| 🟠 中 | 荷兰语比利时正则顺序BUG（nl在nl-be前面导致被截断） | nl-be | 极低 | i18n/index.ts |
+| 🟠 中 | dayjs 无映射层导致4种语言日期不本地化 | sv-se, pt-pt, no, fa | 低 | i18n/index.ts |
+| 🟠 中 | VideoPlayer 中 nb key 是死代码（挪威语视频控件英语） | no | 极低 | VideoPlayer.vue |
+| 🟡 低 | VideoPlayer 缺少 6 种语言包 | ca, fa, is, no, pt, sv-se | 中 | VideoPlayer.vue |
+| 🟡 低 | 加泰罗尼亚语 ca 无 detectLocale 分支（只能手动选，不能自动检测） | ca | 极低 | i18n/index.ts |
+| 🟡 低 | pt.json 冗余不可达（永远不会被使用） | pt | 低 | 资源文件 |
+| 🟡 低 | 希腊语 el 正则写法与其他语言不一致（用 `.*` 而非 `\b`） | el | 极低 | i18n/index.ts |
+
+> **勘误说明**：之前认为 "video.js 语言包大小写可能在 Linux 失败" 是错误判断。经核实，video.js 官方语言包文件名确实使用大写地区代码（`pt-BR.json`、`zh-CN.json` 等），代码中的写法与官方一致，不存在大小写问题。
 
 ### 21.1 建议一次性修复代码
 
@@ -1663,17 +1677,18 @@ export function setHtmlLocale(locale: string) {
 import("dayjs/locale/fa");  // 波斯语
 
 // 2. 修正 detectLocale()
-//    a) 调换 nl-be 和 nl 的顺序
-//    b) 增加 fa 和 ca 分支
-//    c) 瑞典语返回 "sv-se" 而非 "sv"
-//    d) 挪威语保持 "no"（在映射表处理）
+//    a) 调换 nl-be 和 nl 的顺序（nl-be 必须在 nl 之前）
+//    b) 增加 fa 分支
+//    c) 增加 ca 分支（加泰罗尼亚语）
+//    d) 瑞典语返回 "sv-se" 而非 "sv"（与资源文件名一致）
+//    e) 希腊语正则可保持现状，但建议统一为 \b 风格
 
-// 3. 增加 dayjs 映射表
+// 3. 增加 dayjs locale 映射表
 const DAYJS_LOCALE_MAP: Record<string, string> = {
-  "sv-se": "sv",      // 瑞典语
-  "pt-pt": "pt",      // 欧洲葡萄牙语
-  "no": "nb",         // 挪威语（书面语）
-  "fa": "fa",         // 波斯语
+  "sv-se": "sv",      // 瑞典语（vue-i18n用sv-se，dayjs用sv）
+  "pt-pt": "pt",      // 欧洲葡萄牙语（vue-i18n用pt-pt，dayjs用pt）
+  "no": "nb",         // 挪威语（vue-i18n用no，dayjs用nb挪威书面语）
+  "fa": "fa",         // 波斯语（需先添加import）
 };
 
 // 4. 修正 setLocale() 使用映射表
@@ -1683,8 +1698,8 @@ export function setLocale(locale: string) {
   i18n.global.locale.value = locale;
 }
 
-// 5. 修正 RTL 列表
-export const rtlLanguages = ["he", "ar", "fa"];  // 增加波斯语
+// 5. 修正 RTL 列表（增加波斯语）
+export const rtlLanguages = ["he", "ar", "fa"];
 
 // 6. 修正 setHtmlLocale() 增加 body.rtl 类
 export function setHtmlLocale(locale: string) {
@@ -1702,27 +1717,47 @@ export function setHtmlLocale(locale: string) {
 ```
 
 ```javascript
-// Languages.vue - 增加 fa 和 ca 选项
+// Languages.vue - 只增加 fa 选项（ca 已存在于 L20）
 const locales = {
-  // ... 现有语言 ...
-+ ca: "Català",
+  ar: "العربية",
+  bg: "български език",
+  ca: "Català",
+  // ... 中间已有语言 ...
 + fa: "فارسی",
-  // ...
+  // ... 其余语言 ...
 };
 ```
 
 ```typescript
-// VideoPlayer.vue - 增加缺失的语言包映射
+// VideoPlayer.vue - 修复和补充语言包映射
 const languageImports: LanguageImports = {
-  // ... 现有语言 ...
-+ ca: () => import("video.js/dist/lang/ca.json"),
-+ fa: () => import("video.js/dist/lang/fa.json"),
-+ is: () => import("video.js/dist/lang/is.json"),
-+ "sv-se": () => import("video.js/dist/lang/sv.json"),  // 回退到瑞典语
-+ no: () => import("video.js/dist/lang/nb.json"),       // 挪威语
-  // 修正大小写（Linux 兼容性）
-- "pt-br": () => import("video.js/dist/lang/pt-BR.json"),
-+ "pt-br": () => import("video.js/dist/lang/pt-br.json"),
-  // ... 其他大小写修正 ...
+  ar: () => import("video.js/dist/lang/ar.json"),
+  bg: () => import("video.js/dist/lang/bg.json"),
++ ca: () => import("video.js/dist/lang/ca.json"),      // 新增：加泰罗尼亚语
+  cs: () => import("video.js/dist/lang/cs.json"),
+  // ... 中间已有语言 ...
++ fa: () => import("video.js/dist/lang/fa.json"),      // 新增：波斯语
+  // ...
++ is: () => import("video.js/dist/lang/is.json"),      // 新增：冰岛语
+  // ...
+- nb: () => import("video.js/dist/lang/nb.json"),      // 删除：死代码，key不对
++ no: () => import("video.js/dist/lang/nb.json"),      // 新增：改为正确的 key
+  // ...
++ "sv-se": () => import("video.js/dist/lang/sv.json"), // 新增：瑞典语（回退到sv）
+  // ...
+  // 注意：pt-BR / pt-PT / zh-CN / zh-TW 的大小写不需要改，
+  // 这与 video.js 官方文件名一致，所有平台都能正常工作
 };
 ```
+
+### 21.2 修复后预期效果（边界语言）
+
+| 语言 | 修复前问题 | 修复后状态 |
+|-----|-----------|:---:|
+| fa 波斯语 | 4处缺失，完全不可达 | ✅ 完全正常（含RTL、日期、视频控件） |
+| sv-se 瑞典语 | 检测→界面英语，手动→日期英语 | ✅ 检测和手动均正常，日期瑞典语 |
+| nl-be 荷兰语比利时 | 自动检测被截断为 nl | ✅ 自动检测和手动均为比利时变体 |
+| pt-pt 欧洲葡萄牙语 | 日期显示英语 | ✅ 日期显示欧洲葡语格式 |
+| no 挪威语 | 日期英语 + 视频控件英语 | ✅ 日期和视频控件均为挪威语 |
+| ca 加泰罗尼亚语 | 只能手动选，不能自动检测 | ✅ 浏览器检测也能自动匹配 |
+| he/ar 希伯来语/阿拉伯语 | 2处RTL样式（卡片按钮、终端）不生效 | ✅ 全部RTL样式生效 |

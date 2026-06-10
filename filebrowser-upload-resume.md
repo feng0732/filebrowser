@@ -515,16 +515,17 @@ func NewUploadCache(redisURL string) (UploadCache, error) {
 
 ### 6.1 续传触发条件
 
-续传由 **tus-js-client 库自动处理**，在以下场景触发：
+**真正的断点续传**（即从断点继续上传，不从头开始）只在非常有限的条件下发生：
 
-| 场景 | 行为 |
-|------|------|
-| 网络短暂中断（在 retryCount 内） | 自动重试，重试前先 HEAD 查询断点 |
-| 用户暂停/恢复 | 重新 `upload.start()` → 自动 HEAD 查询 |
-| 页面刷新后重新选择同一文件 | ⚠️ 见下方说明 |
-| 超过 TTL（3分钟） | 缓存被清理 → HEAD 返回 404 → 重新创建新上传 |
+| 场景 | 是否刷新页面 | tus-js-client 实例 | 最终行为 |
+|------|------------|-------------------|---------|
+| 网络短暂中断（15秒重试窗口内） | ❌ 否 | **同一个** | ✅ **真正断点续传**（同一实例 → 先 HEAD 查询断点 → PATCH 继续） |
+| 服务端实例滚动重启（15秒窗口内） | ❌ 否 | **同一个** | ✅ **真正断点续传**（跨实例续传，同一前端实例 → HEAD到新实例 → PATCH继续） |
+| 用户暂停/恢复（不刷新页面） | ❌ 否 | **同一个** | ✅ **真正断点续传** |
+| 页面刷新后重新选择文件（缓存有效，<3分钟） | ✅ 是 | **全新** | ❌ **覆盖重传**（新实例 → 直接 POST → O_TRUNC清空 → 从0开始） |
+| 页面刷新后重新选择文件（缓存过期，>3分钟） | ✅ 是 | **全新** | ❌ **从头上传**（新实例 → POST → 从0开始） |
 
-> **注意**：当前代码设置了 `storeFingerprintForResuming: false`，这意味着 **页面刷新后 tus-js-client 不会自动恢复之前的上传**，需要用户重新选择文件。如果需要跨页面续传，需将此选项改为 `true` 并配合持久化存储。
+> **关键前提**：本项目 `storeFingerprintForResuming: false`，且未调用 `findPreviousUploads()` + `resumeFromPreviousUpload()`，因此**页面刷新后 tus-js-client 完全不知道之前的上传历史**。即使服务端缓存有效、磁盘有部分文件，也会从头开始。
 
 ### 6.2 续传的完整时序
 
@@ -598,311 +599,310 @@ T20 上传完成!
 
 ## 七、边界场景恢复分支详解
 
-### 7.1 边界场景一：缓存过期（>3分钟）
+### 7.0 关键前提：tus-js-client 行为核准
 
-当上传中断超过 `uploadCacheTTL`（3分钟），缓存会自动过期。此时恢复会走一条独立的代码路径。
+在分析所有边界场景之前，必须先明确本项目中 tus-js-client 的**真实工作机制**。之前容易误解的地方：
 
-#### 过期触发点
-内存缓存的过期回调在 [memoryUploadCache](file:///d:/fz/0601/solo-dogfeeding/code/177-filebrowser/http/upload_cache_memory.go#L41-L46)：
-```go
-cache.OnEviction(func(_ context.Context, reason ttlcache.EvictionReason, item *ttlcache.Item[string, int64]) {
-    if reason == ttlcache.EvictionReasonExpired {
-        fmt.Printf("deleting incomplete upload file: \"%s\"\n", item.Key())
-        os.Remove(item.Key())  // ✅ 过期时自动删除磁盘文件
-    }
-})
-```
+#### tus-js-client 何时会先 HEAD 查询？
 
-> **关键区别**：Redis 缓存**没有**这个 OnEviction 回调，过期后不会自动删文件。参见 7.2 节。
+tus-js-client 的 `start()` 方法逻辑：
 
-#### 恢复分支时序（内存缓存模式）
-```
-场景: 上传到50MB后断网，4分钟后网络恢复
+| 条件 | 行为 |
+|------|------|
+| 设置了 `uploadUrl` 选项 | **先 HEAD** `uploadUrl` 查询进度，失败再 POST 到 `endpoint` |
+| `storeFingerprintForResuming: true` 且 localStorage 中有历史记录 | **先 HEAD** 历史 URL 查询进度，失败再 POST |
+| 同一个 Upload 实例内的重试（PATCH失败后 retryDelays） | **先 HEAD** 已有的 `upload.url` 查询断点，再继续 PATCH |
+| **本项目配置**（无 uploadUrl + storeFingerprintForResuming:false + 新Upload实例） | **直接 POST** 到 endpoint，**不会先 HEAD** |
 
-T0     用户点击上传 100MB 文件
-T0+10s PATCH offset=41943040 完成 → 50MB
-T0+11s 网络断开! PATCH失败 → tus-js-client开始重试
-T0+11s~T0+15s 重试5次 (0s+1s+2s+4s+8s = 15s) 全部失败
-T0+15s tus-js-client抛错 → 上传终止，前端显示错误
-T0+3min11s 缓存过期 → OnEviction回调执行 os.Remove → 磁盘文件被删除!
-T0+4min  网络恢复，用户手动重新上传同一文件
-
-恢复路径:
-  ├─ 用户选择文件 → checkConflict() 检测服务端文件
-  │   └─ 服务端文件已被删除 → 无冲突
-  ├─ tus-js-client.start()
-  │   ├─ 先 HEAD /api/tus/file.zip
-  │   │   └─ tusHeadHandler: cache.GetLength() → 缓存已过期
-  │   │       └─ return 404 "no active upload found"
-  │   └─ tus-js-client收到404 → 认为是新上传
-  │       └─ 发起 POST /api/tus/file.zip
-  └─ tusPostHandler:
-      ├─ 文件不存在 → 创建新空文件
-      ├─ cache.Register() 重新注册
-      └─ 从 offset=0 重新开始上传
-```
-
-#### 关键代码判断点
-[tusHeadHandler](file:///d:/fz/0601/solo-dogfeeding/code/177-filebrowser/http/tus_handlers.go#L144-L147) 中缓存查询失败直接返回 404：
-```go
-uploadLength, err := cache.GetLength(file.RealPath())
-if err != nil {
-    return http.StatusNotFound, err  // ← 缓存过期时返回404
-}
-```
-
----
-
-### 7.2 边界场景二：多实例部署（Redis 缓存）
-
-多实例部署时使用 Redis 作为共享缓存，配合共享文件系统（NFS、分布式存储等）实现跨实例续传。
-
-#### 缓存创建入口
-[NewUploadCache](file:///d:/fz/0601/solo-dogfeeding/code/177-filebrowser/http/upload_cache_memory.go#L76-L85)：
-```go
-func NewUploadCache(redisURL string) (UploadCache, error) {
-    if redisURL != "" {
-        return newRedisUploadCache(redisURL)   // 多实例: Redis
-    }
-    return newMemoryUploadCache(), nil          // 单实例: 内存
-}
-```
-
-#### 恢复分支时序（Redis + 共享存储）
-```
-部署架构: 负载均衡 → [实例A, 实例B, 实例C] → Redis + NFS共享存储
-
-T0     POST /api/tus/file.zip → 被转发到实例A
-       └─ 实例A: cache.Register() → Redis SET key=filebrowser:upload:/data/file.zip value=104857600 EX 180
-       └─ 实例A: 在NFS上创建空文件
-       └─ 返回 201 Created
-
-T0+5s  PATCH offset=0, 10MB → 实例A
-       └─ 实例A: Redis GET → 100MB ✓
-       └─ 写入NFS + Sync
-       └─ 返回 Upload-Offset:10485760
-
-T0+10s PATCH offset=10485760, 10MB → 实例A
-       └─ 返回 Upload-Offset:20971520 (20MB)
-
-T0+11s 网络断开!
-T0+12s 实例A因滚动升级被重启
-T0+15s 网络恢复 + 实例B就绪
-       └─ 负载均衡将重试请求转发到实例B
-
-恢复路径 (实例B处理):
-  ├─ tus-js-client自动重试 → HEAD /api/tus/file.zip → 实例B
-  │   ├─ 实例B: Redis GET filebrowser:upload:/data/file.zip → 100MB ✓ (缓存共享)
-  │   ├─ 实例B: stat NFS上的文件 → size=20971520 ✓ (存储共享)
-  │   └─ 返回 Upload-Offset:20971520, Upload-Length:104857600
-  ├─ tus-js-client: 已传20MB < 100MB → 从offset=20971520续传
-  ├─ PATCH offset=20971520, 10MB → 实例B
-  │   ├─ 实例B: file.Size == 20971520 == uploadOffset ✓
-  │   ├─ 写入NFS + Sync
-  │   └─ 返回 Upload-Offset:31457280
-  └─ ...继续后续分片...
-```
-
-#### Redis 模式的特有问题
-Redis 缓存**没有 OnEviction 回调**，过期后无法自动删除磁盘文件：
-```
-T0+11s 断网
-T0+3min11s Redis键过期 → key被自动删除，但NFS上的20MB文件仍在!
-T0+4min 用户重新上传
-  ├─ checkConflict() 检测到NFS上已有20MB文件 → 触发冲突对话框
-  ├─ 用户选择 Resume → overwrite=true
-  ├─ tus-js-client HEAD查询 → Redis已过期 → 404
-  ├─ tus-js-client POST /api/tus/file.zip?override=true
-  └─ tusPostHandler: 文件存在 + override=true → O_TRUNC清空 → 从0开始传
-```
-
-> **潜在改进**：可以通过 Redis Keyspace Notifications 监听过期事件，或者配合定时任务扫描清理半完成文件。
-
-#### 多实例部署强制约束
-- **必须共享文件系统**：如果实例A写本地磁盘，实例B无法读取文件大小，`tusHeadHandler` 会返回错误的 Offset，`tusPatchHandler` 的 `file.Size != uploadOffset` 校验会失败
-- **Redis 必须同一集群**：所有实例连接同一个 Redis，确保缓存状态一致
-
----
-
-### 7.3 边界场景三：重新选择同名文件
-
-用户刷新页面或关闭浏览器后，重新选择同一文件上传。这是最复杂的边界场景，有 **4 条独立的恢复分支**。
-
-#### 前置流程：冲突检测
-每次上传前都会调用 [checkConflict()](file:///d:/fz/0601/solo-dogfeeding/code/177-filebrowser/frontend/src/utils/upload.ts#L43-L89)：
+#### 本项目的关键配置
+[tus.ts](file:///d:/fz/0601/solo-dogfeeding/code/177-filebrowser/frontend/src/api/tus.ts#L31-L82)：
 ```typescript
-export async function checkConflict(files, basePath, includeDirectories = false) {
-    // 1. 拉取目标目录下所有文件
-    serverEntries = await api.fetchAll(basePath);
-    
-    // 2. 对比本地文件列表和服务端文件列表
-    files.forEach((file, index) => {
-        const server = serverMap.get(conflictKey(file));
-        if (server) {
-            conflicts.push({
-                index,
-                origin: { lastModified: file.file?.lastModified, size: file.size },
-                dest: { lastModified: server.modified, size: server.size },
-                isSmallerOnServer: file.size > server.size,  // ✅ 关键判断
-            });
-        }
-    });
-    return conflicts;
+const upload = new tus.Upload(content, {
+    // endpoint 直接包含文件路径！不是标准 TUS 的基础 endpoint
+    endpoint: `${origin}${baseURL}/api/tus${filePath}?override=${overwrite}`,
+    chunkSize: tusSettings.chunkSize,
+    parallelUploads: 1,
+    storeFingerprintForResuming: false,  // ❌ 关闭指纹存储
+    // ❌ 未设置 uploadUrl 选项
+    // ❌ 未调用 findPreviousUploads() / resumeFromPreviousUpload()
+    ...
+});
+upload.start();  // 新实例 → 直接 POST
+```
+
+#### 三个核心结论
+
+1. **页面刷新后 = 全新 Upload 实例**：`CURRENT_UPLOAD_LIST` 是内存变量，刷新后丢失，完全不知道之前有过上传
+2. **`storeFingerprintForResuming: false`**：tus-js-client 不会在 localStorage 中保存 "文件指纹 → upload URL" 映射，刷新后无从查起
+3. **endpoint 本身就是文件 URL**：POST 直接打到 `/api/tus/file.zip?override=xxx`，由后端 tusPostHandler 处理
+
+> **因此，只有"同一个 tus.Upload 实例内的自动重试"才能真正从断点续传。页面刷新后重新选择同名文件，无论缓存是否有效，都会走 POST → (O_TRUNC) → 从头上传的路径。**
+
+---
+
+### 7.1 场景一：同页面内自动重试（真正的断点续传）
+
+这是项目中**唯一真正能断点续传**的场景。
+
+#### 触发条件
+- 页面未刷新
+- 同一个 tus.Upload 实例（保存在 `CURRENT_UPLOAD_LIST[filePath]`）
+- PATCH 请求失败（网络抖动、服务端临时不可用）
+- 在 `retryDelays` 次数范围内（默认 5 次：[0, 1000, 2000, 4000, 8000] ms）
+
+#### 恢复时序
+```
+T0  上传 100MB 文件到 20MB，发送 PATCH offset=20971520
+T0+ 网络中断！PATCH 请求失败
+T0+ tus-js-client 内部重试机制启动
+     ├─ 第1次重试 (0ms 延迟)
+     │   ├─ 🔑 关键: 同一实例已保存 this.url = "/api/tus/file.zip"
+     │   ├─ tus-js-client 先 HEAD /api/tus/file.zip
+     │   │   ├─ tusHeadHandler: file.Size=20971520 (20MB)
+     │   │   ├─ tusHeadHandler: cache.GetLength=104857600 (100MB)
+     │   │   └─ 返回 Upload-Offset:20971520, Upload-Length:104857600
+     │   ├─ tus-js-client: 确认断点在 20MB
+     │   ├─ 从本地文件 slice(20971520, 31457280) 取下一片 10MB
+     │   └─ 再次发送 PATCH offset=20971520 → 仍然失败 (网络还没恢复)
+     │
+     ├─ 第2次重试 (1000ms 延迟) → 仍然失败
+     ├─ 第3次重试 (2000ms 延迟) → 仍然失败
+     ├─ 第4次重试 (4000ms 延迟) → 网络恢复了!
+     │   ├─ HEAD /api/tus/file.zip → Upload-Offset:20971520, Upload-Length:104857600
+     │   ├─ PATCH offset=20971520, 10MB 数据
+     │   │   ├─ tusPatchHandler: file.Size(20MB) == uploadOffset(20MB) ✓
+     │   │   ├─ 写入 + Sync
+     │   │   └─ 返回 Upload-Offset:31457280
+     │   └─ ✅ 成功！从第3片继续
+     │
+     └─ 后续分片正常上传...
+```
+
+#### 代码中的重试延迟计算
+[tus.ts computeRetryDelays](file:///d:/fz/0601/solo-dogfeeding/code/177-filebrowser/frontend/src/api/tus.ts#L85-L102)：
+```typescript
+// 5次重试对应的延迟: [0, 1000, 2000, 4000, 8000]
+// 总重试窗口 = 0 + 1000 + 2000 + 4000 + 8000 = 15 秒
+// 如果 15 秒内网络不恢复 → 抛错 → 上传终止
+for (let i = 0; i < tusSettings.retryCount; i++) {
+    retryDelays.push(Math.min(delay, RETRY_MAX_DELAY));
+    delay = delay === 0 ? RETRY_BASE_DELAY : Math.min(delay * 2, RETRY_MAX_DELAY);
 }
 ```
 
-然后弹出 [ResolveConflict.vue](file:///d:/fz/0601/solo-dogfeeding/code/177-filebrowser/frontend/src/components/prompts/ResolveConflict.vue) 对话框，用户有多种选择。
-
-#### 恢复分支决策树
-```
-用户重新选择同一文件上传
-    │
-    ├─ checkConflict() 检测到服务端已有同名文件
-    │   │
-    │   ├─ 缓存仍有效 (<3分钟)
-    │   │   ├─ 用户点击 "Resume Transfer" (续传)
-    │   │   │   └─ 分支A: 智能续传 → 见7.3.1
-    │   │   ├─ 用户点击 "Override" (覆盖)
-    │   │   │   └─ 分支A: 同上 (tus-js-client会自动续传，不会真覆盖)
-    │   │   └─ 用户点击 "Skip" (跳过)
-    │   │       └─ 分支C: 跳过不上传 → 见7.3.3
-    │   │
-    │   └─ 缓存已过期 (>3分钟)
-    │       ├─ 内存模式: 文件已被删除 → 无冲突 → 走新上传
-    │       ├─ Redis模式: 文件仍在
-    │       │   ├─ 用户点击 "Resume Transfer"
-    │       │   │   └─ 分支B: 覆盖重传 → 见7.3.2
-    │       │   └─ 用户点击 "Skip"
-    │       │       └─ 分支C: 跳过不上传 → 见7.3.3
-    │       └─ (服务端文件 == 客户端文件)
-    │           └─ 分支D: 完整文件跳过 → 见7.3.4
-    │
-    └─ 无冲突 → 正常新上传
-```
+> **关键限制**：自动重试窗口只有 15 秒。超过 15 秒网络仍未恢复 → tus-js-client 抛错 → 前端显示错误 → 用户必须手动重新上传。
 
 ---
 
-### 7.3.1 分支A：缓存有效 → 智能续传（不覆盖）
+### 7.2 场景二：页面刷新后重新选择同名文件（缓存有效，<3分钟）
 
-**场景**：上传到20MB断网，1分钟后用户刷新页面重新上传。
+#### 场景描述
+- 上传到 20MB 断网，超过 15 秒重试窗口 → 上传失败
+- 用户刷新了页面
+- 1 分钟后网络恢复，用户手动重新选择同一个文件上传
+- **此时缓存仍然有效（<3分钟）**，磁盘上也有 20MB 文件
 
-**恢复流程**：
+#### 真实行为（⚠️ 不会智能续传，会从头开始！）
+
 ```
-1. 冲突检测:
-   isSmallerOnServer = (100MB > 20MB) = true
+1. 用户在上传对话框选择文件 → 触发 checkConflict()
+   [checkConflict()](file:///d:/fz/0601/solo-dogfeeding/code/177-filebrowser/frontend/src/utils/upload.ts#L43-L89)
+   ├─ 拉取服务端目录列表
+   ├─ 发现 file.zip 已存在，大小 20MB < 本地 100MB
+   └─ isSmallerOnServer = true → 标记为冲突
 
-2. 用户点击 "Resume Transfer" 按钮:
-   [resume()](file:///d:/fz/0601/solo-dogfeeding/code/177-filebrowser/frontend/src/components/prompts/ResolveConflict.vue#L207-L216)
-   ```typescript
-   const resume = (event) => {
-       conflict.value.forEach((item) => {
-           if (item.isSmallerOnServer) {
-               item.checked = ["origin"];  // 标记为"保留源文件"=覆盖
-           } else {
-               item.checked = ["dest"];    // 标记为"保留目标文件"=跳过
-           }
-       });
-       currentPrompt?.confirm(event, conflict.value);
-   };
-   ```
+2. 弹出 ResolveConflict.vue 对话框:
+   ├─ 用户点击 "Resume Transfer" 按钮
+   │   [resume()](file:///d:/fz/0601/solo-dogfeeding/code/177-filebrowser/frontend/src/components/prompts/ResolveConflict.vue#L207-L216)
+   │   └─ item.checked = ["origin"]  (标记为"用源文件覆盖")
+   ├─ 或者用户点击 "Override" 按钮
+   │   └─ 同样 item.checked = ["origin"]
+   └─ confirm → Upload.vue 回调:
+      [Upload.vue](file:///d:/fz/0601/solo-dogfeeding/code/177-filebrowser/frontend/src/components/prompts/Upload.vue#L78-L94)
+      └─ uploadFiles[item.index].overwrite = true  // 仅仅是设了个标记
 
-3. [Upload.vue confirm回调](file:///d:/fz/0601/solo-dogfeeding/code/177-filebrowser/frontend/src/components/prompts/Upload.vue#L78-L94):
-   ```typescript
-   if (item.checked.length == 1 && item.checked[0] == "origin") {
-       uploadFiles[item.index].overwrite = true;  // 设置overwrite=true
-   }
-   ```
+3. 进入 upload.handleFiles() → uploadStore.upload() → api.post() → tus.upload()
+   创建**全新的 tus.Upload 实例**
 
-4. tus-js-client.start() 执行:
-   ```
-   🔴 关键: tus-js-client 会先 HEAD 查询，POST 只在 HEAD 失败时才发
-   
-   ├─ HEAD /api/tus/file.zip
-   │   ├─ cache.GetLength() → 100MB ✓ (缓存仍有效)
-   │   ├─ file.Size → 20MB ✓
-   │   └─ 返回 Upload-Offset:20971520, Upload-Length:104857600
-   └─ tus-js-client: 识别为可续传 → 跳过 POST
-   ```
+4. 🔴 关键: upload.start() 的行为
+   ├─ 没有 uploadUrl 选项
+   ├─ storeFingerprintForResuming = false
+   ├─ 是全新实例，this.url 未设置
+   └─ → **直接 POST 到 endpoint** (/api/tus/file.zip?override=true)
+      ❌ 不会先 HEAD 查询！
 
-5. 直接 PATCH 从 offset=20971520 继续上传
-
-**重要结论**：虽然 `overwrite=true`，但 `tusPostHandler` 中的 `O_TRUNC` 代码路径**根本不会执行**，因为 tus-js-client 发现可以续传就跳过了 POST 请求。
-
----
-
-### 7.3.2 分支B：缓存过期 → 覆盖重传
-
-**场景**：上传到20MB断网，4分钟后（Redis模式）用户重新上传。
-
-**恢复流程**：
-```
-1. 冲突检测: isSmallerOnServer = true (Redis没删文件)
-2. 用户点击 "Resume Transfer" → overwrite = true
-3. tus-js-client.start():
-   ├─ HEAD /api/tus/file.zip
-   │   └─ cache.GetLength() → 缓存已过期 → 404
-   └─ tus-js-client: 收到404 → 发起 POST
-
-4. [tusPostHandler](file:///d:/fz/0601/solo-dogfeeding/code/177-filebrowser/http/tus_handlers.go#L70-L86) 执行:
+5. [tusPostHandler](file:///d:/fz/0601/solo-dogfeeding/code/177-filebrowser/http/tus_handlers.go#L70-L86) 处理 POST:
    ```go
    if file != nil {
+       // 文件已存在 (20MB)
        if r.URL.Query().Get("override") != "true" {
-           return http.StatusConflict, nil  // 没override就返回冲突
+           return http.StatusConflict, nil
        }
        if !d.user.Perm.Modify {
            return http.StatusForbidden, nil
        }
-       fileFlags |= os.O_TRUNC  // ✅ 清空现有文件
+       fileFlags |= os.O_TRUNC  // ✅ 强制清空文件！
    }
+   openFile, err := d.user.Fs.OpenFile(r.URL.Path, fileFlags, ...)
+   // 此时文件大小被重置为 0
+   cache.Register(file.RealPath(), uploadLength)  // 重新注册缓存
    ```
 
-5. 文件被清空 → 重新注册缓存 → 从 offset=0 开始上传
+6. 返回 201 Created → tus-js-client 对返回的 Location 发 HEAD:
+   ├─ Upload-Offset: 0 (文件被清空了)
+   └─ Upload-Length: 104857600
+
+7. 从 offset=0 开始 PATCH，重新上传所有分片
 ```
 
-**为什么不清空不行？**
-- 服务端文件 20MB，客户端新上传也是同一文件的前20MB，但服务端不知道这一点
-- 如果不清空直接 Append，后续 PATCH 的 offset=0 校验会失败（file.Size=20MB != 0）
-- 所以只能清空重传
+#### 为什么"Resume Transfer"按钮名不副实？
+按钮叫 "Resume Transfer"（续传），但实际执行的是 `overwrite=true` 的**覆盖重传**。原因是：
+- tus-js-client 的 `storeFingerprintForResuming` 被关闭了
+- 项目代码也没有调用 `findPreviousUploads()` + `resumeFromPreviousUpload()`
+- 所以新实例无法知道之前的上传 URL，只能从 POST 开始
 
 ---
 
-### 7.3.3 分支C：用户选择 Skip
+### 7.3 场景三：缓存过期（>3分钟）后重新上传
 
-**场景**：检测到冲突后，用户点击 "Skip" 按钮。
+#### 3a. 内存缓存模式（单实例）
 
-**代码流程**：
+内存缓存有 OnEviction 回调，会自动删文件：
+```
+T0      上传到 20MB 失败（断网超过 15 秒重试窗口）
+T0+3min 缓存过期 → OnEviction 回调: os.Remove("/data/file.zip")
+        磁盘文件被删除!
+T0+4min 用户重新选择 file.zip 上传
+        ├─ checkConflict(): 服务端无此文件 → 无冲突
+        ├─ tus-js-client 新实例 → 直接 POST /api/tus/file.zip?override=false
+        ├─ tusPostHandler: 文件不存在 → 创建新空文件
+        ├─ cache.Register()
+        └─ 从 offset=0 正常上传
+```
+
+内存模式过期代码：[memoryUploadCache OnEviction](file:///d:/fz/0601/solo-dogfeeding/code/177-filebrowser/http/upload_cache_memory.go#L41-L46)
+```go
+cache.OnEviction(func(_ context.Context, reason ttlcache.EvictionReason, item *ttlcache.Item[string, int64]) {
+    if reason == ttlcache.EvictionReasonExpired {
+        fmt.Printf("deleting incomplete upload file: \"%s\"\n", item.Key())
+        os.Remove(item.Key())
+    }
+})
+```
+
+#### 3b. Redis 缓存模式（多实例）
+
+Redis 没有 OnEviction 回调，磁盘文件残留：
+```
+T0      上传到 20MB 失败
+T0+3min Redis key 过期 → key 自动删除，但 NFS 上 20MB 文件仍在
+T0+4min 用户重新选择 file.zip 上传
+        ├─ checkConflict(): 发现服务端已有 20MB < 100MB → 冲突
+        ├─ 用户点击 Resume Transfer → overwrite=true
+        ├─ tus-js-client 新实例 → 直接 POST /api/tus/file.zip?override=true
+        ├─ tusPostHandler:
+        │   ├─ 文件存在 + override=true → O_TRUNC 清空为 0
+        │   ├─ cache.Register() 重新注册
+        │   └─ 从 offset=0 开始上传
+        └─ 效果同 7.2 场景：覆盖重传
+```
+
+> **内存 vs Redis 的行为不一致**：内存模式过期自动删文件，重新上传无冲突；Redis 模式过期留垃圾文件，重新上传会触发冲突对话框 → 选 Resume → 覆盖重传。
+
+#### tusHeadHandler 返回 404 的真正用途
+[tusHeadHandler](file:///d:/fz/0601/solo-dogfeeding/code/177-filebrowser/http/tus_handlers.go#L144-L147)：
+```go
+uploadLength, err := cache.GetLength(file.RealPath())
+if err != nil {
+    return http.StatusNotFound, err
+}
+```
+这个 404 **只在 "同一个 tus.Upload 实例内的自动重试" 场景下才有意义**（tus-js-client 收到 404 会重新 POST 创建上传）。页面刷新后的场景根本走不到 HEAD，因为直接先 POST 了。
+
+---
+
+### 7.4 场景四：多实例部署下的自动重试
+
+多实例部署（Redis + 共享存储）时，即使服务端实例滚动重启，只要在 tus-js-client 的 15 秒重试窗口内，仍能断点续传。
+
+#### 部署架构
+```
+负载均衡 → [实例A, 实例B, 实例C] → Redis 缓存 + NFS 共享存储
+```
+
+#### 恢复时序
+```
+T0     POST /api/tus/file.zip → 负载均衡转发到实例A
+       └─ 实例A: Redis SET filebrowser:upload:/data/file.zip = 104857600 EX 180
+       └─ 实例A: NFS 创建空文件
+       └─ 返回 201 Created, tus-js-client 保存 this.url = "/api/tus/file.zip"
+
+T0+5s  PATCH offset=0, 10MB → 实例A → 成功, 返回 Upload-Offset:10485760
+T0+10s PATCH offset=10485760, 10MB → 实例A → 成功, 返回 Upload-Offset:20971520
+T0+11s 发送 PATCH offset=20971520...
+T0+11s 实例A 因滚动升级被终止！连接中断 → PATCH 失败
+
+T0+11s tus-js-client 开始重试:
+       ├─ 第1次重试 (0ms)
+       │   ├─ 同一实例: this.url = "/api/tus/file.zip"
+       │   ├─ 先 HEAD /api/tus/file.zip → 负载均衡转发到实例B
+       │   │   ├─ 实例B: Redis GET filebrowser:upload:/data/file.zip → 100MB ✓
+       │   │   ├─ 实例B: NFS stat → size=20971520 (20MB) ✓
+       │   │   └─ 返回 Upload-Offset:20971520, Upload-Length:104857600
+       │   ├─ tus-js-client: 断点确认在 20MB
+       │   └─ PATCH offset=20971520, 10MB → 实例B
+       │       ├─ 实例B: file.Size(20MB) == uploadOffset(20MB) ✓
+       │       ├─ NFS 追加写入 + Sync
+       │       └─ 返回 Upload-Offset:31457280
+       └─ ✅ 成功！后续 PATCH 可能被转发到任何实例
+```
+
+#### 多实例部署强制约束
+- **必须共享文件系统**（NFS、分布式存储等）：否则实例B无法读取实例A写入的文件内容和大小，`tusPatchHandler` 的 `file.Size != uploadOffset` 校验会失败
+- **所有实例连接同一 Redis 集群**：确保缓存状态共享
+- **负载均衡必须保持 HTTP 语义兼容**：POST/HEAD/PATCH/DELETE 都能正确转发
+
+---
+
+### 7.5 场景五：其他边界分支
+
+#### 5a. 用户选择 Skip
+检测到冲突后点击 "Skip"，从上传列表中删除：
 ```typescript
-// ResolveConflict.vue confirm 回调
+// Upload.vue confirm 回调
 if (item.checked.length == 1 && item.checked[0] == "dest") {
-    uploadFiles.splice(item.index, 1);  // 从上传列表中删除
-}
-
-// 后续
-if (uploadFiles.length > 0) {
-    upload.handleFiles(uploadFiles, path);  // 只上传剩余文件
+    uploadFiles.splice(item.index, 1);  // 从上传列表移除
 }
 ```
 
----
-
-### 7.3.4 分支D：服务端文件已完整 → 自动跳过
-
-**场景**：用户上次上传已完整完成（100MB），现在又选了同一个文件上传。
-
-**代码逻辑**：
+#### 5b. 服务端文件已完整 → 自动跳过
+上次上传完整完成（100MB），再次选择同一文件：
 ```typescript
-// checkConflict() 中计算
+// checkConflict() 中
 isSmallerOnServer: file.size > server.size  // 100MB > 100MB = false
 
-// resume() 函数中
+// ResolveConflict.vue resume() 按钮
 if (item.isSmallerOnServer) {
     item.checked = ["origin"];  // 覆盖
 } else {
-    item.checked = ["dest"];    // ✅ 服务端文件不小 → 跳过
+    item.checked = ["dest"];    // ✅ 服务端文件不小 → 默认选跳过
 }
 ```
 
-> 这是一个重要的防重复上传逻辑：如果服务端文件大小 >= 本地文件，默认认为服务端的文件是完整的，自动跳过。
+> 这是防重复上传逻辑：服务端文件大小 >= 本地文件时，默认认为服务端文件是完整的，自动跳过。
+
+---
+
+### 7.6 所有恢复场景总结对照表
+
+| 场景 | 是否刷新页面 | 缓存状态 | tus-js-client 行为 | 最终结果 |
+|------|------------|---------|-------------------|---------|
+| **7.1 同页面自动重试** | ❌ 否 | ✅ 有效 | 同一实例 → 先 HEAD → 再 PATCH | ✅ **真正断点续传** |
+| **7.2 刷新后重传（缓存有效）** | ✅ 是 | ✅ 有效 (<3min) | 新实例 → 直接 POST → O_TRUNC | ❌ 覆盖重传（从0开始） |
+| **7.3a 内存模式过期** | 无所谓 | ❌ 过期 | 文件被删 → 无冲突 → POST 新文件 | ✅ 新上传（从0开始，无冲突提示） |
+| **7.3b Redis模式过期** | 无所谓 | ❌ 过期 | 文件残留 → 冲突 → Resume → O_TRUNC | ❌ 覆盖重传（从0开始） |
+| **7.4 多实例滚动重启** | ❌ 否 | ✅ 有效 | 同一实例 → HEAD到新实例 → PATCH | ✅ **真正断点续传**（跨实例） |
+| **7.5b 服务端文件完整** | - | - | checkConflict 检测大小一致 → 跳过 | ✅ 不上传 |
 
 ---
 
@@ -917,7 +917,7 @@ if (item.isSmallerOnServer) {
 
 ---
 
-## 十、前端进度显示与交互
+## 九、前端进度显示与交互
 
 [UploadFiles.vue](file:///d:/fz/0601/solo-dogfeeding/code/177-filebrowser/frontend/src/components/prompts/UploadFiles.vue) 组件负责显示上传进度：
 
@@ -965,7 +965,7 @@ export function abortAllUploads() {
 
 ---
 
-## 十一、总结：设计亮点与注意事项
+## 十、总结：设计亮点与注意事项
 
 ### ✅ 设计亮点
 
@@ -980,22 +980,28 @@ export function abortAllUploads() {
 ### ⚠️ 注意事项
 
 #### 通用注意事项
-1. **默认不支持跨页面续传**：`storeFingerprintForResuming` 设为 `false`，刷新页面后需重新选择文件
-2. **TTL 严格限制**：上传中断超过 3 分钟未恢复，缓存过期
-3. **单片串行**：`parallelUploads: 1`，同一文件的多个分片按顺序传输，不能利用多连接加速
-4. **10MB 分片大小**：小文件（<10MB）会退化为单请求上传，大文件分片数 = 文件大小 / 10MB
+1. **只有自动重试才能真正断点续传**：断点续传**仅**发生在同一个 tus.Upload 实例内部的自动重试（15秒重试窗口内）。页面刷新后重新选择文件，无论缓存是否有效，都会从头重传
+2. **默认不支持跨页面续传**：`storeFingerprintForResuming: false` 导致 tus-js-client 不在 localStorage 中保存上传 URL，且项目代码未调用 `findPreviousUploads()` + `resumeFromPreviousUpload()`
+3. **重试窗口极短**：默认 5 次重试的延迟是 [0, 1000, 2000, 4000, 8000] ms，总窗口只有 15 秒。超过 15 秒网络不恢复 → 上传终止 → 必须手动重新上传
+4. **TTL 严格限制**：上传中断超过 3 分钟未恢复，缓存过期
+5. **单片串行**：`parallelUploads: 1`，同一文件的多个分片按顺序传输，不能利用多连接加速
+6. **10MB 分片大小**：小文件（<10MB）会退化为单请求上传，大文件分片数 = 文件大小 / 10MB
 
 #### 边界场景注意事项
-5. **内存 vs Redis 缓存行为不一致**：
-   - 内存缓存：过期时通过 `OnEviction` 回调自动删除磁盘文件
-   - Redis 缓存：过期后**不会**自动删文件，会残留半完成文件，需额外清理机制
-6. **Resume 按钮不总是续传**：
-   - 缓存有效（<3分钟）→ 智能续传，从断点继续
-   - 缓存过期（>3分钟）→ 实际是覆盖重传，从 0 开始
-7. **overwrite=true 不代表一定会覆盖**：
-   如果 tus-js-client 通过 HEAD 查询发现可以续传，会跳过 POST 请求，`O_TRUNC` 清空代码路径不会执行
-8. **多实例部署强制要求**：
-   - 必须使用共享文件系统（NFS、分布式存储等）
-   - 所有实例必须连接同一个 Redis 集群
-9. **防重复上传逻辑**：
+7. **内存 vs Redis 缓存行为不一致**：
+   - 内存缓存：过期时通过 `OnEviction` 回调自动删除磁盘文件，重新上传时无冲突
+   - Redis 缓存：过期后**不会**自动删文件，会残留半完成文件，重新上传触发冲突对话框 → 选 Resume → 覆盖重传
+8. **"Resume Transfer" 按钮名不副实**：
+   按钮文字是"续传"，但实际行为是设置 `overwrite=true` 后创建全新的 tus.Upload 实例 → 直接 POST → O_TRUNC 清空已有文件 → **从头重传**。不是真正的断点续传
+9. **tusHeadHandler 返回 404 只有一个用途**：
+   仅用于同一 tus.Upload 实例的内部自动重试。页面刷新后的重新上传走不到 HEAD 请求，因为 tus-js-client 直接先发 POST
+10. **多实例部署强制要求**：
+   - 必须使用共享文件系统（NFS、分布式存储等），否则实例间无法读取对方写入的文件
+   - 所有实例必须连接同一个 Redis 集群，确保缓存状态共享
+11. **防重复上传逻辑**：
    当服务端文件大小 >= 本地文件大小时，`resume()` 会自动选择跳过，认为服务端文件是完整的
+
+#### 实现跨页面续传的改进思路
+如果需要支持页面刷新后真正断点续传，需要做以下修改：
+- 前端：`storeFingerprintForResuming` 改为 `true`，或手动在上传前调用 `upload.findPreviousUploads()` + `upload.resumeFromPreviousUpload()`
+- 后端：确保 POST 收到已有文件且 `override=false` 时，不返回 409 Conflict，而是配合 tus-js-client 继续使用

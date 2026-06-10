@@ -49,7 +49,7 @@ rootCmd.RunE 回调 ◄───────────────────
 
 ### 2.1 程序入口
 
-[main.go](file:///d:/fz/0601/solo-dogfeeding/code/180-filebrowser/main.go#L9-L12) 极简，直接调用 `cmd.Execute()`：
+[main.go](cmd/root.go) 极简，直接调用 `cmd.Execute()`：
 
 ```go
 func main() {
@@ -61,7 +61,7 @@ func main() {
 
 ### 2.2 Cobra Root 命令初始化
 
-[cmd/root.go](file:///d:/fz/0601/solo-dogfeeding/code/180-filebrowser/cmd/root.go#L72-L95) 的 `init()` 函数完成三件事：
+[cmd/root.go](cmd/root.go#L72-L95) 的 `init()` 函数完成三件事：
 
 1. **全局标志名迁移**：兼容旧版 flag 名称（如 `--file-mode` → `--fileMode`），通过 `SetGlobalNormalizationFunc` 实现
 2. **注册 Persistent Flags**（所有子命令共享）：
@@ -69,7 +69,7 @@ func main() {
    - `--database / -d`：数据库路径（默认 `./filebrowser.db`）
 3. **注册 Root Flags**（仅主命令启动服务用）：
    - `--noauth`、`--username`、`--password`、`--socketPerm`、`--cacheDir`、`--redisCacheUrl`、`--imageProcessors`
-   - 以及 `addServerFlags()` 添加的服务器相关标志
+   - 以及 [addServerFlags()](cmd/root.go#L99-L114) 添加的服务器相关标志
 
 ### 2.3 子命令体系
 
@@ -77,9 +77,9 @@ func main() {
 
 | 命令文件 | 注册内容 |
 |---------|---------|
-| [cmd/config.go](file:///d:/fz/0601/solo-dogfeeding/code/180-filebrowser/cmd/config.go#L19-L21) | `config` 命令组 |
-| [cmd/config_init.go](file:///d:/fz/0601/solo-dogfeeding/code/180-filebrowser/cmd/config_init.go#L11-L14) | `config init` |
-| [cmd/config_set.go](file:///d:/fz/0601/solo-dogfeeding/code/180-filebrowser/cmd/config_set.go#L7-L10) | `config set` |
+| [cmd/config.go](cmd/config.go#L19-L21) | `config` 命令组 |
+| [cmd/config_init.go](cmd/config_init.go#L11-L14) | `config init` |
+| [cmd/config_set.go](cmd/config_set.go#L7-L10) | `config set` |
 | ... | users/cmds/rules 等子命令 |
 
 ---
@@ -88,7 +88,7 @@ func main() {
 
 ### 3.1 initViper() 函数详解
 
-[cmd/utils.go](file:///d:/fz/0601/solo-dogfeeding/code/180-filebrowser/cmd/utils.go#L85-L133) 是配置合并的核心入口：
+[cmd/utils.go](cmd/utils.go#L85-L133) 是配置合并的核心入口：
 
 ```go
 func initViper(cmd *cobra.Command) (*viper.Viper, error) {
@@ -114,7 +114,7 @@ func initViper(cmd *cobra.Command) (*viper.Viper, error) {
         generateEnvKeyReplacements(cmd)...
     ))
 
-    // Step 3: 绑定命令行 Flags（优先级最高的来源）
+    // Step 3: 绑定命令行 Flags（仅绑定用户显式设置的 flag）
     v.BindPFlags(cmd.Flags())
 
     // Step 4: 读取配置文件（失败仅记录日志，不中断）
@@ -126,7 +126,7 @@ func initViper(cmd *cobra.Command) (*viper.Viper, error) {
 
 ### 3.2 环境变量名映射机制
 
-[generateEnvKeyReplacements()](file:///d:/fz/0601/solo-dogfeeding/code/180-filebrowser/cmd/utils.go#L73-L83) 遍历命令所有 Flags，为每个 flag 生成 `camelCase → SNAKE_CASE` 的替换对：
+[generateEnvKeyReplacements()](cmd/utils.go#L73-L83) 遍历命令所有 Flags，为每个 flag 生成 `camelCase → SNAKE_CASE` 的替换对：
 
 ```
 flag: disablePreviewResize
@@ -141,12 +141,16 @@ flag: disablePreviewResize
 
 Viper 的 `GetXxx()` 调用时按以下顺序查找（先命中即返回）：
 
-1. **显式 Set 的值**（本项目未使用）
-2. **命令行 Flag**（通过 `BindPFlags` 绑定）
-3. **环境变量**（通过 `AutomaticEnv` + `EnvKeyReplacer`）
-4. **配置文件**（通过 `ReadInConfig` 加载）
-5. **Key/Value Store**（本项目未使用）
-6. **默认值**（pflag 注册时的默认值）
+1. **命令行 Flag**（通过 `BindPFlags` 绑定——仅用户显式设置的 flag 才会被绑定）
+2. **环境变量**（通过 `AutomaticEnv` + `EnvKeyReplacer`）
+3. **配置文件**（通过 `ReadInConfig` 加载）
+4. **pflag 默认值**（pflag 未显式设置时 `BindPFlags` 不会绑定该 key，此时 Viper 回退到 pflag 默认值）
+
+> **关键机制**：`v.BindPFlags(cmd.Flags())` 只绑定 `Changed=true` 的 flag 到 Viper。用户未显式设置的 flag 不会被绑定，Viper 对该 key 调用 `IsSet()` 返回 `false`。因此 Viper 的 `GetXxx()` 实际查找链是：
+> - 用户显式设置的 flag 值（绑定到 Viper）
+> - 环境变量
+> - 配置文件值
+> - pflag 默认值（通过 `v.GetString()` 等最终仍可取到，因为 Viper 会 fallback 到 pflag）
 
 > **注意**：Viper 不会自动将配置写回数据库。配置文件/环境变量/Flags 仅影响当前运行时，不会持久化到 BoltDB。
 
@@ -156,7 +160,7 @@ Viper 的 `GetXxx()` 调用时按以下顺序查找（先命中即返回）：
 
 ### 4.1 包装器模式
 
-[cmd/utils.go](file:///d:/fz/0601/solo-dogfeeding/code/180-filebrowser/cmd/utils.go#L147-L194) 的 `withViperAndStore` 是一个高阶函数，将「Viper 初始化 + 数据库打开」封装成 Cobra 的 `RunE` 函数：
+[cmd/utils.go](cmd/utils.go#L150-L194) 的 `withViperAndStore` 是一个高阶函数，将「Viper 初始化 + 数据库打开」封装成 Cobra 的 `RunE` 函数：
 
 ```go
 func withViperAndStore(
@@ -177,8 +181,10 @@ func withViperAndStore(
         switch {
         case exists && options.expectsNoDatabase:    // config init 场景
             log.Fatal(path + " already exists")
-        case !exists && !allowsNoDatabase:            // 普通子命令
+        case !exists && !options.expectsNoDatabase && !options.allowsNoDatabase:
             log.Fatal(path + " does not exist")
+        case !exists && !options.expectsNoDatabase:  // root 命令，DB 不存在时打警告
+            log.Println("WARNING: filebrowser.db can't be found...")
         }
 
         // 5. 打开 BoltDB（通过 Storm ORM）
@@ -202,7 +208,17 @@ func withViperAndStore(
 
 ### 4.3 withStore 简化版
 
-对于不需要访问 Viper 的子命令（如 `config set`），提供 `withStore` 包装器，内部忽略 `*viper.Viper` 参数。
+[cmd/utils.go](cmd/utils.go#L196-L200) 对于不需要访问 Viper 的子命令（如 `config set`、`config init`），提供 `withStore` 包装器，内部调用 `withViperAndStore` 但忽略 `*viper.Viper` 参数：
+
+```go
+func withStore(fn func(cmd *cobra.Command, args []string, store *store) error, options storeOptions) cobraFunc {
+    return withViperAndStore(func(cmd *cobra.Command, args []string, _ *viper.Viper, store *store) error {
+        return fn(cmd, args, store)
+    }, options)
+}
+```
+
+> **重要**：`withStore` 内部仍然会调用 `initViper()`，Viper 仍然初始化（用于解析 `--database` 路径等），只是回调函数中不暴露 Viper 实例。因此 config 子命令的 `--database` 路径和 `--config` 路径仍然经过 Viper 合并。
 
 ---
 
@@ -210,7 +226,7 @@ func withViperAndStore(
 
 ### 5.1 执行流程
 
-[cmd/root.go](file:///d:/fz/0601/solo-dogfeeding/code/180-filebrowser/cmd/root.go#L157-L279) 的 `RunE` 回调：
+[cmd/root.go](cmd/root.go#L157-L279) 的 `RunE` 回调：
 
 ```
 rootCmd.RunE
@@ -237,37 +253,49 @@ rootCmd.RunE
 
 ### 5.2 getServerSettings()：DB + Viper 的选择性覆盖
 
-[cmd/root.go](file:///d:/fz/0601/solo-dogfeeding/code/180-filebrowser/cmd/root.go#L282-L373) 采用 **「读 DB → 检查 Viper.IsSet → 选择性覆盖」** 的模式：
+[cmd/root.go](cmd/root.go#L282-L373) 采用 **「读 DB → 检查 Viper.IsSet → 选择性覆盖」** 的模式：
 
 ```go
 func getServerSettings(v *viper.Viper, st *storage.Storage) (*settings.Server, error) {
     // 1. 先从数据库读取已保存的 Server 配置
     server, _ := st.Settings.GetServer()
 
+    isSocketSet := false
+    isAddrSet := false
+
     // 2. 对每个配置项做「Viper 有设置才覆盖」
-    if v.IsSet("address")   { server.Address = v.GetString("address") }
-    if v.IsSet("port")      { server.Port = v.GetString("port") }
+    if v.IsSet("address")   { server.Address = v.GetString("address"); isAddrSet = true }
     if v.IsSet("log")       { server.Log = v.GetString("log") }
-    if v.IsSet("cert")      { server.TLSCert = v.GetString("cert") }
-    if v.IsSet("key")       { server.TLSKey = v.GetString("key") }
+    if v.IsSet("port")      { server.Port = v.GetString("port"); isAddrSet = true }
+    if v.IsSet("cert")      { server.TLSCert = v.GetString("cert"); isAddrSet = true }
+    if v.IsSet("key")       { server.TLSKey = v.GetString("key"); isAddrSet = true }
     if v.IsSet("root")      { server.Root = v.GetString("root") }
-    if v.IsSet("socket")    { server.Socket = v.GetString("socket") }
-    if v.IsSet("baseURL")   { server.BaseURL = v.GetString("baseURL") }
-    if v.IsSet("tokenExpirationTime")   { server.TokenExpirationTime = v.GetString("tokenExpirationTime") }
+    if v.IsSet("socket")    { server.Socket = v.GetString("socket"); isSocketSet = true }
 
-    // 3. 布尔标志的取反语义（disableXxx → !enableXxx）
-    if v.IsSet("disableThumbnails")     { server.EnableThumbnails = !v.GetBool(...) }
-    if v.IsSet("disablePreviewResize")  { server.ResizePreview = !v.GetBool(...) }
-    if v.IsSet("disableExec")           { server.EnableExec = !v.GetBool(...) }
-    if v.IsSet("disableTypeDetectionByHeader") { server.TypeDetectionByHeader = !v.GetBool(...) }
-    if v.IsSet("disableImageResolutionCalc")   { server.ImageResolutionCal = !v.GetBool(...) }
-
-    // 4. 冲突校验：socket 不能与 address/port/cert/key 同时设置
-    if isAddrSet && isSocketSet {
-        return errors.New("--socket flag cannot be used with ...")
+    // 3. baseURL 有特殊向后兼容处理
+    if v.IsSet("baseURL") {
+        server.BaseURL = v.GetString("baseURL")
+    } else if v := os.Getenv("FB_BASEURL"); v != "" {
+        // 兼容旧版环境变量 FB_BASEURL（已废弃，应使用 FB_BASE_URL）
+        log.Println("DEPRECATION NOTICE: FB_BASEURL deprecated, use FB_BASE_URL")
+        server.BaseURL = v
     }
 
-    // 5. 逻辑修正：手动设了 address/port，则清空 DB 中的 socket
+    if v.IsSet("tokenExpirationTime")   { server.TokenExpirationTime = v.GetString("tokenExpirationTime") }
+
+    // 4. 布尔标志的取反语义（disableXxx → !enableXxx）
+    if v.IsSet("disableThumbnails")     { server.EnableThumbnails = !v.GetBool("disableThumbnails") }
+    if v.IsSet("disablePreviewResize")  { server.ResizePreview = !v.GetBool("disablePreviewResize") }
+    if v.IsSet("disableTypeDetectionByHeader") { server.TypeDetectionByHeader = !v.GetBool("disableTypeDetectionByHeader") }
+    if v.IsSet("disableImageResolutionCalc")   { server.ImageResolutionCal = !v.GetBool("disableImageResolutionCalc") }
+    if v.IsSet("disableExec")           { server.EnableExec = !v.GetBool("disableExec") }
+
+    // 5. 冲突校验：socket 不能与 address/port/cert/key 同时设置
+    if isAddrSet && isSocketSet {
+        return nil, errors.New("--socket flag cannot be used with --address, --port, --key nor --cert")
+    }
+
+    // 6. 逻辑修正：手动设了 address/port，则清空 DB 中的 socket
     if isAddrSet && server.Socket != "" {
         server.Socket = ""
     }
@@ -276,11 +304,13 @@ func getServerSettings(v *viper.Viper, st *storage.Storage) (*settings.Server, e
 }
 ```
 
-> **关键设计**：使用 `v.IsSet(key)` 而非直接 `v.GetXxx`，确保只有**用户明确提供**的来源（flag/env/config file）才覆盖 DB。这避免了 pflag 默认值（如 `--port=8080`）误覆盖 DB 中的自定义值。
+> **关键设计**：使用 `v.IsSet(key)` 而非直接 `v.GetXxx`，确保只有**用户明确提供**的来源（flag/env/config file）才覆盖 DB。
+>
+> **为什么这能工作？** 因为 `v.BindPFlags(cmd.Flags())` 仅绑定 `Changed=true` 的 flag（即用户在命令行上显式传入的）。pflag 的默认值（如 `--port=8080`）不会触发 `Changed=true`，因此 Viper 对该 key 的 `IsSet()` 返回 `false`，不会误覆盖 DB 中的自定义值。
 
 ### 5.3 quickSetup()：首次启动的 DB 初始化
 
-[cmd/root.go](file:///d:/fz/0601/solo-dogfeeding/code/180-filebrowser/cmd/root.go#L393-L502) 仅当数据库文件不存在时触发：
+[cmd/root.go](cmd/root.go#L393-L502) 仅当数据库文件不存在时触发：
 
 ```go
 func quickSetup(v *viper.Viper, s *storage.Storage) error {
@@ -291,7 +321,23 @@ func quickSetup(v *viper.Viper, s *storage.Storage) error {
         HideLoginButton:       true,
         CreateUserDir:         false,
         MinimumPasswordLength: settings.DefaultMinimumPasswordLength, // 12
-        // ... 其他默认值
+        UserHomeBasePath:      settings.DefaultUsersHomeBasePath,     // "/users"
+        Defaults: settings.UserDefaults{
+            Scope:                 ".",
+            Locale:                "en",
+            SingleClick:           false,
+            RedirectAfterCopyMove: true,
+            Perm: users.Permissions{
+                Admin: false, Execute: true, Create: true,
+                Rename: true, Modify: true, Delete: true,
+                Share: true, Download: true,
+            },
+        },
+        Branding: settings.Branding{},
+        Tus: settings.Tus{
+            ChunkSize:  settings.DefaultTusChunkSize,
+            RetryCount: settings.DefaultTusRetryCount,
+        },
     }
 
     // 2. 选择认证方式并保存
@@ -304,12 +350,22 @@ func quickSetup(v *viper.Viper, s *storage.Storage) error {
     }
     s.Settings.Save(set)
 
-    // 3. 构造 Server（从 Viper 读取当前运行参数作为初始值写入 DB）
+    // 3. 构造 Server（注意：这里用 v.GetString() 而非 v.IsSet()，
+    //    因此 pflag 默认值也会被写入 DB）
     ser := &settings.Server{
         BaseURL:               v.GetString("baseURL"),
         Port:                  v.GetString("port"),
         Log:                   v.GetString("log"),
-        // ... 从 Viper 读取当前值
+        TLSKey:                v.GetString("key"),
+        TLSCert:               v.GetString("cert"),
+        Address:               v.GetString("address"),
+        Root:                  v.GetString("root"),
+        TokenExpirationTime:   v.GetString("tokenExpirationTime"),
+        EnableThumbnails:      !v.GetBool("disableThumbnails"),
+        ResizePreview:         !v.GetBool("disablePreviewResize"),
+        EnableExec:            !v.GetBool("disableExec"),
+        TypeDetectionByHeader: !v.GetBool("disableTypeDetectionByHeader"),
+        ImageResolutionCal:    !v.GetBool("disableImageResolutionCalc"),
     }
     s.Settings.SaveServer(ser)
 
@@ -318,14 +374,16 @@ func quickSetup(v *viper.Viper, s *storage.Storage) error {
     password := v.GetString("password")  // 空则随机生成
     if password == "" {
         pwd, _ := users.RandomPwd(set.MinimumPasswordLength)
-        password, _ = users.ValidateAndHashPwd(pwd, ...)
+        password, _ = users.ValidateAndHashPwd(pwd, set.MinimumPasswordLength)
     }
-    user := &users.User{Username: username, Password: password, ...}
+    user := &users.User{Username: username, Password: password, LockPassword: false}
     set.Defaults.Apply(user)
     user.Perm.Admin = true
     return s.Users.Save(user)
 }
 ```
+
+> **注意**：`quickSetup()` 中使用 `v.GetString("port")` 而非 `v.IsSet("port")` 判断，这意味着如果用户未传 `--port`，Viper 返回的将是 pflag 默认值 `"8080"`，并以此写入 DB。这是合理的——首次启动需要完整填充 Server 结构体。
 
 ---
 
@@ -333,9 +391,10 @@ func quickSetup(v *viper.Viper, s *storage.Storage) error {
 
 ### 6.1 config init：创建全新配置
 
-[cmd/config_init.go](file:///d:/fz/0601/solo-dogfeeding/code/180-filebrowser/cmd/config_init.go#L16-L61)：
+[cmd/config_init.go](cmd/config_init.go#L16-L61)：
 
 - 使用 `withStore(..., storeOptions{expectsNoDatabase: true})`
+  - 注意：`withStore` 内部仍会调用 `initViper()`，但回调中不暴露 Viper
 - 要求 DB **不存在**，否则退出
 - `getSettings(flags, s, ser, nil, true)` 中 `all=true`：
   - **VisitAll** 遍历所有 flag（包括未设置的，使用默认值）
@@ -344,7 +403,7 @@ func quickSetup(v *viper.Viper, s *storage.Storage) error {
 
 ### 6.2 config set：增量更新配置
 
-[cmd/config_set.go](file:///d:/fz/0601/solo-dogfeeding/code/180-filebrowser/cmd/config_set.go#L12-L61)：
+[cmd/config_set.go](cmd/config_set.go#L12-L61)：
 
 - 使用 `withStore(..., storeOptions{})`（DB 必须已存在）
 - **先读 DB** 现有配置：
@@ -360,11 +419,13 @@ func quickSetup(v *viper.Viper, s *storage.Storage) error {
 
 ### 6.3 getSettings()：flag → 结构体的字段映射
 
-[cmd/config.go](file:///d:/fz/0601/solo-dogfeeding/code/180-filebrowser/cmd/config.go#L274-L392) 是 `config init/set` 共用的核心函数：
+[cmd/config.go](cmd/config.go#L274-L392) 是 `config init/set` 共用的核心函数：
 
 ```go
 func getSettings(flags *pflag.FlagSet, set *settings.Settings, ser *settings.Server,
     auther auth.Auther, all bool) (auth.Auther, error) {
+
+    hasAuth := false
 
     visit := func(flag *pflag.Flag) {
         switch flag.Name {
@@ -380,6 +441,7 @@ func getSettings(flags *pflag.FlagSet, set *settings.Settings, ser *settings.Ser
         case "signup":    set.Signup, _ = flags.GetBool(flag.Name)
         case "branding.name": set.Branding.Name, _ = flags.GetString(flag.Name)
         case "tus.chunkSize": set.Tus.ChunkSize, _ = flags.GetUint64(flag.Name)
+        case "auth.method": hasAuth = true  // 仅标记，后续在 getAuthentication 中处理
         // ...
         }
     }
@@ -395,6 +457,7 @@ func getSettings(flags *pflag.FlagSet, set *settings.Settings, ser *settings.Ser
 
     // 认证方式处理
     if all {
+        // 全量模式：无 fallback，直接从 flags 构建
         set.AuthMethod, auther, _ = getAuthentication(flags)
     } else {
         // 增量模式：传入现有 DB 值作 fallback
@@ -411,7 +474,7 @@ func getSettings(flags *pflag.FlagSet, set *settings.Settings, ser *settings.Ser
 
 ### 7.1 两层配置模型
 
-[settings/settings.go](file:///d:/fz/0601/solo-dogfeeding/code/180-filebrowser/settings/settings.go#L23-L65) 将配置分为两个独立结构体：
+[settings/settings.go](settings/settings.go#L23-L65) 将配置分为两个独立结构体：
 
 #### settings.Settings — 业务/通用配置
 ```go
@@ -420,15 +483,18 @@ type Settings struct {
     Signup                bool                // 是否允许注册
     HideLoginButton       bool
     CreateUserDir         bool
+    UserHomeBasePath      string
     MinimumPasswordLength uint
     Defaults              UserDefaults        // 新用户默认配置
     AuthMethod            AuthMethod          // json/proxy/hook/noauth
+    LogoutPage            string
     Branding              Branding            // 定制化（名称/主题/颜色）
     Tus                   Tus                 // TUS 断点续传
     Commands              map[string][]string // 事件钩子命令
     Shell                 []string            // Shell 命令前缀
     Rules                 []rules.Rule        // 文件访问规则
     FileMode, DirMode     fs.FileMode         // 新建文件/目录权限
+    HideDotfiles          bool
 }
 ```
 
@@ -444,23 +510,37 @@ type Server struct {
     ResizePreview          bool     // 预览图缩放
     EnableExec             bool     // 命令执行（高危，默认关）
     TypeDetectionByHeader  bool     // 通过文件头检测 MIME
+    ImageResolutionCal     bool     // 图片分辨率计算
+    AuthHook               string   // 认证钩子命令
     TokenExpirationTime    string   // Session 超时，如 "2h"
 }
 ```
 
 ### 7.2 BoltDB 存储层
 
-[storage/bolt/config.go](file:///d:/fz/0601/solo-dogfeeding/code/180-filebrowser/storage/bolt/config.go#L13-L29) 使用 Storm ORM 的 KV 存储，两个独立 bucket：
+[storage/bolt/config.go](storage/bolt/config.go#L9-L29) 使用 Storm ORM 的 KV 存储，两个独立 bucket：
 
 ```go
+type settingsBackend struct {
+    db *storm.DB
+}
+
 func (s settingsBackend) Get() (*settings.Settings, error) {
     set := &settings.Settings{}
-    return set, get(s.db, "settings", set)   // bucket: "settings"
+    return set, get(s.db, "settings", set)   // bucket key: "settings"
+}
+
+func (s settingsBackend) Save(set *settings.Settings) error {
+    return save(s.db, "settings", set)
 }
 
 func (s settingsBackend) GetServer() (*settings.Server, error) {
     server := &settings.Server{}
-    return server, get(s.db, "server", server)  // bucket: "server"
+    return server, get(s.db, "server", server)  // bucket key: "server"
+}
+
+func (s settingsBackend) SaveServer(server *settings.Server) error {
+    return save(s.db, "server", server)
 }
 ```
 
@@ -476,32 +556,34 @@ filebrowser --port 9000 --root /data --noauth
 
 ```
 1. Cobra 解析 Flags
-   --port=9000, --root=/data, --noauth=true
-   --database 使用 pflag 默认值 ./filebrowser.db
+   --port=9000 (Changed=true), --root=/data (Changed=true), --noauth=true (Changed=true)
+   --database 未传，使用 pflag 默认值 ./filebrowser.db (Changed=false)
 
 2. initViper()
    ├─ 未指定 --config，搜索 ./.filebrowser.* → 无
    ├─ 环境变量 FB_* → 未设置
-   └─ BindPFlags 合并 Flags
+   ├─ BindPFlags：仅绑定 port=9000, root=/data, noauth=true
+   └─ ReadInConfig → 无文件
 
 3. withViperAndStore
-   ├─ v.GetString("database") → ./filebrowser.db
+   ├─ v.GetString("database") → "./filebrowser.db"（pflag 默认值）
    ├─ dbExists() → false
-   ├─ allowsNoDatabase=true → 不报错
+   ├─ allowsNoDatabase=true → 打 WARNING，不报错
    └─ 创建 ./filebrowser.db，databaseExisted=false
 
 4. rootCmd.RunE
    ├─ databaseExisted=false → 触发 quickSetup(v, Storage)
-   │   ├─ Settings{Key: random, AuthMethod: noauth, ...}
-   │   ├─ Server{Port: "9000", Root: "/data", ...}  ← 从 Viper 读取
-   │   ├─ 创建 admin 用户
+   │   ├─ v.GetBool("noauth")=true → AuthMethod=noauth
+   │   ├─ Server{Port: "9000", Root: "/data", ...}  ← v.GetString() 取到用户值
+   │   │   （注意：v.GetString("port")="9000"，因为 BindPFlags 绑定了用户传入的值）
+   │   ├─ 创建 admin 用户（随机密码）
    │   └─ 全部存入 BoltDB
-   ├─ imageProcessors=4（pflag 默认值）
-   ├─ cacheDir=""（空→禁用）
+   ├─ v.GetInt("imageProcessors")=4（pflag 默认值，未 Changed，Viper 未绑定，回退取 pflag 默认）
+   ├─ v.GetString("cacheDir")=""（pflag 默认值）
    ├─ getServerSettings(v, Storage)
-   │   ├─ 从 DB 读 Server（刚写入，含 Port=9000）
-   │   ├─ v.IsSet("port")=true → 覆盖为 9000（值相同）
-   │   └─ v.IsSet("root")=true → 覆盖为 /data
+   │   ├─ 从 DB 读 Server（刚写入，含 Port="9000"）
+   │   ├─ v.IsSet("port")=true（BindPFlags 绑定了）→ server.Port = "9000"（相同）
+   │   └─ v.IsSet("root")=true → server.Root = "/data"
    └─ 启动 HTTP 监听 :9000
 ```
 
@@ -514,25 +596,26 @@ filebrowser
 
 ```
 1. Cobra 解析 Flags
-   --port 使用 pflag 默认值 "8080"（IsSet 为 false，因为用户没显式传）
+   所有 flag 未显式传入，均使用 pflag 默认值（Changed 全为 false）
 
 2. initViper()
-   ├─ 环境变量 FB_PORT=9090 → 映射为 port=9090
-   └─ BindPFlags 合并（但 flag 未显式设置，env 优先级 > pflag 默认值）
+   ├─ 环境变量 FB_PORT=9090 → Viper 通过 AutomaticEnv 注册
+   ├─ BindPFlags：无 flag 被 Changed，无任何绑定
+   └─ ReadInConfig → 无文件
 
 3. withViperAndStore
    └─ DB 存在，databaseExisted=true
 
 4. rootCmd.RunE
-   ├─ 跳过 quickSetup
+   ├─ 跳过 quickSetup（DB 已存在）
    └─ getServerSettings(v, Storage)
        ├─ 从 DB 读 Server{Port: "9000"（上次启动存的值）}
-       ├─ v.IsSet("port")=true（env 设置了）
+       ├─ v.IsSet("port")=true（环境变量 FB_PORT 设置了该 key）
        │   └─ server.Port = v.GetString("port") = "9090"
        └─ 最终使用 9090 启动
 ```
 
-> **重点**：pflag 的「默认值」不触发 `IsSet=true`，只有**用户显式通过 CLI / env / config file 提供**才会 `IsSet=true`。因此 env 能正确覆盖 DB。
+> **重点**：Viper 的 `IsSet()` 会检查环境变量是否设置了该 key。因此即使命令行未传 `--port`，`FB_PORT` 环境变量仍会使 `v.IsSet("port")` 返回 `true`，从而覆盖 DB 中的值。
 
 ### 场景 3：config set 增量更新
 
@@ -542,15 +625,15 @@ filebrowser config set --branding.name "My Files" --disableExec
 
 ```
 1. Cobra 解析 Flags
-   --branding.name="My Files", --disableExec=true
-   (其他 flag 未设置)
+   --branding.name="My Files" (Changed=true), --disableExec=true (Changed=true)
+   (其他 flag 未设置，Changed=false)
 
-2. withStore（无 Viper 参与，config 子命令不用 Viper）
+2. withStore（内部调用 initViper 用于解析 --database，但回调中不暴露 Viper）
 
 3. configSetCmd.RunE
    ├─ 从 DB 读现有: set, ser, auther
    ├─ getSettings(flags, set, ser, auther, all=false)
-   │   └─ flags.Visit(visit)：仅遍历 2 个显式设置的 flag
+   │   └─ flags.Visit(visit)：仅遍历 2 个 Changed=true 的 flag
    │       ├─ "branding.name" → set.Branding.Name = "My Files"
    │       └─ "disableExec" → ser.EnableExec = !true = false
    ├─ 其他字段（如 Signup、Port、AuthMethod）保持 DB 原值
@@ -565,10 +648,12 @@ filebrowser config set --branding.name "My Files" --disableExec
 
 | | Root 主命令 | Config 子命令（init/set） |
 |---|------------|--------------------------|
-| 使用 Viper | ✅ 是（含 env/config file） | ❌ 否，直接读 `*pflag.FlagSet` |
-| 访问 DB | ✅ 读 + 运行时覆盖 | ✅ 读写持久化 |
+| 使用 Viper | ✅ 是（含 env/config file） | ⚠️ 间接使用（`withStore` 内部仍调 `initViper`，但不暴露给回调） |
+| 回调中访问 Viper | ✅ 直接使用 `v.IsSet/GetString` | ❌ 仅使用 `*pflag.FlagSet` |
+| 访问 DB | ✅ 读 + 运行时覆盖（不写回） | ✅ 读写持久化 |
 | Flags 遍历方式 | `viper.IsSet` 判定 | `Visit/VisitAll` 函数 |
 | 生效范围 | 当前进程运行时 | 永久写入 BoltDB |
+| 环境变量/配置文件 | ✅ 可覆盖 DB 值 | ❌ 不生效（回调中不读 Viper） |
 
 > **为什么 config set 不支持 env/config file？**
 > 因为 `config set` 是**管理操作**，语义是「明确告诉我要改什么」，隐式的环境变量/配置文件会导致意外修改。设计上，只有服务启动（root 命令）才需要多源合并，管理命令使用显式 flag 更安全。
@@ -588,27 +673,45 @@ Server 结构体:       EnableExec           EnableThumbnails
 
 ### 9.3 deprecated 标志名的兼容迁移
 
-[cmd/root.go](file:///d:/fz/0601/solo-dogfeeding/code/180-filebrowser/cmd/root.go#L36-L70) 通过 `SetGlobalNormalizationFunc` 实现旧 flag → 新 flag 自动映射：
+[cmd/root.go](cmd/root.go#L36-L70) 通过 `SetGlobalNormalizationFunc` 实现旧 flag → 新 flag 自动映射：
 
 ```go
 var flagNamesMigrations = map[string]string{
-    "file-mode":       "fileMode",
-    "dir-mode":        "dirMode",
-    "baseurl":         "baseURL",
-    "cache-dir":       "cacheDir",
-    // ... 约 14 条映射
-}
-
-func migrateFlagNames(_ *pflag.FlagSet, name string) pflag.NormalizedName {
-    if newName, ok := flagNamesMigrations[name]; ok {
-        log.Printf("DEPRECATION NOTICE: --%s 已弃用, 使用 --%s\n", name, newName)
-        name = newName  // 内部统一替换为新名称
-    }
-    return pflag.NormalizedName(name)
+    "file-mode":                        "fileMode",
+    "dir-mode":                         "dirMode",
+    "hide-login-button":                "hideLoginButton",
+    "create-user-dir":                  "createUserDir",
+    "minimum-password-length":          "minimumPasswordLength",
+    "socket-perm":                      "socketPerm",
+    "disable-thumbnails":               "disableThumbnails",
+    "disable-preview-resize":           "disablePreviewResize",
+    "disable-exec":                     "disableExec",
+    "disable-type-detection-by-header": "disableTypeDetectionByHeader",
+    "img-processors":                   "imageProcessors",
+    "cache-dir":                        "cacheDir",
+    "redis-cache-url":                  "redisCacheUrl",
+    "token-expiration-time":            "tokenExpirationTime",
+    "baseurl":                          "baseURL",
 }
 ```
 
 用户使用 `--file-mode=0644` → 自动归一化为 `fileMode` → 后续 Viper 绑定、结构体赋值全部使用新名称，实现**无损兼容升级**。
+
+### 9.4 baseURL 的双重向后兼容
+
+[getServerSettings()](cmd/root.go#L324-L330) 中对 `baseURL` 有特殊处理：
+
+```go
+if v.IsSet("baseURL") {
+    server.BaseURL = v.GetString("baseURL")
+} else if v := os.Getenv("FB_BASEURL"); v != "" {
+    // 兼容旧版：FB_BASEURL → 应使用 FB_BASE_URL
+    log.Println("DEPRECATION NOTICE: FB_BASEURL deprecated, use FB_BASE_URL")
+    server.BaseURL = v
+}
+```
+
+这是唯一一个在 `getServerSettings()` 中直接使用 `os.Getenv()` 的地方，属于向后兼容的硬编码特殊处理。
 
 ---
 
@@ -616,21 +719,24 @@ func migrateFlagNames(_ *pflag.FlagSet, name string) pflag.NormalizedName {
 
 | 功能 | 文件 | 行号 |
 |------|------|------|
-| 程序入口 | [main.go](file:///d:/fz/0601/solo-dogfeeding/code/180-filebrowser/main.go#L9-L12) | L9-L12 |
-| Root 命令定义与 Flags 注册 | [cmd/root.go](file:///d:/fz/0601/solo-dogfeeding/code/180-filebrowser/cmd/root.go#L72-L114) | L72-L114 |
-| 标志名迁移（兼容旧版） | [cmd/root.go](file:///d:/fz/0601/solo-dogfeeding/code/180-filebrowser/cmd/root.go#L36-L70) | L36-L70 |
-| 服务启动主逻辑（含合并） | [cmd/root.go](file:///d:/fz/0601/solo-dogfeeding/code/180-filebrowser/cmd/root.go#L157-L279) | L157-L279 |
-| getServerSettings（DB + Viper 合并） | [cmd/root.go](file:///d:/fz/0601/solo-dogfeeding/code/180-filebrowser/cmd/root.go#L282-L373) | L282-L373 |
-| quickSetup（首次启动初始化） | [cmd/root.go](file:///d:/fz/0601/solo-dogfeeding/code/180-filebrowser/cmd/root.go#L393-L502) | L393-L502 |
-| initViper（多源合并核心） | [cmd/utils.go](file:///d:/fz/0601/solo-dogfeeding/code/180-filebrowser/cmd/utils.go#L85-L133) | L85-L133 |
-| env key 映射（camelCase → SNAKE_CASE） | [cmd/utils.go](file:///d:/fz/0601/solo-dogfeeding/code/180-filebrowser/cmd/utils.go#L73-L83) | L73-L83 |
-| withViperAndStore 包装器 | [cmd/utils.go](file:///d:/fz/0601/solo-dogfeeding/code/180-filebrowser/cmd/utils.go#L150-L194) | L150-L194 |
-| DB 存在性判断 | [cmd/utils.go](file:///d:/fz/0601/solo-dogfeeding/code/180-filebrowser/cmd/utils.go#L50-L68) | L50-L68 |
-| config init（全量初始化） | [cmd/config_init.go](file:///d:/fz/0601/solo-dogfeeding/code/180-filebrowser/cmd/config_init.go#L16-L61) | L16-L61 |
-| config set（增量更新） | [cmd/config_set.go](file:///d:/fz/0601/solo-dogfeeding/code/180-filebrowser/cmd/config_set.go#L12-L61) | L12-L61 |
-| getSettings（flag → 结构体映射） | [cmd/config.go](file:///d:/fz/0601/solo-dogfeeding/code/180-filebrowser/cmd/config.go#L274-L392) | L274-L392 |
-| addServerFlags（服务器类 flag 定义） | [cmd/root.go](file:///d:/fz/0601/solo-dogfeeding/code/180-filebrowser/cmd/root.go#L99-L114) | L99-L114 |
-| addConfigFlags（配置类 flag 定义） | [cmd/config.go](file:///d:/fz/0601/solo-dogfeeding/code/180-filebrowser/cmd/config.go#L30-L63) | L30-L63 |
-| Settings 结构体定义 | [settings/settings.go](file:///d:/fz/0601/solo-dogfeeding/code/180-filebrowser/settings/settings.go#L23-L41) | L23-L41 |
-| Server 结构体定义 | [settings/settings.go](file:///d:/fz/0601/solo-dogfeeding/code/180-filebrowser/settings/settings.go#L49-L65) | L49-L65 |
-| BoltDB Settings 读写 | [storage/bolt/config.go](file:///d:/fz/0601/solo-dogfeeding/code/180-filebrowser/storage/bolt/config.go#L13-L29) | L13-L29 |
+| 程序入口 | [main.go](main.go) | L9-L12 |
+| Root 命令定义与 Flags 注册 | [cmd/root.go](cmd/root.go#L72-L95) | L72-L95 |
+| 标志名迁移（兼容旧版） | [cmd/root.go](cmd/root.go#L36-L70) | L36-L70 |
+| addServerFlags（服务器类 flag 定义） | [cmd/root.go](cmd/root.go#L99-L114) | L99-L114 |
+| 服务启动主逻辑（含合并） | [cmd/root.go](cmd/root.go#L157-L279) | L157-L279 |
+| getServerSettings（DB + Viper 合并） | [cmd/root.go](cmd/root.go#L282-L373) | L282-L373 |
+| quickSetup（首次启动初始化） | [cmd/root.go](cmd/root.go#L393-L502) | L393-L502 |
+| setupLog（日志输出配置） | [cmd/root.go](cmd/root.go#L375-L391) | L375-L391 |
+| initViper（多源合并核心） | [cmd/utils.go](cmd/utils.go#L85-L133) | L85-L133 |
+| generateEnvKeyReplacements（env 映射） | [cmd/utils.go](cmd/utils.go#L73-L83) | L73-L83 |
+| withViperAndStore 包装器 | [cmd/utils.go](cmd/utils.go#L150-L194) | L150-L194 |
+| withStore 简化版包装器 | [cmd/utils.go](cmd/utils.go#L196-L200) | L196-L200 |
+| dbExists（DB 存在性判断） | [cmd/utils.go](cmd/utils.go#L50-L68) | L50-L68 |
+| addConfigFlags（配置类 flag 定义） | [cmd/config.go](cmd/config.go#L30-L63) | L30-L63 |
+| getSettings（flag → 结构体映射） | [cmd/config.go](cmd/config.go#L274-L392) | L274-L392 |
+| getAuthentication（认证方式构建） | [cmd/config.go](cmd/config.go#L172-L197) | L172-L197 |
+| config init（全量初始化） | [cmd/config_init.go](cmd/config_init.go#L16-L61) | L16-L61 |
+| config set（增量更新） | [cmd/config_set.go](cmd/config_set.go#L12-L61) | L12-L61 |
+| Settings 结构体定义 | [settings/settings.go](settings/settings.go#L23-L41) | L23-L41 |
+| Server 结构体定义 | [settings/settings.go](settings/settings.go#L49-L65) | L49-L65 |
+| BoltDB Settings 读写 | [storage/bolt/config.go](storage/bolt/config.go#L9-L29) | L9-L29 |

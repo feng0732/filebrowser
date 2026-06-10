@@ -345,11 +345,11 @@ if link.Expire != 0 && link.Expire <= time.Now().Unix() { ... }
 ```
 （`Expire == 0` 代表永久分享，永远不清理）
 
-### 4.2 ⚠️ 批量列表场景下的边界问题：range 遍历 + 原地修改切片导致 DB 漏删 + 返回错乱 + panic
+### 4.2 ⚠️ 批量列表场景下的边界问题：range 遍历 + 原地修改切片导致 DB 漏删 + 返回残留 +（条件性）panic
 
 #### 问题描述
 
-**`All()`、`FindByUserID()`、`Gets()` 三个批量方法存在「range 遍历 + append 原地修改切片」的严重 bug，包含 DB 漏删、返回切片错乱、runtime panic 三个层面的问题。**
+**`All()`、`FindByUserID()`、`Gets()` 三个批量方法存在「range 遍历 + append 原地修改切片」的 bug，仅从 `range` 语义和 `append` 行为即可推出三个层面的问题。**
 
 当前实现 [share/storage.go#L39-L46](share/storage.go#L39-L46)：
 
@@ -364,7 +364,11 @@ for i, link := range links {
 }
 ```
 
-#### 根本原因（Go 切片内存模型精确分析）
+**推导前提**：只有 `link` 判断为「过期」时才会进入 if 分支，也只有在这个分支里才会执行 `append(links[:i], ...)`（切片边界检查在这里）。不进入过期分支，就不会执行切片操作，就不会 panic。
+
+---
+
+#### 根本原因（Go range 语义 + append 行为分析）
 
 ##### Go 切片的三字段结构
 
@@ -387,32 +391,32 @@ for i, v := range links { ... }
 等价于：
 
 ```go
-// 第 0 步：在循环开始前，对 range 表达式求值 ONE TIME
-_temp_range := links          // 复制切片头：3 个字段
-_len := _temp_range.Len       // 固定迭代次数 = 初始 Len = 4
+// ===== 循环开始前：对 range 表达式求值 ONE TIME =====
+_temp_range := links          // 复制切片头：(Data, Len, Cap) 三个字段
+_len := _temp_range.Len       // 固定迭代次数 = 初始 Len
 
 for i := 0; i < _len; i++ {
+    // 从共享的底层数组偏移 i 处直接读 —— 不是从 temp 副本读！
     v := *(*Link)(unsafe.Pointer(_temp_range.Data + uintptr(i)*unsafe.Sizeof(Link{})))
-    // ↳ 从共享的底层数组偏移 i 处直接读！不是从 temp 副本读元素值！
     
-    ... // 循环体，可修改 links 变量本身
+    ... // 循环体中可以修改 links 变量本身
 }
 ```
 
-**四个关键结论**：
+**四个关键机制**：
 
-| # | 机制 | 说明 | 后果 |
-|---|------|------|------|
-| 1 | **切片头副本** | `_temp_range` 复制了 `(Data, Len, Cap)` 三个字段 | `links.Len` 后续变化不影响迭代次数 |
-| 2 | **底层数组共享** | `_temp_range.Data == links.Data`，指针指向同一块内存 | `append` 原地修改时，**后续迭代读到的元素值已被改写** |
-| 3 | **`v` 从共享数组读** | `v = arr[i]` 是每次迭代时从当前底层数组**实时读取** | 删除操作会移动数组元素 → 后续 `v` 读到"跑过来"的新值 |
-| 4 | **切片操作用新 `Len`** | `links[:i]` 边界检查用当前 `links.Len`（可能已缩短） | `i` 继续递增 → 边界越界 → **panic** |
+| # | 机制 | 说明 | 可推出的事实 |
+|---|------|------|-------------|
+| 1 | **切片头副本** | `_temp_range` 复制了三字段，迭代次数 = `_temp_range.Len` | `links.Len` 后续如何缩短，循环都会跑满初始次数 |
+| 2 | **底层数组共享** | `_temp_range.Data == links.Data`，指针指向同一块内存 | `append` 原地修改数组时，后续迭代读到的 `arr[i]` **已被改写** |
+| 3 | **`v` 实时读取** | `v = arr[i]` 每次迭代从当前数组当前位置读 | 元素被移动后，下次迭代读到的是「跑过来」的新位置元素 |
+| 4 | **切片操作条件执行** | `links[:i]` 只在过期分支里执行，用当前 `links.Len` 做边界检查 | 进入过期分支且 `i >= 当前 links.Len` → 越界 → **panic**<br>不进入过期分支 → 不执行切片操作 → **不会 panic** |
 
 ---
 
-#### 复现场景 A：连续过期（精确到每一行代码执行）
+#### 复现场景 A：连续过期（精确推导）
 
-**准备**：`links = [A(过期), B(过期), C(正常), D(过期)]`，底层数组初始 Len=4, Cap=4
+**准备**：`links = [A(过期), B(过期), C(正常), D(过期)]`，Len=4, Cap=4
 
 ```
 内存初始状态:
@@ -422,27 +426,16 @@ for i := 0; i < _len; i++ {
           (过)  (过)  (正)  (过)
 ```
 
-```go
-// ===== 循环开始前 =====
-_temp_range = links   // Data=&arr[0], Len=4, Cap=4
-_len = 4              // 迭代次数固定为 4 次
-```
-
 ---
 
 ##### ▶️ 第 1 次迭代：`i=0`
 
 ```go
-// Step 1: 读 link
-link = *(_temp_range.Data + 0*Size) = arr[0] = A
-// link.Expire → 过期 ✅
+link = arr[0] = A   // 过期 ✅
+s.Delete(A.Hash)    // DB 删 A ✅
 
-// Step 2: DB 删除 (正确)
-s.Delete(A.Hash)   // ✅ A 从 DB 删除
-
-// Step 3: 切片操作 —— 关键点！
-// links[:0] = [Data=&arr[0], Len=0, Cap=4] → 空切片，头在 arr[0]
-// links[1:] = [Data=&arr[1], Len=3, Cap=3] → [B, C, D]
+// links[:0] = 空切片 (头在 arr[0])
+// links[1:] = [B, C, D]
 // append → 容量足够，将 [B,C,D] 拷贝到 arr[0..2]
 links = append(links[:0], links[1:]...)
 ```
@@ -452,80 +445,64 @@ links = append(links[:0], links[1:]...)
 ```
 arr:   [ B ][ C ][ D ][ D ]
          0    1    2    3   ← arr[3] 是旧值，未被覆盖
-links: [Data=&arr[0], Len=3, Cap=4]   ← Len 从 4 变成 3
+links: [Data=&arr[0], Len=3, Cap=4]   ← Len: 4 → 3
 ```
 
-**本步总结**：DB 正确删 A，切片正确变 [B,C,D]，无异常
+**本步**：DB 正确删 A，切片正确变 `[B,C,D]`，无异常。
 
 ---
 
 ##### ▶️ 第 2 次迭代：`i=1`
 
 ```go
-// Step 1: 读 link —— ⚠️ 从共享数组实时读！
-link = *(_temp_range.Data + 1*Size) = arr[1] = C
-//                       ↑ 不是 B！是 C！
-// arr[1] 已经在上一步被 B→C 的拷贝覆盖了
-// link.Expire → C 是正常的 ❌，不进入删除分支
+link = arr[1] = C
+//       ↑ 不是 B！
+// arr[1] 已经被上一步拷贝覆盖为 C（原本 C 在 arr[2]）
+// C 是正常的 ❌ → 不进入过期分支
 ```
 
-**什么都没做！** B（原本应该被删）在 arr[0]，但 `i` 已经走到了 1，**B 永远不会被检查到了**。
+**什么都没做！** B（原本应该被删的）现在在 `arr[0]`，但 `i` 已经走到了 1，**B 永远不会被迭代到了**。
 
 **内存保持不变**：`arr=[B,C,D,D]`, `links=[B,C,D]`, `Len=3`
 
-**本步总结**：
-- ❌ **DB 漏删 B**（B 移到了 arr[0]，但 i=1 跳过了它）
-- ❌ **C 被当作正常**（实际读到的是 arr[1]=C，但原 B 已跳过）
+**本步问题**：
+- ❌ **DB 漏删 B**（B 移到了已检查的 arr[0]，i=1 跳过了它）
+- ✅ 不进入过期分支 → 不执行切片操作 → **不 panic**
 
 ---
 
 ##### ▶️ 第 3 次迭代：`i=2`
 
 ```go
-// Step 1: 读 link
-link = *(_temp_range.Data + 2*Size) = arr[2] = D
-// link.Expire → 过期 ✅
+link = arr[2] = D   // 过期 ✅
+s.Delete(D.Hash)    // DB 删 D ✅
 
-// Step 2: DB 删除
-s.Delete(D.Hash)   // ✅ D 从 DB 删除
-
-// Step 3: 切片操作
-// 当前 links.Len = 3, i = 2
-// links[:2] = [B, C]   (Len=2)
-// links[3:] = [Data=&arr[3], Len=0, ...] → 空切片 (Len=3, start=3)
-links = append(links[:2], links[3:]...)  // 追加空 → [B, C]
+// 当前 links.Len = 3, i = 2 → 边界检查通过
+// links[:2] = [B, C]
+// links[3:] = 空切片 (start=3 == Len=3)
+links = append(links[:2], links[3:]...)  // → [B, C]
 ```
 
-**内存写入后**：
+**内存写入后**：`arr` 不变，`links.Len = 3 → 2`
 
-```
-arr:   [ B ][ C ][ D ][ D ]   (不变)
-links: [Data=&arr[0], Len=2, Cap=4]   ← Len 从 3 变成 2
-```
-
-**本步总结**：DB 正确删 D，切片变 [B,C]，无异常
+**本步**：DB 正确删 D，切片变 `[B,C]`，无异常。
 
 ---
 
 ##### ▶️ 第 4 次迭代：`i=3`
 
 ```go
-// Step 1: 读 link
-link = *(_temp_range.Data + 3*Size) = arr[3] = D
-// link.Expire → 过期 ✅ (D 的指针值还在，字段未变)
+link = arr[3] = D   // 过期 ✅（arr[3] 是旧值，Expire 字段仍未过期）
+s.Delete(D.Hash)    // 幂等，不会报错
 
-// Step 2: DB 删除
-s.Delete(D.Hash)   // 没问题，Delete 是幂等的，不会报错
-
-// Step 3: 切片操作 —— 💥 BOOM!
-// 当前 links.Len = 2, i = 3
-links[:3]   // ⚠️ 切片上界 3 > 当前 Len 2
+// 当前 links.Len = 2, i = 3 → 进入过期分支后：
+links[:3]   // ⚠️ 上界 3 > Len 2
             // → runtime panic: slice bounds out of range [:3] with length 2
 ```
 
 ---
 
-##### 📊 场景 A 最终结果汇总
+##### 📊 场景 A 最终结果
 
 | 检查项 | 结果 | 说明 |
 |--------|------|------|
@@ -533,13 +510,8 @@ links[:3]   // ⚠️ 切片上界 3 > 当前 Len 2
 | DB 中 B | ❌ **残留** | 移到 arr[0] 后被跳过，**DB 漏删** |
 | DB 中 C | ✅ 保留 | 正确（C 未过期） |
 | DB 中 D | ✅ 已删 | 正确 |
-| 返回切片 | `[B, C]` | B 在 DB 中不存在 → 后续访问时 404 |
-| 运行状态 | 💥 **panic** | `i=3` 时 `links[:3]` 越界 |
-
-**核心问题链**：
-1. `i=0` 删 A → `[B,C,D]` 拷入 `arr[0..2]` → **B 移到 arr[0]**
-2. `i=1` 读 `arr[1]=C`（正常）→ **跳过 B** → **DB 漏删**
-3. 切片 Len 从 4→3→2，但 `i` 继续递增到 3 → **`links[:3]` 越界 panic**
+| 返回切片 | `[B, C]`（若 panic 前被截断则不确定） | B 在 DB 中不存在 → 后续访问 404 |
+| 运行状态 | 💥 **panic** | 进入了过期分支且 `i=3 >= links.Len=2` |
 
 ---
 
@@ -547,13 +519,11 @@ links[:3]   // ⚠️ 切片上界 3 > 当前 Len 2
 
 `links = [A(过期), B(过期), C(过期)]`, Len=3, Cap=3
 
-| i | link = arr[i] | 过期 | DB 删除 | 操作后 arr | 操作后 links.Len | 异常 |
-|---|--------------|------|---------|-----------|-----------------|------|
-| 0 | A | ✅ | Delete(A) ✅ | `[B,C,C]` | 2 | - |
-| 1 | arr[1] = **C** (原本是 B，被覆盖了) | ✅ | Delete(C) ✅ | `[B,C,C]` | 1 | ❌ **DB 漏删 B** |
-| 2 | arr[2] = C | ✅ | Delete(C) (幂等) | - | 1 | 💥 `links[:2]` 越界 |
-
-最终：B 在 DB 残留，返回 `[B]`，panic 或 返回错误数据。
+| i | link = arr[i] | 过期 | 进入 if | DB 删除 | 操作后 arr | 操作后 links.Len | 异常 |
+|---|--------------|------|---------|---------|-----------|-----------------|------|
+| 0 | A | ✅ | ✅ | Delete(A) ✅ | `[B,C,C]` | 3→2 | - |
+| 1 | arr[1] = **C**<br>（原本是 B，被覆盖） | ✅ | ✅ | Delete(C) ✅ | `[B,C,C]` | 2→1 | ❌ **DB 漏删 B**<br>（B 在 arr[0]，被跳过） |
+| 2 | arr[2] = C | ✅ | ✅ | Delete(C)（幂等） | - | 1 | 💥 `i=2 >= Len=1`<br>进入过期分支 → panic |
 
 ---
 
@@ -561,13 +531,44 @@ links[:3]   // ⚠️ 切片上界 3 > 当前 Len 2
 
 `links = [A(过期), B(正常), C(过期)]`, Len=3, Cap=3
 
-| i | link = arr[i] | 过期 | DB 删除 | 操作后 arr | 操作后 links.Len | 异常 |
-|---|--------------|------|---------|-----------|-----------------|------|
-| 0 | A | ✅ | Delete(A) ✅ | `[B,C,C]` | 2 | - |
-| 1 | arr[1] = **C** (原本是 B，被覆盖了！) | ✅ | Delete(C) ✅ | `[B,C,C]` | 1 | ❌ **本应检查 B，实际检查了 C**<br>❌ **C 的过期判断结果被用于了原本 B 的位置** |
-| 2 | arr[2] = C | ✅ | Delete(C) | - | 1 | 💥 `links[:2]` 越界 |
+| i | link = arr[i] | 过期 | 进入 if | DB 删除 | 操作后 arr | 操作后 links.Len | 异常 |
+|---|--------------|------|---------|---------|-----------|-----------------|------|
+| 0 | A | ✅ | ✅ | Delete(A) ✅ | `[B,C,C]` | 3→2 | - |
+| 1 | arr[1] = **C**<br>（原本是 B，被覆盖！） | ✅ | ✅ | Delete(C) ✅ | `[B,C,C]` | 2→1 | ❌ **原 B 没被检查**（B 移到 arr[0]）<br>❌ **C 被提前删了**（本应在 i=2 被检查） |
+| 2 | arr[2] = C | ✅ | ✅ | Delete(C)（幂等） | - | 1 | 💥 `i=2 >= Len=1`<br>进入过期分支 → panic |
 
-**非连续过期同样出问题**：即使中间有正常元素，`i=1` 读到的也是 `arr[1]=C` 而非原本的 B。
+**关键**：即使原本是「正常」的 B 夹在中间，数组被改写后实际读到的是 C。但如果 B 是正常的且恰好移到 arr[0]，它仍然没被检查——不过因为它本来就不该删，所以 DB 层面不会出错。真正危险的是**过期元素移到已检查索引**导致漏删。
+
+---
+
+#### 复现场景 D：删一次后后续全正常 → **不 panic**
+
+`links = [A(过期), B(正常), C(正常), D(正常)]`, Len=4, Cap=4
+
+| i | link = arr[i] | 过期 | 进入 if | DB 删除 | 操作后 arr | 操作后 links.Len | 异常 |
+|---|--------------|------|---------|---------|-----------|-----------------|------|
+| 0 | A | ✅ | ✅ | Delete(A) ✅ | `[B,C,D,D]` | 4→3 | - |
+| 1 | arr[1] = **C**<br>（原 B 移到 arr[0]，C 移到 arr[1]） | ❌ 正常 | ❌ 不进入 | - | 不变 | 3 | - |
+| 2 | arr[2] = **D**<br>（原 C 移到 arr[2]...不对，原 D 在 arr[3]，此处 arr[2]=D） | ❌ 正常 | ❌ 不进入 | - | 不变 | 3 | - |
+| 3 | arr[3] = **D** | ❌ 正常 | ❌ 不进入 | - | 不变 | 3 | ✅ **不 panic** |
+
+**为什么不 panic**：i=1、2、3 都**没有进入过期分支**，所以都不执行 `links[:i]`，就不会触发边界检查。即使 `links.Len=3` 而 `i=3`，只要不执行切片操作，就不会 panic。
+
+**但仍然有问题**：
+- 原 B 移到了 arr[0]，没有被检查 → 但它本来就是正常的，所以 DB 没问题
+- 返回切片是 `[B,C,D]`（links.Len=3，对应 arr[0..2] = [B,C,D]）
+- 实际上这个返回切片恰好是对的——但这是巧合，是因为 B 本来就正常
+
+---
+
+### 🎯 从 range + append 严格可推出的结论总结
+
+| 结论 | 推导依据 | 是否一定发生 |
+|------|---------|-------------|
+| ❌ **可能漏删 DB 过期项** | 删除第 i 项 → `arr[i+1..]` 左移一位到 `arr[i..]` → 原本应在 i+1 被检查的元素移到了 i（已检查过的位置）→ 下次 i++ 跳过它 | **连续过期时一定发生**（第 2、4、6... 个漏删） |
+| ❌ **返回切片可能残留过期项** | 漏删的 DB 过期项，其指针仍在返回切片中（如场景 A 的 B）→ 后续按 hash 访问会得到 404/空 | **伴随漏删发生** |
+| 💥 **可能 panic** | 条件链：`i >= links.Len` **并且** `arr[i]` 判断为过期 **并且** 进入 if 分支执行 `links[:i]` → 越界 | **条件性发生**：需要「删过至少一次」+「后续又遇到过期项且 i 超限」 |
+| ✅ **未进入过期分支就不 panic** | `links[:i]` 只在 if 内，不进 if 就不做切片边界检查 | 严格成立（场景 D 证明） |
 
 ---
 
@@ -575,21 +576,13 @@ links[:3]   // ⚠️ 切片上界 3 > 当前 Len 2
 
 | API 端点 | 调用的方法 | 影响程度 |
 |----------|-----------|---------|
-| `GET /api/shares` | `All()` [share/storage.go#L32-L49](share/storage.go#L32-L49) | 🔴 严重 - DB 漏删 + 返回数据错乱 + 可能 panic |
+| `GET /api/shares` | `All()` [share/storage.go#L32-L49](share/storage.go#L32-L49) | 🔴 严重 - DB 漏删过期项 + 返回残留过期项 + 条件性 panic |
 | `GET /api/share/{path}` | `Gets()` [share/storage.go#L94-L111](share/storage.go#L94-L111) | 🔴 严重 - 同上 |
 | `GetsByPath()` [share/storage.go#L113-L128](share/storage.go#L113-L128) | 内部调用 `All()` | 🔴 严重 - 同上 |
 | `GET /api/public/share/{hash}` | `GetByHash()` [share/storage.go#L72-L86](share/storage.go#L72-L86) | 🟢 安全 - 单条查询无循环 |
 | 删除文件级联 | `DeleteWithPathPrefix()` [storage/bolt/share.go#L80-L104](storage/bolt/share.go#L80-L104) | 🟢 安全 - Bolt 底层实现，不经过 Storage 包装层 |
 
-#### 实际表现总结
-
-| 现象 | 说明 |
-|------|------|
-| ❌ **DB 漏删** | 连续过期时第 2、4、6… 个元素会被跳过（移动到已检查的索引位置） |
-| ❌ **DB 误删** | 非连续时正常元素的位置可能被过期元素覆盖，导致用错对象判断 |
-| ❌ **返回切片错乱** | 返回切片中可能包含 DB 中已删除的元素，或漏掉本应保留的元素 |
-| 💥 **Runtime Panic** | 只要发生过删除（Len 缩短），后续 `i >= links.Len` 就会触发 `slice bounds out of range` |
-| 🔄 **最终一致性** | 如果没 panic，下次调用重新从 DB 读取，可能进一步清理部分残留，但仍可能漏删 |
+---
 
 #### 修复方案
 
@@ -613,7 +606,7 @@ return filtered, nil
 
 **方案 B：反向遍历（最小改动）**
 
-从后往前遍历，删除元素只影响未检查的索引（因为它们在已检查索引的前面）：
+从后往前遍历，删除元素左移只会影响未检查的索引（它们在已检查索引的前面）：
 
 ```go
 for i := len(links) - 1; i >= 0; i-- {
@@ -714,7 +707,7 @@ type Link struct {
 | 8 | checkerPrefix 规则补偿 | [http/data.go#L42-L43](http/data.go#L42-L43) | 分享子目录绕过所有者 deny 规则 |
 | 9 | 删除分享只能本人或 Admin | [http/share.go#L92-L93](http/share.go#L92-L93) | 普通用户删别人的分享 |
 | 10 | DeleteWithPathPrefix 精确路径 + UserID 过滤 | [storage/bolt/share.go#L93-L99](storage/bolt/share.go#L93-L99) | 删除级联误删他人链接 |
-| 11 | ⚠️ range 遍历 + 原地修改切片 | [share/storage.go#L39-L46](share/storage.go#L39-L46) | DB 漏删过期链接 + 返回切片错乱 + runtime panic（待修复） |
+| 11 | ⚠️ range 遍历 + 原地修改切片 | [share/storage.go#L39-L46](share/storage.go#L39-L46) | DB 漏删过期项 + 返回残留过期项 + 条件性 panic（待修复） |
 
 ---
 

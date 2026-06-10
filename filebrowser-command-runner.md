@@ -558,48 +558,347 @@ export default function command(url, command, onmessage, onclose) {
 
 ---
 
-## 五、输出返回对比
+## 五、输出返回与错误处理链路（代码核准）
 
-### 5.1 两大模式对比
+### 5.1 返回值的传递机制
 
-| 维度 | 事件钩子模式 | 交互式 Shell 模式 |
-|------|-------------|------------------|
-| **传输方式** | `os.Stdout` / `os.Stderr`（落服务器日志） | WebSocket `TextMessage`（实时推前端） |
-| **输出采集** | 不采集，直接打印 | `StdoutPipe` + `StderrPipe` 逐行读取 |
-| **错误影响** | before/阻塞模式错误会**终止主操作** | 仅在前端显示，无副作用 |
-| **可用环境变量** | `$FILE` `$SCOPE` `$TRIGGER` `$USERNAME` `$DESTINATION` | 无（仅继承系统环境） |
-| **CWD** | 未显式设置（继承 FileBrowser 进程） | `cmd.Dir = 用户当前浏览路径` |
-| **异步支持** | 命令末尾加 `&` | 否（WebSocket 生命周期内同步等待） |
+所有 HTTP handler 函数签名为 `func(w, r, d) (int, error)`，返回值由 [handle()](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/http/data.go#L66-L101) 中间件统一处理：
+
+```go
+// data.go:78-97
+status, err := fn(w, r, &data{...})
+
+if status >= 400 || err != nil {
+    log.Printf("%s: %v %s %v", r.URL.Path, status, clientIP, err)
+}
+
+if status != 0 {
+    txt := http.StatusText(status)
+    if status == http.StatusBadRequest && err != nil {
+        txt += " (" + err.Error() + ")"
+    }
+    http.Error(w, strconv.Itoa(status)+" "+txt, status)
+    return
+}
+// status == 0 时不写任何错误响应，handler 自行写正常响应
+```
+
+**关键逻辑**：
+- `status != 0` → 写 HTTP 错误响应（`http.Error` 会设置 Content-Type 和 body）
+- `status == 0` → 不写错误响应，handler 自行处理正常响应体
+- `err != nil` 且 `status >= 400` → 打印日志（但日志不影响响应内容，只用于服务端排查）
+- **handler 返回的 status 决定了一切**，err 只影响日志和 400 状态码的 body 细节
 
 ---
 
-### 5.2 各操作的输出返回链路详解
+### 5.2 各操作成功时的完整返回链路
 
-#### 5.2.1 事件钩子命令输出路径
+#### 🔹 普通上传（POST）成功
+
+[resourcePostHandler](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/http/resource.go#L125-L178) 成功路径：
 
 ```
-                    Runner.exec()
-  ┌───────────────────────────────────────────────┐
-  │                                               │
-  │  cmd.Stdin  = os.Stdin                        │
-  │  cmd.Stdout = os.Stdout  ────►  服务器 stdout │
-  │  cmd.Stderr = os.Stderr  ────►  服务器 stderr │
-  │                                               │
-  │  阻塞模式: cmd.Run()                          │
-  │    命令退出码 != 0 → 返回 error → 主操作中止   │
-  │                                               │
-  │  非阻塞模式 (&): cmd.Start()                  │
-  │    go func() { cmd.Wait() }                   │
-  │    失败仅打日志，不影响主流程                  │
-  └───────────────────────────────────────────────┘
+d.RunHook(fn, "upload", ..., d.user)  → 返回 nil
+    ↓
+err == nil
+    ↓
+不执行 RemoveAll 回滚
+    ↓
+return errToStatus(nil), nil           → (200, nil)
+    ↓
+handle() 中 status == 0 → 不调用 http.Error
+    ↓
+但等一下——handler 内部已通过 fn 设置了 ETag header
+    ↓
+前端实际收到的响应：HTTP 200 + ETag header + 无 body
 ```
 
-**代码位置**：[runner.go:99-117](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/runner/runner.go#L99-L117)
+**⚠️ 修正说明**：`errToStatus(nil)` 返回 `http.StatusOK` 即 `200`，不是 `0`。
+
+再仔细看 `handle()` 中 `status != 0` 时会调用 `http.Error`，所以实际上当 `errToStatus(err)` 返回 `200` 时，**也会走到 `http.Error` 分支**！
 
 ```go
-cmd.Stdin = os.Stdin
-cmd.Stdout = os.Stdout
-cmd.Stderr = os.Stderr
+// errToStatus(nil) → 200
+// handle() 中: status != 0 → true (200 != 0)
+// → http.Error(w, "200 OK", 200)
+```
+
+这意味着**普通上传成功时返回的是 HTTP 200 + body "200 OK"**，而非无 body 的 200。但 handler 内部在 `fn` 中已通过 `w.Header().Set("ETag", ...)` 设置了 ETag 头（[resource.go:167-168](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/http/resource.go#L167-L168)），ETag 仍会出现在响应中。
+
+#### 🔹 保存（PUT）成功
+
+[resourcePutHandler](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/http/resource.go#L180-L210) 成功路径完全同上传：
+
+```
+d.RunHook(fn, "save", ..., d.user) → nil
+    ↓
+return errToStatus(nil), nil         → (200, nil)
+    ↓
+http.Error(w, "200 OK", 200) + ETag header
+```
+
+#### 🔹 删除（DELETE）成功
+
+[resourceDeleteHandler](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/http/resource.go#L84-L123) 成功路径：
+
+```
+d.RunHook(fn, "delete", ..., d.user) → nil
+    ↓
+return http.StatusNoContent, nil      → (204, nil)
+    ↓
+handle() 中: status != 0 → http.Error(w, "204 No Content", 204)
+```
+
+#### 🔹 复制/重命名（PATCH）成功
+
+[resourcePatchHandler](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/http/resource.go#L212-L262) 成功路径：
+
+```
+d.RunHook(fn, action, ..., d.user) → nil
+    ↓
+return errToStatus(nil), nil         → (200, nil)
+    ↓
+http.Error(w, "200 OK", 200)
+```
+
+#### 🔹 分片上传（TUS PATCH）成功
+
+[tusPatchHandler](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/http/tus_handlers.go#L156-L239) 成功路径：
+
+```
+文件写入完成 + newOffset >= uploadLength
+    ↓
+cache.Complete(file.RealPath())
+_ = d.RunHook(func() error { return nil }, "upload", ..., d.user)
+    ↓
+return http.StatusNoContent, nil      → (204, nil)
+    ↓
+http.Error(w, "204 No Content", 204)
+    ↑ 前面还设置了 Upload-Offset header
+```
+
+**分片上传中间片段**（`newOffset < uploadLength`）：
+
+```
+不触发 RunHook
+    ↓
+return http.StatusNoContent, nil      → (204, nil)
+```
+
+---
+
+### 5.3 RunHook 中 before 和 after 命令失败的返回差异
+
+[RunHook](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/runner/runner.go#L21-L53) 的完整逻辑：
+
+```go
+func (r *Runner) RunHook(fn func() error, evt, path, dst string, user *users.User) error {
+    path = user.FullPath(path)
+    dst = user.FullPath(dst)
+
+    // ──── 第一阶段：before 命令 ────
+    if r.Enabled {
+        if val, ok := r.Commands["before_"+evt]; ok {
+            for _, command := range val {
+                err := r.exec(command, "before_"+evt, path, dst, user)
+                if err != nil {
+                    return err    // ← before 失败：fn() 不会执行
+                }
+            }
+        }
+    }
+
+    // ──── 第二阶段：主操作 ────
+    err := fn()
+    if err != nil {
+        return err            // ← 主操作失败：after 不会执行
+    }
+
+    // ──── 第三阶段：after 命令 ────
+    if r.Enabled {
+        if val, ok := r.Commands["after_"+evt]; ok {
+            for _, command := range val {
+                err := r.exec(command, "after_"+evt, path, dst, user)
+                if err != nil {
+                    return err    // ← after 失败：主操作已完成
+                }
+            }
+        }
+    }
+
+    return nil
+}
+```
+
+#### before 命令失败 vs after 命令失败的关键差异
+
+| 维度 | before 失败 | after 失败 |
+|------|-----------|----------|
+| **fn() 是否执行** | ❌ 否——fn() 被完全跳过 | ✅ 是——fn() 已成功执行 |
+| **文件系统状态** | 原始状态不变（主操作未发生） | 主操作已生效（文件已写入/删除/移动） |
+| **RunHook 返回** | `exec()` 的 error | `exec()` 的 error |
+| **errToStatus 映射** | `500 Internal Server Error`（默认分支） | `500 Internal Server Error`（默认分支） |
+| **对客户端的表象** | 看起来是"操作没发生 + 500" | 看起来是"操作没发生 + 500"，**但实际已生效** |
+| **数据一致性** | ✅ 安全——客户端看到 500 后重试没问题 | ⚠️ 不一致——客户端可能因 500 重试，但操作已完成 |
+
+> **⚠️ 重要的数据一致性风险**：after 钩子失败时，主操作已完成但返回 500，客户端可能重试导致重复操作。这在删除场景中无影响（文件已删，重试只会 404），但在复制场景中会导致重复文件。
+
+---
+
+### 5.4 各操作的错误返回完整链路（代码逐行核准）
+
+#### 🔹 删除（DELETE）—— before/after 失败
+
+```go
+// resource.go:113-119
+err = d.RunHook(func() error {
+    return d.user.Fs.RemoveAll(r.URL.Path)       // 主操作
+}, "delete", r.URL.Path, "", d.user)
+
+if err != nil {
+    return errToStatus(err), err                  // → (500, exec.ExitError)
+}
+return http.StatusNoContent, nil                  // → (204, nil)
+```
+
+| 场景 | RunHook 返回 | handler 返回 | HTTP 响应 | 文件状态 |
+|------|-------------|-------------|----------|---------|
+| before_delete 阻塞命令失败 | exec error | `(500, error)` | `500 Internal Server Error` | 文件保留 ✅ |
+| before_delete 非阻塞命令 `cmd.Start()` 失败 | exec error | `(500, error)` | `500 Internal Server Error` | 文件保留 ✅ |
+| 主操作 RemoveAll 失败 | fn() error | `(errToStatus(err), error)` | 取决于错误类型 | 不确定 |
+| after_delete 阻塞命令失败 | exec error | `(500, error)` | `500 Internal Server Error` | 文件已删 ⚠️ |
+| after_delete 非阻塞命令 `cmd.Start()` 失败 | exec error | `(500, error)` | `500 Internal Server Error` | 文件已删 ⚠️ |
+| 全部成功 | nil | `(204, nil)` | `204 No Content` | 文件已删 |
+
+**非阻塞命令的特殊情况**：命令末尾加 `&` 时，`cmd.Start()` 失败（如可执行文件不存在）仍会返回 error，但 `cmd.Start()` 成功后的 `cmd.Wait()` 失败不会返回 error（仅在 goroutine 中打印日志）。
+
+---
+
+#### 🔹 普通上传（POST）—— before/after 失败
+
+```go
+// resource.go:161-176
+err = d.RunHook(func() error {
+    info, writeErr := writeFile(d.user.Fs, r.URL.Path, r.Body, ...)
+    if writeErr != nil { return writeErr }
+    w.Header().Set("ETag", etag)
+    return nil
+}, "upload", r.URL.Path, "", d.user)
+
+if err != nil {
+    _ = d.user.Fs.RemoveAll(r.URL.Path)           // 失败回滚
+}
+
+return errToStatus(err), err
+```
+
+| 场景 | RunHook 返回 | handler 返回 | HTTP 响应 | 文件状态 |
+|------|-------------|-------------|----------|---------|
+| before_upload 命令失败 | exec error | `(500, error)` | `500 Internal Server Error` | 文件不存在（fn 未执行），回滚 RemoveAll 无害 |
+| 主操作 writeFile 失败 | fn() error | `(errToStatus(err), error)` | 取决于错误类型 | RemoveAll 尝试清理可能残留的半成文件 |
+| after_upload 命令失败 | exec error | `(500, error)` | `500 Internal Server Error` | 文件已写入 + **RemoveAll 回滚删掉它** ⚠️ |
+| 全部成功 | nil | `(200, nil)` | `200 OK` + ETag | 文件已创建 |
+
+> **⚠️ 上传场景的隐蔽行为**：after_upload 钩子失败时，`err != nil` → 执行 `RemoveAll` 删除文件。这意味着一个 after 钩子的失败会导致**已经成功写入的文件被删除**。这可能不是预期行为——文件写入成功，但因 after 通知命令失败而回滚。
+
+---
+
+#### 🔹 保存（PUT）—— before/after 失败
+
+```go
+// resource.go:198-209
+err = d.RunHook(func() error {
+    info, writeErr := writeFile(d.user.Fs, r.URL.Path, r.Body, ...)
+    if writeErr != nil { return writeErr }
+    w.Header().Set("ETag", etag)
+    return nil
+}, "save", r.URL.Path, "", d.user)
+
+return errToStatus(err), err                        // 无回滚
+```
+
+| 场景 | RunHook 返回 | handler 返回 | HTTP 响应 | 文件状态 |
+|------|-------------|-------------|----------|---------|
+| before_save 命令失败 | exec error | `(500, error)` | `500 Internal Server Error` | 原文件保留 ✅ |
+| 主操作 writeFile 失败 | fn() error | `(errToStatus(err), error)` | 取决于错误类型 | 原文件可能已被截断破坏 ⚠️ |
+| after_save 命令失败 | exec error | `(500, error)` | `500 Internal Server Error` | 新内容已写入，无回滚 ⚠️ |
+| 全部成功 | nil | `(200, nil)` | `200 OK` + ETag | 文件已更新 |
+
+> **注意**：PUT 保存**没有回滚逻辑**（不像 POST 上传有 RemoveAll）。`writeFile` 使用 `O_RDWR|O_O_CREATE|O_TRUNC`（[resource.go:303](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/http/resource.go#L303)），会先截断文件再写入。如果写入中途失败，原文件内容已丢失。
+
+---
+
+#### 🔹 复制/重命名（PATCH）—— before/after 失败
+
+```go
+// resource.go:256-261
+err = d.RunHook(func() error {
+    return patchAction(r.Context(), action, src, dst, d, fileCache)
+}, action, src, dst, d.user)
+
+return errToStatus(err), err                        // 无回滚
+```
+
+| 场景 | RunHook 返回 | handler 返回 | HTTP 响应 | 文件状态 |
+|------|-------------|-------------|----------|---------|
+| before_copy/rename 失败 | exec error | `(500, error)` | `500 Internal Server Error` | 原文件不变 ✅ |
+| 主操作 patchAction 失败 | fn() error | `(errToStatus(err), error)` | 取决于错误类型 | 不确定 |
+| after_copy 失败 | exec error | `(500, error)` | `500 Internal Server Error` | 目标文件已创建，无回滚 ⚠️ |
+| after_rename 失败 | exec error | `(500, error)` | `500 Internal Server Error` | 文件已移动，无回滚 ⚠️ |
+| 全部成功 | nil | `(200, nil)` | `200 OK` | 操作完成 |
+
+---
+
+#### 🔹 分片上传（TUS PATCH）—— 钩子失败的实际影响
+
+```go
+// tus_handlers.go:229-237
+newOffset := uploadOffset + bytesWritten
+w.Header().Set("Upload-Offset", strconv.FormatInt(newOffset, 10))
+
+if newOffset >= uploadLength {
+    cache.Complete(file.RealPath())
+    _ = d.RunHook(func() error { return nil }, "upload", r.URL.Path, "", d.user)
+}
+
+return http.StatusNoContent, nil                    // ← 无论钩子成败都走这里
+```
+
+**逐行分析**：
+
+1. 文件数据已在 [tus_handlers.go:218](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/http/tus_handlers.go#L218) 处通过 `io.Copy(openFile, r.Body)` 写入并 Sync
+2. `cache.Complete()` 已标记上传完成
+3. `_ = d.RunHook(...)` 用 `_` 显式丢弃返回值
+4. `return http.StatusNoContent, nil` **无条件执行**
+
+| 场景 | RunHook 返回 | handler 返回 | HTTP 响应 | 文件状态 |
+|------|-------------|-------------|----------|---------|
+| before_upload 阻塞命令失败 | exec error（被 `_` 丢弃） | `(204, nil)` | `204 No Content` | 文件已写入，缓存已标记完成 |
+| before_upload 非阻塞命令失败 | exec error（被 `_` 丢弃） | `(204, nil)` | `204 No Content` | 同上 |
+| after_upload 阻塞命令失败 | exec error（被 `_` 丢弃） | `(204, nil)` | `204 No Content` | 同上 |
+| 钩子全部成功 | nil（被 `_` 丢弃） | `(204, nil)` | `204 No Content` | 文件已写入 |
+| 中间分片（未触发钩子） | — | `(204, nil)` | `204 No Content` | 数据追加写入 |
+
+**分片上传钩子失败的本质**：
+- **文件不受影响**——数据早已写入并同步到磁盘
+- **客户端不受影响**——始终收到 204
+- **钩子命令的 stdout/stderr 仍会输出到服务器日志**——因为 `exec()` 中 `cmd.Stdout = os.Stdout`
+- **但钩子命令的失败无法传播到客户端或阻止操作完成**
+- 这与普通上传（POST）形成鲜明对比：POST 中 after_upload 失败会触发 RemoveAll 删除文件
+
+---
+
+### 5.5 非阻塞命令（`&` 后缀）的失败行为
+
+[exec()](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/runner/runner.go#L55-L118) 中非阻塞模式的关键逻辑：
+
+```go
+if strings.HasSuffix(raw, "&") {
+    blocking = false
+    raw = strings.TrimSpace(strings.TrimSuffix(raw, "&"))
+}
+
+// ...解析命令...
 
 if !blocking {
     log.Printf("[INFO] Nonblocking Command: \"%s\"", strings.Join(command, " "))
@@ -611,52 +910,52 @@ if !blocking {
             }
         }()
     }()
-    return cmd.Start()
+    return cmd.Start()    // ← 只返回 Start 的错误
 }
-
-log.Printf("[INFO] Blocking Command: \"%s\"", strings.Join(command, " "))
-return cmd.Run()
 ```
+
+| 失败点 | 阻塞模式 | 非阻塞模式（`&`） |
+|--------|---------|------------------|
+| `cmd.Start()` 失败（如可执行文件不存在） | 返回 error → RunHook 中断 | 返回 error → RunHook 中断 |
+| `cmd.Run()` / `cmd.Wait()` 失败（命令执行出错） | 返回 error → RunHook 中断 | **仅打日志**，RunHook 继续 ✅ |
+| 对主操作的影响 | before 失败会阻止 fn() 执行 | Start 失败阻止，Wait 失败**不阻止** |
+
+**这意味着**：非阻塞命令只要能成功启动（`cmd.Start()` 返回 nil），即使命令实际执行失败（exit code != 0），也不会影响后续流程。
 
 ---
 
-#### 5.2.2 各操作的错误返回路径
+### 5.6 errToStatus 映射表
 
-| 操作 | 命令失败时的处理 | 代码位置 |
-|------|-----------------|---------|
-| **删除** | `before_delete` 失败 → 文件不删，返回错误<br>`after_delete` 失败 → 文件已删，仍返回错误 | [resource.go:117-119](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/http/resource.go#L117-L119) |
-| **普通上传** | 任一阶段失败 → 先 `RemoveAll` 清理半成文件，再返回错误 | [resource.go:172-174](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/http/resource.go#L172-L174) |
-| **保存** | 任一阶段失败 → 直接返回错误（原文件可能已被破坏） | [resource.go:209](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/http/resource.go#L209) |
-| **复制** | `before_copy` 失败 → 不复制<br>`after_copy` 失败 → 已复制，返回错误 | [resource.go:260](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/http/resource.go#L260) |
-| **重命名** | `before_rename` 失败 → 不重命名<br>`after_rename` 失败 → 已重命名，返回错误 | [resource.go:260](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/http/resource.go#L260) |
-| **分片上传** | 钩子错误被 `_` 忽略！<br>`_ = d.RunHook(...)` → 始终返回 HTTP 204 | [tus_handlers.go:234](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/http/tus_handlers.go#L234) |
+[errToStatus](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/http/utils.go#L30-L51) 函数将不同错误类型映射为 HTTP 状态码：
 
-> **⚠️ 重要提示**：分片上传完成时的钩子错误被显式忽略了（`_ = d.RunHook(...)`），这意味着即使 `before_upload` 或 `after_upload` 钩子执行失败，API 仍会返回 `204 No Content`，客户端不会感知到错误。这是与普通上传（POST）的关键区别。
+```go
+func errToStatus(err error) int {
+    switch {
+    case err == nil:                          → 200 OK
+    case os.IsPermission(err):                → 403 Forbidden
+    case os.IsNotExist(err):                  → 404 Not Found
+    case os.IsExist(err):                     → 409 Conflict
+    case errors.Is(err, ErrPermissionDenied): → 403 Forbidden
+    case errors.Is(err, ErrInvalidRequestParams): → 400 Bad Request
+    case errors.Is(err, ErrRootUserDeletion): → 403 Forbidden
+    case errors.Is(err, ErrImageTooLarge):    → 413 Request Entity Too Large
+    default:                                  → 500 Internal Server Error
+    }
+}
+```
+
+**钩子命令执行错误（`*exec.ExitError`）**不属于以上任何特定类型，**始终走 default 分支 → 500**。
+
+这也意味着钩子失败时，`handle()` 中间件会打印日志：
+```
+/api/resources/test.txt: 500 127.0.0.1 exit status 1
+```
+
+但客户端收到的 body 只有 `500 Internal Server Error`，**不包含具体的钩子失败原因**（只有 400 状态码才会追加 err 信息到 body）。
 
 ---
 
-#### 5.2.3 HTTP 状态码映射
-
-命令错误通过 `errToStatus(err)` 函数映射为 HTTP 状态码，最终返回给前端：
-
-```
-命令执行错误（os/exec.ExitError）
-    │
-    ▼
-errToStatus(err) ───► http.StatusInternalServerError (500)
-    │
-    ▼
-http.Error(w, "500 Internal Server Error (exit status 1)", 500)
-```
-
-同时服务器日志会记录：
-```
-202X/XX/XX XX:XX:XX /api/resources/test.txt: 500 127.0.0.1 exit status 1
-```
-
----
-
-#### 5.2.4 交互式 Shell 输出路径
+### 5.7 交互式 Shell 的输出返回
 
 ```
        commandsHandler (WebSocket)
@@ -678,9 +977,15 @@ http.Error(w, "500 Internal Server Error (exit status 1)", 500)
 └──────────────────────────────────────────────┘
 ```
 
-**代码位置**：[commands.go:91-117](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/http/commands.go#L91-L117)
+**代码位置**：[commands.go:88-117](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/http/commands.go#L88-L117)
 
-**前端接收**（[Shell.vue:177-189](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/frontend/src/components/Shell.vue#L177-L189)）：
+**与事件钩子的关键区别**：
+- 交互式 Shell 用 `StdoutPipe` / `StderrPipe` 采集输出推给前端
+- 事件钩子用 `os.Stdout` / `os.Stderr` 直接打印到服务器日志
+- 交互式 Shell 的命令失败仅在前端显示，不影响任何文件操作
+- 交互式 Shell 的命令工作目录为 `cmd.Dir = d.user.FullPath(r.URL.Path)`（当前浏览路径）
+
+**前端接收**（[Shell.vue:174-189](file:///d:/fz/0601/solo-dogfeeding/code/171-filebrowser/frontend/src/components/Shell.vue#L174-L189)）：
 ```js
 commands(
   this.path,
@@ -693,24 +998,24 @@ commands(
     results.text = results.text
       .replace(/\u001b\[[0-9;]+m/g, "")  // 过滤 ANSI 颜色码
       .trimEnd();
-    this.canInput = true;
+    this.canInput = true;                 // 解锁输入
   }
 );
 ```
 
 ---
 
-### 5.3 关键差异总结表
+### 5.8 关键差异总结表
 
-| 操作 | before 失败影响 | after 失败影响 | 失败回滚 | 输出去向 |
-|------|----------------|---------------|---------|---------|
-| **删除** | ❌ 文件保留 | ❌ 文件已删 | 无 | 服务器日志 |
-| **普通上传** | ❌ 文件不建 | ✅ 已创建的文件会被删除 | `RemoveAll` 清理 | 服务器日志 |
-| **保存** | ❌ 文件保留 | ❌ 文件可能已破坏 | 无 | 服务器日志 |
-| **复制** | ❌ 不复制 | ❌ 文件已复制 | 无 | 服务器日志 |
-| **重命名** | ❌ 不重命名 | ❌ 文件已重命名 | 无 | 服务器日志 |
-| **分片上传** | ⚠️ 文件已写入，错误被忽略 | ⚠️ 文件已写入，错误被忽略 | 无 | 服务器日志 |
-| **交互式 Shell** | — | — | — | 前端终端 |
+| 操作 | before 失败 → 文件状态 | after 失败 → 文件状态 | 失败回滚 | 成功状态码 | 失败状态码 |
+|------|----------------------|---------------------|---------|----------|----------|
+| **删除** | 保留 ✅ | 已删 ⚠️ | 无 | 204 | 500 |
+| **普通上传** | 不存在 ✅ | **已写入但被 RemoveAll 删除** ⚠️ | RemoveAll | 200 | 500 |
+| **保存** | 保留 ✅ | 已覆写（无回滚）⚠️ | 无 | 200 | 500 |
+| **复制** | 未复制 ✅ | 已复制（无回滚）⚠️ | 无 | 200 | 500 |
+| **重命名** | 未重命名 ✅ | 已重命名（无回滚）⚠️ | 无 | 200 | 500 |
+| **分片上传** | 已写入（错误被 `_` 忽略）⚠️ | 已写入（错误被 `_` 忽略）⚠️ | 无 | 204 | **始终 204** |
+| **交互式 Shell** | — | — | — | WebSocket 关闭 | 前端显示 |
 
 ---
 

@@ -155,9 +155,9 @@ const logoutPage: string = window.FileBrowser.LogoutPage;
 > |---------|---------|---------|------|
 > | `initAuth()` 分支 | `loginPage` (bool) | `ProxyAuth.LoginPage()` → 恒 `false`，**与 logoutPage 无关** | 走 `login("", "", "")` 空凭据登录获取 Token |
 > | `parseToken()` 计时器禁用 | `authMethod` + `logoutPage` | `authMethod==="proxy" && logoutPage!=="/login"` | 禁用前端空闲登出计时器 |
-> | `renewableErr()` 过期宽容 | `AuthMethod` + `LogoutPage` + `err` | proxy + 自定义登出页 + 仅 Token 过期 | 后端放行过期 JWT |
+> | `renewableErr()` 过期宽容 | `AuthMethod` + `LogoutPage` + `err` | proxy + 自定义登出页 + 仅 Token 过期 | 后端放行过期 JWT，才能到达 L98 刷新检测 |
 >
-> **核心区别**：`initAuth()` 是否显示登录页只取决于**认证器类型**（Proxy 认证永远不显示登录页），而计时器禁用和过期宽容还额外要求**配置了自定义登出页**（暗示外部有 SSO 统一会话管理）。因此 Proxy+默认登出页场景下，前端仍会走空凭据登录获取 Token，但计时器不会被禁用，过期 JWT 也不会被后端宽容放行。
+> **核心区别**：`initAuth()` 是否显示登录页只取决于**认证器类型**（Proxy 认证永远不显示登录页），而计时器禁用和过期宽容还额外要求**配置了自定义登出页**（暗示外部有 SSO 统一会话管理）。因此 Proxy+默认登出页场景下，前端仍会走空凭据登录获取 Token，但计时器不会被禁用，过期 JWT 也不会被后端宽容放行（直接 401），L98 的 `expiresSoon` 刷新检测对过期 Token 根本不可达。
 
 **签发路径完整流程图**：
 
@@ -229,11 +229,13 @@ func withUser(fn handleFunc) handleFunc {
         // jwt-go/v5 只要签名正确，即使过期也会把 claims 解析进 tk，
         // 只是 token.Valid==false 且 err==jwt.ErrTokenExpired。
         // 此时 renewableErr() 可以决定是否放行。
+        // ★ 关键：此判断在刷新检测之前——不过校验就直接 401 返回，
+        //   后续 L98-103 的刷新检测代码不会执行。
         if (err != nil || !token.Valid) && !renewableErr(err, d) {
-            return http.StatusUnauthorized, nil  // 401 未授权
+            return http.StatusUnauthorized, nil  // 401 未授权，提前返回
         }
 
-        // ─── 刷新检测（即使过期宽容通过也执行，见下节） ───
+        // ─── 刷新检测（只有校验通过/被放行后才执行） ───
         expiresSoon := tk.ExpiresAt != nil && time.Until(tk.ExpiresAt.Time) < time.Hour
         updated := tk.IssuedAt != nil && tk.IssuedAt.Unix() < d.store.Users.LastUpdate(tk.User.ID)
         if expiresSoon || updated {
@@ -313,7 +315,9 @@ func renewableErr(err error, d *data) bool {
 - 但签名正确性仍严格校验，防止伪造 Token
 
 **过期令牌如何续签**：
-即使通过了 `renewableErr` 的宽容放行，`withUser` 中的刷新检测逻辑仍然执行：
+`expiresSoon` / `updated` 刷新检测代码在 `withUser` 的 L94 校验判断**之后**，只有通过校验（Token 有效 或 过期但被 `renewableErr` 放行）才能执行到 L98。**Proxy+默认登出页下过期 Token 在 L94 就返回 401，刷新检测根本不可达**。
+
+对 Proxy+自定义登出页（`renewableErr` 放行后）的刷新检测逻辑：
 1. **expiresSoon**：对已过期 Token，`time.Until(expiredTime)` 返回**负数**，而**负数 < 1 小时恒成立**，因此 `expiresSoon=true`
 2. **updated**：用户信息变更时仍会触发 `X-Renew-Token: true`
 3. 以上两个条件**任一满足**就会设置响应头 `X-Renew-Token: true`
@@ -338,9 +342,11 @@ withUser 中间件
               └─→ printToken() → 返回全新未过期 JWT
 ```
 
-> 这就是**过期令牌续签**的完整链条：服务端对过期 Token 放行（`renewableErr`）→ `expiresSoon=true` 几乎必然触发刷新提示（过期后恒成立）→ 前端发起 renew → renewHandler 凭借同样的过期宽容机制通过校验并签发新 Token。
+> 这就是**过期令牌续签**的完整链条（仅限 Proxy+自定义登出页场景）：服务端对过期 Token 放行（`renewableErr`）→ `expiresSoon=true` 几乎必然触发刷新提示（过期后负数 < 1h 恒成立）→ 前端发起 renew → renewHandler 凭借同样的过期宽容机制通过校验并签发新 Token。
 >
-> **修正前的错误理解**：曾认为过期 Token 的 `time.Until` 为负不会触发 `< time.Hour`，实际是**负数一定小于正数**，所以过期后 `expiresSoon` 恒为 `true`。
+> **历次修正**：
+> 1. 曾认为过期 Token 的 `time.Until` 为负不会触发 `< time.Hour`——实际**负数一定小于正数**，数学上 `expiresSoon` 恒为 `true`。
+> 2. 曾认为"数学恒成立 = 代码一定会执行"——实际 `expiresSoon` 判断（L98）在校验判断（L94）**之后**，**Proxy+默认登出页下过期 Token 在 L94 就返回 401，根本走不到 L98**。逻辑恒真 ≠ 代码可达。
 
 ### 2.5 校验路径完整流程图
 
@@ -356,14 +362,16 @@ withUser 中间件
     ├─→ jwt.NewParser(HS256 only, exp required)
     ├─→ request.ParseFromRequest() 解析出 tk + err
     ├─→ 校验分支：
-    │    ├─ err==nil && valid==true → 直接通过
+    │    ├─ err==nil && valid==true → 直接通过 → 进入刷新检测
     │    └─ 过期/无效 → 检查 renewableErr(err, d)：
-    │         ├─ 非 proxy → false → 401 Unauthorized
-    │         ├─ logoutPage=="default" → false → 401
-    │         ├─ 非 ErrTokenExpired → false → 401（签名错误不宽容）
-    │         └─ proxy + 自定义登出 + 仅过期 → true → ★ 放行过期 Token
-    ├─→ 刷新检测（expiresSoon || updated）→ X-Renew-Token 响应头
-    │    （过期 Token 的 expiresSoon 恒为 true，负数 < 1h）
+    │         ├─ 非 proxy → false → 401 Unauthorized ★
+    │         ├─ logoutPage=="default" → false → 401 ★
+    │         ├─ 非 ErrTokenExpired → false → 401（签名错误不宽容）★
+    │         └─ proxy + 自定义登出 + 仅过期 → true → ★ 放行 → 进入刷新检测
+    │    （★ 标记的 401 路径：L94 直接返回，后续刷新检测代码不执行）
+    ├─→ 刷新检测（仅校验通过后才到达，L98-103）
+    │    ├─ expiresSoon：未过期且<1h → true；被放行的过期 Token → 恒 true（负数<1h）
+    │    └─ updated：用户信息变更 → true
     ├─→ d.store.Users.Get() 从 DB 加载最新用户
     └─→ 执行业务处理函数
 ```
@@ -374,9 +382,17 @@ withUser 中间件
 
 ### 3.1 服务端主动提示刷新
 
-`withUser` 中间件在校验通过（含过期宽容）后，会检测两种需要刷新的条件（[http/auth.go](http/auth.go#L98-L103)）：
+`withUser` 中间件在校验通过（含过期宽容）后，会检测两种需要刷新的条件（[http/auth.go L98-L103](http/auth.go#L98-L103)）：
+
+> **关键前提**：刷新检测代码位于 L94 校验判断之后。只有通过校验（Token 有效 或 过期但被 `renewableErr` 放行）的请求才能到达此处。**过期 Token 在 Proxy+默认登出页场景下会先被 L94 返回 401，根本走不到刷新检测**。
 
 ```go
+// L94: 校验判断——不通过则直接 401 返回
+if (err != nil || !token.Valid) && !renewableErr(err, d) {
+    return http.StatusUnauthorized, nil  // ← 提前返回，L98-103 不会执行
+}
+
+// L98-103: 刷新检测——只有校验通过后才执行
 expiresSoon := tk.ExpiresAt != nil && time.Until(tk.ExpiresAt.Time) < time.Hour
 updated := tk.IssuedAt != nil && tk.IssuedAt.Unix() < d.store.Users.LastUpdate(tk.User.ID)
 
@@ -385,16 +401,18 @@ if expiresSoon || updated {
 }
 ```
 
-| 触发条件 | 判断逻辑 | 设计意图 | Proxy+自定义登出页场景下 |
-|---------|---------|---------|----------------------|
-| **即将过期（含已过期）** | `time.Until(ExpiresAt) < 1h` | 提前续期，避免用户操作中途掉线 | **过期后恒触发**（`time.Until` 返回负数，**负数 < 1 小时恒成立**），这是过期 Token 续签的**主要触发路径** |
-| **用户信息变更** | Token 签发时间 (iat) < 用户最后更新时间 | 确保前端持有最新权限/偏好设置 | 仍会触发，与 expiresSoon 形成**双保险** |
+| 触发条件 | 判断逻辑 | 设计意图 | Proxy+自定义登出页（过期 Token 被放行后） | Proxy+默认登出页（过期 Token 已被 401 拦截） |
+|---------|---------|---------|--------------------------------------|--------------------------------------|
+| **即将过期（含已过期）** | `time.Until(ExpiresAt) < 1h` | 提前续期，避免用户操作中途掉线 | **过期后恒触发**（`time.Until` 返回负数，**负数 < 1 小时恒成立**），这是过期 Token 续签的主要触发路径 | **过期后根本不可达**（L94 已返回 401），仅对未过期 Token 的最后 1 小时生效 |
+| **用户信息变更** | Token 签发时间 (iat) < 用户最后更新时间 | 确保前端持有最新权限/偏好设置 | 仍会触发，与 expiresSoon 形成**双保险** | 同上，仅对未过期 Token 生效 |
 
-> **关键修正**：`time.Until(t)` 返回 `t - now`，当 `t` 已过时时返回负值。而**任何负数都小于 1 小时**，因此：
-> ```go
-> time.Until(已过期的时间)  // 返回 -1h30m 这样的负数
-> -1h30m < time.Hour        // 结果为 true！
-> ```
+> **关键修正**：
+> 1. `time.Until(t)` 返回 `t - now`，当 `t` 已过时时返回负值，而**任何负数都小于 1 小时**：
+>    ```go
+>    time.Until(已过期的时间)  // 返回 -1h30m 这样的负数
+>    -1h30m < time.Hour        // 结果为 true！
+>    ```
+> 2. 但**数学上恒成立 ≠ 代码上一定会执行**。`expiresSoon` 判断在 L98，而 L94 的校验判断在前面。Proxy+默认登出页下，过期 Token 在 L94 就被返回 401 了，L98 永远不会执行——过期 Token 根本不可能触发 `expiresSoon` 刷新提示。
 
 **用户更新时间戳机制**：[users/storage.go](users/storage.go#L76-L90) 在每次 `Update()` 时记录：
 
@@ -547,13 +565,17 @@ export async function validateLogin() {
 ```
 ┌─ 服务端检测 ───────────────────────────────────────────────┐
 │ withUser 中间件                                             │
-│   ├─ expiresSoon: 剩余 < 1h ?                               │
-│   └─ updated: iat < LastUpdate ?                            │
-│   └─→ 是 → 响应头 X-Renew-Token: true                       │
+│   L94: 校验判断（在刷新检测之前执行！）                      │
+│     ├─ Token 有效 → 通过 → 进入 L98 刷新检测               │
+│     ├─ Token 过期 + renewableErr=true → 通过 → 进入 L98    │
+│     └─ Token 过期 + renewableErr=false → 401 返回          │
+│         （Proxy+默认登出页走此路径，L98 不可达）             │
 │                                                             │
-│ 过期宽容分支（proxy + 自定义登出页 + ErrTokenExpired）：      │
-│   └─→ renewableErr=true → 跳过 401，仍执行上述刷新检测       │
-│      （expiresSoon 恒成立 + updated 双保险触发续签）          │
+│   L98: 刷新检测（仅校验通过/被放行后执行）                   │
+│     ├─ expiresSoon: 剩余 < 1h ?                             │
+│     │   （被放行的过期 Token → 负数恒成立 → true）           │
+│     └─ updated: iat < LastUpdate ?                          │
+│     └─→ 是 → 响应头 X-Renew-Token: true                     │
 └─────────────────────────────────────────────────────────────┘
                          ↓
 ┌─ 前端响应 ─────────────────────────────────────────────────┐
@@ -609,10 +631,12 @@ Proxy 认证下，**前端初始化走空凭据登录**是所有 Proxy 配置的
 | 判断位置 | 触发条件 | 作用 | Proxy+默认登出页 | Proxy+自定义登出页 |
 |---------|---------|------|----------------|------------------|
 | `initAuth()` 分支 | `ProxyAuth.LoginPage()=false`（恒成立，与登出页无关） | 跳过登录页，空凭据 `login("","","")` 获取 Token | ✅ 触发 | ✅ 触发 |
-| 后端过期宽容 | `AuthMethod==proxy && LogoutPage!=default && err==expired` | 过期 JWT 仍通过 `withUser` 校验 | ❌ 不触发（401） | ✅ 触发 |
-| `expiresSoon` 判断 | `time.Until(ExpiresAt) < 1h`（过期后负数恒成立） | 触发 `X-Renew-Token: true` 刷新提示 | ✅ 触发 | ✅ 触发 |
+| 后端过期宽容 | `AuthMethod==proxy && LogoutPage!=default && err==expired` | 过期 JWT 仍通过 `withUser` L94 校验 | ❌ 不触发（→ 401，后续刷新检测不可达） | ✅ 触发（→ 通过校验，可进入刷新检测） |
+| `expiresSoon` 判断 | `time.Until(ExpiresAt) < 1h`（过期后负数恒成立） | 触发 `X-Renew-Token: true` 刷新提示 | ⚠️ 仅未过期 Token 可达；过期 Token 在 L94 已 401，此行不执行 | ✅ 触发（过期被放行后恒为 true） |
 | 前端计时器禁用 | `authMethod=="proxy" && logoutPage!="/login"` | 禁用 JWT 自身 exp 驱动的登出计时器 | ❌ 不禁用（到点登出） | ✅ 禁用 |
 | 前端登出跳转 | `logoutPage != "/login"` | 登出时跳转到外部 SSO 统一登出 URL | ❌ 跳内部 /login | ✅ 跳外部 |
+
+> **关键修正**：`expiresSoon` 的判断代码（L98）在校验判断（L94）**之后**，只有通过校验的请求才能执行到 L98。Proxy+默认登出页下，过期 Token 在 L94 就被 `renewableErr()=false` 拦截并返回 401，**刷新检测代码根本不会执行**。数学上 `负数 < 1h` 恒成立，但**代码路径上过期 Token 在 Proxy+默认登出页场景下永远走不到这个判断**——这是"逻辑恒真 ≠ 代码可达"的典型案例。
 
 > **注意**：`renewHandler` 的形参名是 `tokenExpireTime`（无 'a'），与 `printToken` 的 `tokenExpirationTime`（有 'a'）不同，调用时需保持参数名一致：`printToken(..., tokenExpireTime)`。
 >
@@ -620,7 +644,7 @@ Proxy 认证下，**前端初始化走空凭据登录**是所有 Proxy 配置的
 
 ### 4.2 SSO 集成体验三处必须同时配置
 
-`initAuth()` 空凭据登录和 `expiresSoon` 恒成立是 Proxy 认证的固有行为，无需额外配置。但要实现完整的 SSO 集成体验，**另外三处必须同时满足**（authMethod=proxy + logoutPage=外部URL），否则单边修改无效：
+`initAuth()` 空凭据登录是 Proxy 认证的固有行为，无需额外配置。`expiresSoon` 对**未过期 Token**的刷新提示也是所有认证方式共有的行为。但要实现完整的 SSO 集成体验（过期 Token 仍可用 + 不被前端计时器登出 + 登出跳转外部），**另外三处必须同时满足**（authMethod=proxy + logoutPage=外部URL），否则单边修改无效：
 
 1. **只有后端过期宽容（renewableErr）但不禁用前端计时器**：
    前端 `logoutTimer` 会在 `exp` 时刻准时调用 `logout("inactivity")`，即使后端仍接受过期 Token，用户仍会被前端强制登出——**单边修改无效**。
@@ -664,12 +688,15 @@ Proxy 认证下，**前端初始化走空凭据登录**是所有 Proxy 配置的
             用户活跃操作（N 次 API 请求）
                      ┌───────────────────────────────┐
   GET /api/...      │                               │
- ───────────────────→│  withUser 校验 JWT             │
-                     │    ├─ 已过期 → renewableErr   │
-                     │    │    (三条件命中则放行)     │
+ ───────────────────→│  withUser L94: 校验 JWT       │
+                     │    ├─ 未过期 → 通过            │
+                     │    └─ 已过期 → renewableErr    │
+                     │         ├─ 三条件命中 → 放行   │
+                     │         └─ 默认登出页 → 401   │
+                     │  L98: 刷新检测（仅通过/放行后）│
                      │    ├─ expiresSoon（过期恒 true）│
                      │    └─ updated（双保险）        │
-                     │    → X-Renew-Token: true（几乎必发）│
+                     │    → X-Renew-Token: true       │
                      │  fetchURL 检测到后 renew()     │
                      │    renewHandler 签发新 JWT     │
                      │    parseToken()（仍禁用计时）  │
@@ -727,12 +754,13 @@ Proxy 认证下，**前端初始化走空凭据登录**是所有 Proxy 配置的
  │                                       │── withUser 校验
  │                                       │    ├─ 提取 Token
  │                                       │    ├─ 验签 + exp 检查
- │                                       │    ├─ 过期 ?
- │                                       │    │  └─ renewableErr 三条件 ?
- │                                       │    │       ├─ YES → ★ 放行
- │                                       │    │       └─ NO  → 401
- │                                       │    ├─ expiresSoon?（过期则恒 true）
- │                                       │    └─ updated?（双保险）
+ │                                       │    ├─ L94: 校验判断
+ │                                       │    │   ├─ 有效 → 通过
+ │                                       │    │   ├─ 过期 + renewableErr → ★ 放行
+ │                                       │    │   └─ 过期 + 默认登出页 → 401 ← 终止
+ │                                       │    ├─ L98: 刷新检测（仅通过/放行后执行）
+ │                                       │    │   ├─ expiresSoon?（过期放行后恒 true）
+ │                                       │    │   └─ updated?（双保险）
  │←─ 200 + (可能 X-Renew-Token:true) ──│
  │                                       │
  │── detect X-Renew-Token:true           │

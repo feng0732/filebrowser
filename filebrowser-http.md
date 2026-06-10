@@ -1,315 +1,622 @@
-# File Browser HTTP 路由与中间件分析
-
-## 一、整体架构概览
-
-File Browser 的 HTTP 层使用 **gorilla/mux** 作为路由框架，采用 **函数装饰器模式** 构建中间件链，通过统一的 `handleFunc` 签名串联上下文装配、权限校验和错误处理。
-
-核心入口：[http.go](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/http.go) 中的 `NewHandler` 函数
+# File Browser HTTP 请求处理链深度分析
 
 ---
 
-## 二、请求进入流程
+## 一、用户管理接口的权限判断：管理员或本人
 
-### 2.1 总览：请求处理链路
+用户管理接口位于 [http/users.go](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/users.go)，注册路由在 [http/http.go#L53-L58](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/http.go#L53-L58)。
 
-```
-HTTP 请求
-  → stripPrefix(BaseURL)          [前缀剥离]
-  → CSP 中间件                    [安全头注入]
-  → mux.Router 路由匹配
-    ├─ /health                    [健康检查，无包装]
-    ├─ /static/*                  [静态资源，经 handle 包装]
-    ├─ /api/*                     [API 接口，经 monkey → handle 包装]
-    │   ├─ /login, /signup        [免认证]
-    │   ├─ /users/*               [withAdmin 装饰]
-    │   ├─ /resources/*           [withUser 装饰]
-    │   ├─ /share/*               [withPermShare → withUser 装饰]
-    │   └─ /public/*              [withHashFile 装饰，分享鉴权]
-    └─ 其他所有路径 → index       [SPA 前端页面，NotFoundHandler]
-```
+### 1.1 路由与装饰器对应关系
 
-### 2.2 路由注册入口：NewHandler
+| 路由 | 方法 | 装饰器 | 权限 |
+|------|------|--------|------|
+| `/api/users` | GET | `withAdmin` | 仅管理员可列出全部用户 |
+| `/api/users` | POST | `withAdmin` | 仅管理员可创建新用户 |
+| `/api/users/{id}` | GET | `withSelfOrAdmin` | 本人或管理员可查看 |
+| `/api/users/{id}` | PUT | `withSelfOrAdmin` | 本人或管理员可修改（带字段级限制） |
+| `/api/users/{id}` | DELETE | `withSelfOrAdmin` | 本人或管理员可删除 |
 
-[NewHandler](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/http.go#L19-L94) 是整个 HTTP 层的构造函数，负责：
+### 1.2 两层权限装饰器
 
-1. **清理配置**：`server.Clean()`
-2. **创建路由器**：`mux.NewRouter()`
-3. **注册 CSP 中间件**：全局 Content-Security-Policy 头
-4. **获取静态处理器**：`getStaticHandlers()` 返回 index 和 static 两个 handler
-5. **定义 monkey 包装函数**：将 `handleFunc` 包装成标准 `http.Handler`
-6. **注册路由**：按层级注册健康检查、静态资源、API 子路由
-7. **返回包装后的 Handler**：`stripPrefix(server.BaseURL, r)`
+#### 第一层：withAdmin —— 纯管理员
+
+[withAdmin](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/auth.go#L113-L121) 嵌套了 `withUser`，在用户认证通过后额外校验 `Perm.Admin`：
 
 ```go
-// 核心包装函数 monkey
-monkey := func(fn handleFunc, prefix string) http.Handler {
-    return handle(fn, prefix, store, server)
-}
-```
-
-### 2.3 前缀剥离：stripPrefix
-
-[stripPrefix](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/utils.go#L55-L80) 是对标准库 `http.StripPrefix` 的定制版本：
-
-- 如果前缀为空或 "/"，直接返回原 handler
-- 如果路径恰好等于前缀（无尾斜杠），重定向到带尾斜杠的版本
-- 否则剥离前缀后转发请求
-
-该函数作用于**最外层**，在路由匹配之前统一处理 BaseURL。
-
----
-
-## 三、上下文装配机制
-
-### 3.1 核心数据结构：data
-
-[data](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/data.go#L20-L34) 是贯穿整个请求生命周期的上下文载体：
-
-```go
-type data struct {
-    *runner.Runner                  // 命令执行器
-    settings *settings.Settings     // 全局设置
-    server   *settings.Server       // 服务器配置
-    store    *storage.Storage       // 存储层
-    user     *users.User            // 当前用户（认证后装配）
-    raw      interface{}            // 原始数据（分享场景使用）
-    checkerPrefix string            // 规则检查前缀（分享场景使用）
-}
-```
-
-`data` 同时实现了 `rules.Checker` 接口（[Check 方法](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/data.go#L37-L64)），用于路径权限规则校验。
-
-### 3.2 统一包装器：handle 函数
-
-[handle](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/data.go#L66-L101) 是所有业务 handler 的统一入口包装器，完成**第一层上下文装配**：
-
-```go
-func handle(fn handleFunc, prefix string, store *storage.Storage, server *settings.Server) http.Handler {
-    handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        // 1. 设置全局响应头
-        for k, v := range globalHeaders {
-            w.Header().Set(k, v)
+func withAdmin(fn handleFunc) handleFunc {
+    return withUser(func(w http.ResponseWriter, r *http.Request, d *data) (int, error) {
+        if !d.user.Perm.Admin {
+            return http.StatusForbidden, nil   // 非管理员直接 403
         }
-
-        // 2. 从存储层读取设置
-        settings, err := store.Settings.Get()
-        // ...
-
-        // 3. 构造 data 上下文（第一层：无用户信息）
-        status, err := fn(w, r, &data{
-            Runner:   &runner.Runner{Enabled: server.EnableExec, Settings: settings},
-            store:    store,
-            settings: settings,
-            server:   server,
-        })
-
-        // 4. 统一错误响应（见第四章）
-        // ...
-    })
-
-    // 5. 剥离路由前缀
-    return stripPrefix(prefix, handler)
-}
-```
-
-**关键特征**：
-- 每个请求都会重新从数据库读取 `settings`，保证配置实时生效
-- 初始 `data` 中 `user` 为 nil，需后续中间件装配
-- 返回值是 `(status int, err error)` 的双值约定，status=0 表示成功
-
-### 3.3 认证装饰器：withUser
-
-[withUser](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/auth.go#L85-L111) 是最核心的用户装配中间件，完成**第二层上下文装配**：
-
-```go
-func withUser(fn handleFunc) handleFunc {
-    return func(w http.ResponseWriter, r *http.Request, d *data) (int, error) {
-        // 1. 从请求中提取并解析 JWT Token
-        //    - 优先从 X-Auth Header 提取
-        //    - GET 请求回退到 auth Cookie
-        //    - 使用 HS256 算法验证签名
-        p := jwt.NewParser(...)
-        token, err := request.ParseFromRequest(r, &extractor{}, keyFunc, ...)
-        if (err != nil || !token.Valid) && !renewableErr(err, d) {
-            return http.StatusUnauthorized, nil
-        }
-
-        // 2. 检测 Token 是否需要续期
-        //    - 过期时间 < 1 小时
-        //    - 用户信息在 Token 签发后有更新
-        if expiresSoon || updated {
-            w.Header().Add("X-Renew-Token", "true")
-        }
-
-        // 3. 从存储层加载完整用户信息
-        d.user, err = d.store.Users.Get(d.server.Root, tk.User.ID)
-        // ...
-
-        // 4. 调用下一个 handler
         return fn(w, r, d)
+    })
+}
+```
+
+#### 第二层：withSelfOrAdmin —— 本人或管理员
+
+[withSelfOrAdmin](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/users.go#L57-L71) 是用户管理接口的核心权限门控：
+
+```go
+func withSelfOrAdmin(fn handleFunc) handleFunc {
+    return withUser(func(w http.ResponseWriter, r *http.Request, d *data) (int, error) {
+        // 1. 从 URL 路径中解析目标用户 ID
+        id, err := getUserID(r)          // mux.Vars(r)["id"] → uint
+        if err != nil {
+            return http.StatusInternalServerError, err
+        }
+
+        // 2. 核心判断：当前登录用户 ID ≠ 目标用户 ID 且非管理员 → 403
+        if d.user.ID != id && !d.user.Perm.Admin {
+            return http.StatusForbidden, nil
+        }
+
+        // 3. 将解析出的目标用户 ID 放入 d.raw 传递给下游
+        d.raw = id
+        return fn(w, r, d)
+    })
+}
+```
+
+**判断逻辑真值表**：
+
+| d.user.ID == id | d.user.Perm.Admin | 结果 |
+|-----------------|-------------------|------|
+| true | 任意 | ✅ 通过（本人操作） |
+| false | true | ✅ 通过（管理员操作他人） |
+| false | false | ❌ 403 Forbidden |
+
+### 1.3 PUT /api/users/{id} 的字段级权限控制
+
+[userPutHandler](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/users.go#L180-L269) 在 `withSelfOrAdmin` 基础上还有更细粒度的限制：
+
+#### A. 当前密码验证（JSONAuth 模式下）
+
+如果修改的是"敏感字段"（username、password、scope、lockPassword、commands、perm、all），需要验证当前登录用户的密码：
+
+```go
+sensibleFields := {"all", "username", "password", "scope", "lockPassword", "commands", "perm"}
+for _, field := range req.Which {
+    if _, ok := sensibleFields[strings.ToLower(field)]; ok {
+        if !users.CheckPwd(req.CurrentPassword, d.user.Password) {
+            return http.StatusBadRequest, fberrors.ErrCurrentPasswordIncorrect
+        }
+        break
     }
 }
 ```
 
-### 3.4 权限装饰器链
+#### B. 非管理员的字段黑名单
 
-在 `withUser` 基础上，还有更细粒度的权限装饰器：
+[NonModifiableFieldsForNonAdmin](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/users.go#L21-L23) 定义了 6 个非管理员不可修改的字段：
 
-| 装饰器 | 位置 | 作用 |
-|--------|------|------|
-| `withAdmin` | [auth.go#L113-L121](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/auth.go#L113-L121) | 校验用户是否为管理员 |
-| `withPermShare` | [share.go#L20-L28](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/share.go#L20-L28) | 校验用户是否有分享和下载权限 |
-| `withHashFile` | [public.go#L17-L98](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/public.go#L17-L98) | 分享链接鉴权，重绑定用户和文件系统 |
+```go
+NonModifiableFieldsForNonAdmin = []string{
+    "Username", "Scope", "LockPassword", "Perm", "Commands", "Rules",
+}
+```
 
-### 3.5 分享场景的特殊装配：withHashFile
+遍历检查逻辑：
+```go
+for _, f := range NonModifiableFieldsForNonAdmin {
+    if !d.user.Perm.Admin && v == f {
+        return http.StatusForbidden, nil
+    }
+}
+```
 
-[withHashFile](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/public.go#L17-L98) 是公开分享接口的上下文装配器，流程较为特殊：
+#### C. 全量更新必须是管理员
 
-1. 从 URL 路径提取分享哈希 ID
-2. 根据哈希查找分享记录 `share.Link`
-3. 校验分享密码（如有）
-4. 根据 `link.UserID` 加载所属用户
-5. **重绑定文件系统**：使用 `files.NewScopedFs` 将用户文件系统限定在分享路径内
-6. **设置 checkerPrefix**：确保规则校验仍基于用户原始路径
-7. 预加载共享文件/目录信息到 `d.raw`
+如果 `req.Which` 为空（等价于 "all"），要求必须是管理员：
+```go
+if len(req.Which) == 0 || (len(req.Which) == 1 && req.Which[0] == "all") {
+    if !d.user.Perm.Admin {
+        return http.StatusForbidden, nil
+    }
+    // ...
+}
+```
 
-这是一个典型的**上下文重绑定**模式，复用了用户体系但限制了访问范围。
+#### D. 非管理员修改密码的额外限制
+
+如果用户 `LockPassword = true`（密码被锁定），即使是本人也不能改密码：
+```go
+if v == "Password" {
+    if !d.user.Perm.Admin && d.user.LockPassword {
+        return http.StatusForbidden, nil
+    }
+    // ...
+}
+```
+
+#### E. 分享权限与下载权限的绑定约束
+
+任何情况下设置 `Perm.Share = true` 都必须同时有 `Perm.Download = true`：
+```go
+if req.Data.Perm.Share && !req.Data.Perm.Download {
+    return http.StatusBadRequest, fberrors.ErrShareRequiresDownload
+}
+```
+
+### 1.4 GET /api/users/{id} 的返回字段脱敏
+
+[userGetHandler](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/users.go#L90-L105) 中，非管理员查看自己的信息时会隐藏 `Scope`：
+
+```go
+u.Password = ""                       // 始终清空密码哈希
+if !d.user.Perm.Admin {
+    u.Scope = ""                       // 非管理员看不到自己的文件系统根路径
+}
+```
 
 ---
 
-## 四、错误响应处理链
+## 二、令牌续期入口与完整流程
 
-### 4.1 错误约定：handleFunc 签名
+### 2.1 续期机制的三个关键点
+
+令牌续期涉及 [http/auth.go](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/auth.go) 中的以下代码：
+
+| 组件 | 位置 | 作用 |
+|------|------|------|
+| `renewableErr` | [auth.go#L69-L83](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/auth.go#L69-L83) | 判断过期错误是否允许续期 |
+| `withUser` 中的续期提示 | [auth.go#L98-L103](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/auth.go#L98-L103) | 检测到需要续期时设置响应头 |
+| `renewHandler` | [auth.go#L216-L221](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/auth.go#L216-L221) | `/api/renew` 显式续期入口 |
+| `printToken` | [auth.go#L223-L257](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/auth.go#L223-L257) | 签发新 Token 的公共函数 |
+
+### 2.2 隐式续期提示：withUser 中的 X-Renew-Token
+
+每次经过 `withUser` 认证的请求都会检查是否需要提示续期：
 
 ```go
+// 条件1：Token 过期时间 < 1 小时
+expiresSoon := tk.ExpiresAt != nil && time.Until(tk.ExpiresAt.Time) < time.Hour
+
+// 条件2：Token 签发时间早于用户信息最后更新时间
+//        （管理员修改了该用户的权限/密码等信息）
+updated := tk.IssuedAt != nil && tk.IssuedAt.Unix() < d.store.Users.LastUpdate(tk.User.ID)
+
+// 满足任一条件，在响应头中提示前端续期
+if expiresSoon || updated {
+    w.Header().Add("X-Renew-Token", "true")
+}
+```
+
+**重要**：这里只是**设置响应头提示**，并不实际签发新 Token。前端看到 `X-Renew-Token: true` 后需要主动调用 `/api/renew`。
+
+### 2.3 显式续期入口：/api/renew
+
+路由注册：[http.go#L51](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/http.go#L51)
+
+```go
+func renewHandler(tokenExpireTime time.Duration) handleFunc {
+    return withUser(func(w http.ResponseWriter, r *http.Request, d *data) (int, error) {
+        w.Header().Set("X-Renew-Token", "false")   // 明确告知：已续期，无需再提示
+        return printToken(w, r, d, d.user, tokenExpireTime)   // 签发新 Token
+    })
+}
+```
+
+流程：
+1. `withUser` 验证旧 Token（只要没过期或属于可再生错误都放行）
+2. 设置 `X-Renew-Token: false`（清除续期提示）
+3. 调用 `printToken` 用当前最新的用户信息签发全新 Token
+
+### 2.4 过期 Token 的特殊放行：renewableErr
+
+[renewableErr](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/auth.go#L69-L83) 决定了**已过期 Token 能否被接受**（仅用于 ProxyAuth 模式）：
+
+```go
+func renewableErr(err error, d *data) bool {
+    // 条件1：必须是 ProxyAuth 认证方式，且确实发生了错误
+    if d.settings.AuthMethod != fbAuth.MethodProxyAuth || err == nil {
+        return false
+    }
+    // 条件2：必须配置了非默认的 LogoutPage（自定义登出页）
+    if d.settings.LogoutPage == settings.DefaultLogoutPage {
+        return false
+    }
+    // 条件3：错误类型必须是 JWT 过期
+    if !errors.Is(err, jwt.ErrTokenExpired) {
+        return false
+    }
+    return true   // 三个条件全满足 → 过期 Token 暂不放回 401，交给 renewHandler 处理
+}
+```
+
+在 `withUser` 中的使用：
+```go
+if (err != nil || !token.Valid) && !renewableErr(err, d) {
+    return http.StatusUnauthorized, nil      // 正常情况下过期直接 401
+}
+// 如果 renewableErr 返回 true，则继续执行，过期 Token 也能通过 withUser
+// 这样 /api/renew 就能用已过期的 ProxyAuth Token 换取新 Token
+```
+
+### 2.5 新 Token 签发：printToken
+
+[printToken](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/auth.go#L223-L257) 被 `loginHandler` 和 `renewHandler` 共同调用：
+
+```go
+func printToken(w http.ResponseWriter, _ *http.Request, d *data, user *users.User, tokenExpirationTime time.Duration) (int, error) {
+    claims := &authToken{
+        User: userInfo{ /* 从 user 对象拷贝字段 */ },
+        RegisteredClaims: jwt.RegisteredClaims{
+            IssuedAt:  jwt.NewNumericDate(time.Now()),              // 签发时间 = 现在
+            ExpiresAt: jwt.NewNumericDate(time.Now().Add(tokenExpirationTime)),  // 默认 2 小时后
+            Issuer:    "File Browser",
+        },
+    }
+    token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+    signed, err := token.SignedString(d.settings.Key)   // 用 settings.Key 做 HS256 签名
+    // ...
+    w.Header().Set("Content-Type", "text/plain")
+    w.Write([]byte(signed))
+    return 0, nil
+}
+```
+
+### 2.6 令牌续期完整时序图
+
+```
+前端                                后端
+  |                                   |
+  |-- GET /api/resources/xxx ------->|
+  |                                   |  withUser 解析 Token
+  |                                   |  → 发现 expiresSoon = true
+  |<-- 200 + X-Renew-Token: true ----|
+  |                                   |
+  |  检测到 X-Renew-Token 头          |
+  |-- POST /api/renew -------------->|  (携带旧 Token)
+  |                                   |
+  |                                   |  withUser 验证旧 Token
+  |                                   |  → renewableErr 判定 (ProxyAuth 专用)
+  |                                   |  renewHandler:
+  |                                   |    1. X-Renew-Token = "false"
+  |                                   |    2. printToken 签发新 Token
+  |<-- 200 新 Token 文本 -------------|
+  |                                   |
+  |  保存新 Token，后续请求使用        |
+```
+
+---
+
+## 三、基础路径剥离与路由前缀剥离的先后顺序
+
+### 3.1 涉及的三层剥离函数
+
+整个系统存在 **三层** 路径前缀剥离，按**请求到达先后顺序**排列：
+
+| 层级 | 执行时机 | 函数/位置 | 剥离内容 | 剥离对象 |
+|------|----------|-----------|----------|----------|
+| 第 1 层 | 最外层，进入 mux.Router 之前 | [http.go#L93](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/http.go#L93) `stripPrefix(server.BaseURL, r)` | 应用基础路径 BaseURL（如 `/files`） | 全局所有请求 |
+| 第 2 层 | mux.Router 匹配后，进入业务 handler 之前 | [data.go#L100](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/data.go#L100) `stripPrefix(prefix, handler)` | 路由注册前缀（如 `/api/resources`） | 单个路由组 |
+| 第 3 层 | 分享场景中，进入业务逻辑前 | [public.go#L70](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/public.go#L70) `files.NewScopedFs` + `checkerPrefix` | 分享根路径（如 `/docs/share/`） | 分享场景的文件系统路径 |
+
+### 3.2 代码层面的精确执行顺序
+
+以 `NewHandler` 中 `/api/resources` 路由为例：
+
+```go
+// 【构造阶段】倒序注册，层层包裹
+// Step 3: 最外层包装 BaseURL 剥离
+return stripPrefix(server.BaseURL, r), nil
+                        ↑
+                        |
+// Step 2: 注册路由时，monkey 包装 handle，handle 内部再包 stripPrefix
+api.PathPrefix("/resources").Handler(
+    monkey(resourceGetHandler, "/api/resources")
+    // monkey 内部: handle(fn, prefix, ...)
+    //   handle 内部构造 HandlerFunc 后，外层包: stripPrefix("/api/resources", handler)
+    //                                            ↑
+    //                                            |
+    // Step 1: 最内层业务逻辑（withUser 装饰链）
+    // withUser(withUser(func(...))) → 业务函数
+).Methods("GET")
+```
+
+### 3.3 实际请求路径变换示例
+
+假设配置：
+- `server.BaseURL = "/app"`
+- 请求 URL: `http://host/app/api/resources/docs/report.pdf`
+
+#### 变换过程
+
+```
+原始 URL.Path (进入 Go net/http 时):
+    /app/api/resources/docs/report.pdf
+
+─────────────── 第 1 层剥离: stripPrefix("/app", r) ───────────────
+传入 mux.Router 的 URL.Path:
+    /api/resources/docs/report.pdf
+
+    mux.Router 匹配: PathPrefix("/api/resources") 匹配成功
+    → 调用 monkey 返回的 http.Handler
+
+─────────────── 第 2 层剥离: stripPrefix("/api/resources", handler) ───────────────
+传入 handle 内 HandlerFunc 的 URL.Path:
+    /docs/report.pdf
+
+    handle 调用: fn(w, r, &data{...})  → 即 resourceGetHandler
+    (withUser 包装的业务 handler 接收的 r.URL.Path 就是这个值)
+
+─────────────── 业务 handler 内部 ───────────────
+resourceGetHandler 内看到的路径: /docs/report.pdf
+→ d.user.Fs.Open("/docs/report.pdf")  // 直接用，已经是相对用户根路径
+```
+
+### 3.4 stripPrefix 的内部实现
+
+[stripPrefix](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/utils.go#L55-L80) 相比标准库 `http.StripPrefix` 有两处重要差异：
+
+```go
+func stripPrefix(prefix string, h http.Handler) http.Handler {
+    // 快速路径：无前缀直接透传
+    if prefix == "" || prefix == "/" {
+        return h
+    }
+
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        p := strings.TrimPrefix(r.URL.Path, prefix)
+        rp := strings.TrimPrefix(r.URL.RawPath, prefix)
+
+        // 差异1: 恰好等于前缀时重定向到带尾斜杠的版本
+        //        防止 mux 收到空路径后重定向到站点根
+        if p == "" {
+            http.Redirect(w, r, prefix+"/", http.StatusMovedPermanently)
+            return
+        }
+
+        // 差异2: 不做 404，没有前缀也继续转发
+        //        标准库 StripPrefix 这里是 http.NotFound(w, r)
+        r2 := new(http.Request)
+        *r2 = *r
+        r2.URL = new(url.URL)
+        *r2.URL = *r.URL
+        r2.URL.Path = p
+        r2.URL.RawPath = rp
+        h.ServeHTTP(w, r2)
+    })
+}
+```
+
+### 3.5 静态资源与 NotFoundHandler 的路径处理
+
+`NewHandler` 中的特殊路由注册：
+
+```go
+r.PathPrefix("/static").Handler(static)   // static 内部带 stripPrefix("/static/", ...)
+r.NotFoundHandler = index                 // index 无内部前缀剥离
+```
+
+- `/static` 路由：进入 `getStaticHandlers` 返回的 `static` handler，其内部的 `handle` 包装又会执行 `stripPrefix("/static/", ...)`，所以业务 handler 看到的是相对路径（如 `/js/app.js`）
+- `NotFoundHandler`：所有未匹配的请求都走 SPA 的 `index` handler，**不会剥离任何前缀**，因为注册时传给 `handle` 的 prefix 是 `""`
+
+---
+
+## 四、状态码和错误文本的统一返回方式
+
+### 4.1 统一返回约定：handleFunc 签名
+
+```go
+// [data.go#L18]
 type handleFunc func(w http.ResponseWriter, r *http.Request, d *data) (int, error)
 ```
 
-**双返回值约定**：
-- `int`：HTTP 状态码，`0` 表示正常响应（已写入）
-- `error`：错误信息，可为 nil
+**双返回值协议**：
 
-### 4.2 统一错误出口：handle 函数
+| status | err | 含义 | 后续行为 |
+|--------|-----|------|----------|
+| `0` | `nil` | 正常返回，handler 已自行写入响应体 | 直接结束，不做处理 |
+| `0` | 非 nil | handler 写响应中途出错 | 记录日志（err != nil 触发），但不向客户端输出 |
+| 非 0（< 400） | 任意 | 业务状态码（如 201 Created） | 由 handle 统一用 `http.Error` 输出 |
+| 非 0（>= 400） | 任意 | 错误状态码 | 记录日志 + 统一错误输出 |
 
-在 [handle 函数](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/data.go#L85-L97) 中进行统一错误处理：
+### 4.2 唯一出口：handle 函数中的错误处理
+
+[data.go#L85-L97](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/data.go#L85-L97) 是**所有 HTTP 错误响应的唯一出口**（WebSocket 除外）：
 
 ```go
-// 1. 错误日志记录（状态码 >= 400 或有错误时）
+status, err := fn(w, r, &data{...})
+
+// ─── 阶段 1：日志记录 ───
+// 触发条件：status >= 400  或者  err != nil
+// 记录内容：请求路径、HTTP 状态码、客户端真实 IP、错误信息字符串
 if status >= 400 || err != nil {
     clientIP := realip.FromRequest(r)
     log.Printf("%s: %v %s %v", r.URL.Path, status, clientIP, err)
 }
 
-// 2. 输出 HTTP 错误响应
+// ─── 阶段 2：响应输出 ───
 if status != 0 {
-    txt := http.StatusText(status)
+    txt := http.StatusText(status)              // 标准 HTTP 状态文本，如 "Bad Request"
+
+    // ★ 重要：只有 400 Bad Request 才会附加错误详情
+    // 其他状态码一律不泄露内部错误信息给客户端
     if status == http.StatusBadRequest && err != nil {
         txt += " (" + err.Error() + ")"
     }
+
+    // 最终输出格式：
+    //   响应行: HTTP/1.1 <status> <StatusText>
+    //   响应体: "<status> <StatusText>[(err)]"
+    //   Content-Type: text/plain; charset=utf-8
     http.Error(w, strconv.Itoa(status)+" "+txt, status)
     return
 }
 ```
 
-**关键行为**：
-- 仅当状态码为 `http.StatusBadRequest` 时，才会将错误详情附加到响应体中
-- 其他错误只返回标准状态文本，不泄露内部错误信息
-- 所有 >= 400 的状态码和错误都会记录日志，包含客户端 IP
+### 4.3 不同状态码的响应体格式对照表
 
-### 4.3 错误码转换：errToStatus
+| status | err | 响应体示例 |
+|--------|-----|------------|
+| `201` | nil | `201 Created` |
+| `204` | nil | `204 No Content` |
+| `400` | nil | `400 Bad Request` |
+| `400` | `errors.New("invalid JSON")` | `400 Bad Request (invalid JSON)` |
+| `400` | `fberrors.ErrCurrentPasswordIncorrect` | `400 Bad Request (the current password is incorrect)` |
+| `401` | nil | `401 Unauthorized` |
+| `403` | `fberrors.ErrPermissionDenied` | `403 Forbidden`（**错误详情不返回**） |
+| `404` | `os.ErrNotExist` | `404 Not Found`（**错误详情不返回**） |
+| `409` | `fberrors.ErrExist` | `409 Conflict`（**错误详情不返回**） |
+| `500` | `errors.New("db conn fail")` | `500 Internal Server Error`（**错误详情不返回**） |
 
-[errToStatus](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/utils.go#L30-L51) 将领域错误映射为 HTTP 状态码：
+### 4.4 错误码转换函数：errToStatus
 
-| 错误类型 | HTTP 状态码 |
-|----------|-------------|
-| `nil` | 200 OK |
-| `os.IsPermission` / `ErrPermissionDenied` / `ErrRootUserDeletion` | 403 Forbidden |
-| `os.IsNotExist` / `ErrNotExist` | 404 Not Found |
-| `os.IsExist` / `ErrExist` | 409 Conflict |
-| `ErrInvalidRequestParams` | 400 Bad Request |
-| `imgErrors.ErrImageTooLarge` | 413 Request Entity Too Large |
-| 其他所有错误 | 500 Internal Server Error |
-
-业务 handler 中常见的调用模式：
+[errToStatus](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/utils.go#L30-L51) 是业务层常用的辅助函数，将 Go 标准错误和领域错误映射为 HTTP 状态码：
 
 ```go
-file, err := files.NewFileInfo(...)
-if err != nil {
-    return errToStatus(err), err
-}
-```
-
-### 4.4 业务层错误定义
-
-领域错误集中定义在 [errors/errors.go](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/errors/errors.go)，包括：
-
-- `ErrExist` / `ErrNotExist` - 资源存在性
-- `ErrPermissionDenied` - 权限拒绝
-- `ErrInvalidRequestParams` - 请求参数无效
-- `ErrSourceIsParent` - 源路径是父目录
-- `ErrRootUserDeletion` - 不能删除唯一管理员
-- `ErrCurrentPasswordIncorrect` - 当前密码错误
-- 自定义错误类型 `ErrShortPassword`（带最小长度信息）
-
----
-
-## 五、中间件设计模式总结
-
-### 5.1 装饰器模式
-
-所有鉴权/权限中间件都采用**函数装饰器**模式：
-
-```go
-// 输入：handleFunc → 输出：handleFunc
-func withXxx(fn handleFunc) handleFunc {
-    return func(w http.ResponseWriter, r *http.Request, d *data) (int, error) {
-        // 前置处理...
-        result, err := fn(w, r, d)  // 调用下一层
-        // 后置处理...
-        return result, err
+func errToStatus(err error) int {
+    switch {
+    case err == nil:
+        return http.StatusOK                           // 200
+    case os.IsPermission(err):
+        return http.StatusForbidden                    // 403
+    case os.IsNotExist(err), errors.Is(err, libErrors.ErrNotExist):
+        return http.StatusNotFound                     // 404
+    case os.IsExist(err), errors.Is(err, libErrors.ErrExist):
+        return http.StatusConflict                     // 409
+    case errors.Is(err, libErrors.ErrPermissionDenied):
+        return http.StatusForbidden                    // 403
+    case errors.Is(err, libErrors.ErrInvalidRequestParams):
+        return http.StatusBadRequest                   // 400
+    case errors.Is(err, libErrors.ErrRootUserDeletion):
+        return http.StatusForbidden                    // 403
+    case errors.Is(err, imgErrors.ErrImageTooLarge):
+        return http.StatusRequestEntityTooLarge        // 413
+    default:
+        return http.StatusInternalServerError          // 500（兜底）
     }
 }
 ```
 
-这种模式的优势：
-- **类型安全**：统一的 `handleFunc` 签名
-- **可组合**：多个装饰器可链式嵌套（如 `withAdmin` 内部嵌套 `withUser`）
-- **上下文传递**：通过 `*data` 指针传递和累积上下文信息
-
-### 5.2 典型调用链示例
-
-以 `sharePostHandler` 为例：
-
-```
-sharePostHandler
-  → withPermShare
-    → withUser (JWT 认证 + 用户装配)
-      → handle (全局头 + settings 装配 + 错误统一处理)
-        → stripPrefix
-          → mux.Router
-            → stripPrefix (最外层 BaseURL)
+**典型用法**：
+```go
+file, err := files.NewFileInfo(...)
+if err != nil {
+    return errToStatus(err), err     // 领域错误 → HTTP 状态码 + 原始错误
+}
 ```
 
-以 `publicShareHandler` 为例：
+注意：`errToStatus` 只是转换状态码，**最终响应体是否包含错误详情仍由 handle 函数的 `status == 400` 判断决定**。例如 `ErrExist` 被转为 409，虽然 err 不为 nil，但因为 status ≠ 400，响应体只有 `409 Conflict`。
+
+### 4.5 领域错误定义
+
+[errors/errors.go](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/errors/errors.go) 中定义了全部领域错误变量：
+
+| 错误变量 | 触发 400 详情返回？ | 说明 |
+|----------|---------------------|------|
+| `ErrExist` | ❌ (→ 409) | 资源已存在 |
+| `ErrNotExist` | ❌ (→ 404) | 资源不存在 |
+| `ErrPermissionDenied` | ❌ (→ 403) | 权限被拒 |
+| `ErrInvalidRequestParams` | ✅ (→ 400) | 请求参数无效 |
+| `ErrEmptyRequest` | ✅ (→ 400) | 请求体为空 |
+| `ErrInvalidDataType` | ✅ (→ 400) | 数据类型无效 |
+| `ErrInvalidOption` | ✅ (→ 400) | 选项无效 |
+| `ErrEmptyPassword` | ✅ (→ 400) | 密码为空 |
+| `ErrEasyPassword` | ✅ (→ 400) | 密码太简单 |
+| `ErrEmptyUsername` | ✅ (→ 400) | 用户名为空 |
+| `ErrCurrentPasswordIncorrect` | ✅ (→ 400) | 当前密码错误 |
+| `ErrShareRequiresDownload` | ✅ (→ 400) | 分享权限需要下载权限 |
+| `ErrSourceIsParent` | ✅ (→ 400) | 源是父目录（复制移动场景） |
+| `ErrRootUserDeletion` | ❌ (→ 403) | 不能删除唯一管理员 |
+| `ErrShortPassword` (struct) | ✅ (→ 400) | 密码太短，带最小长度信息 |
+
+### 4.6 JSON 成功响应的返回模式
+
+`renderJSON` 是成功响应的标准出口：
+
+```go
+func renderJSON(w http.ResponseWriter, _ *http.Request, data interface{}) (int, error) {
+    marsh, err := json.Marshal(data)
+    if err != nil {
+        return http.StatusInternalServerError, err   // 序列化失败走统一错误出口
+    }
+    w.Header().Set("Content-Type", "application/json; charset=utf-8")
+    if _, err := w.Write(marsh); err != nil {
+        return http.StatusInternalServerError, err   // 写入失败走统一错误出口
+    }
+    return 0, nil   // status=0, err=nil → handle 不再处理
+}
+```
+
+### 4.7 WebSocket 的独立错误处理（特殊情况）
+
+命令执行接口 `/api/command` 使用 WebSocket，**不经过 handle 函数的统一错误出口**，而是有自己的 `wsErr` 函数：
+
+[commands.go#L31-L39](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/commands.go#L31-L39)
+```go
+func wsErr(ws *websocket.Conn, r *http.Request, status int, err error) {
+    txt := http.StatusText(status)
+    if err != nil || status >= 400 {
+        log.Printf("%s: %v %s %v", r.URL.Path, status, r.RemoteAddr, err)  // 日志记录
+    }
+    // 通过 WebSocket Close Frame 返回状态文本（非 HTTP 响应）
+    if err := ws.WriteControl(websocket.CloseInternalServerErr, []byte(txt), ...); err != nil {
+        log.Print(err)
+    }
+}
+```
+
+---
+
+## 五、请求处理链完整调用图（综合示例）
+
+以 **PUT /api/users/5**（修改用户 5）为例，`server.BaseURL = ""`，当前登录用户 ID = 2，非管理员：
 
 ```
-publicShareHandler
-  → withHashFile (分享鉴权 + 文件系统重绑定)
-    → handle
-      → stripPrefix
-        → mux.Router
-          → stripPrefix (最外层 BaseURL)
+          HTTP 请求 PUT /api/users/5
+                      │
+                      ▼
+    ┌──────────────────────────────────┐
+    │  stripPrefix(BaseURL="")        │  第 1 层：无前缀，直接透传
+    └──────────────┬───────────────────┘
+                   │
+                   ▼
+    ┌──────────────────────────────────┐
+    │  CSP 中间件                     │  设置 Content-Security-Policy 头
+    └──────────────┬───────────────────┘
+                   │
+                   ▼
+    ┌──────────────────────────────────┐
+    │  mux.Router 路由匹配            │  匹配: /api/users/{id:[0-9]+} PUT
+    └──────────────┬───────────────────┘
+                   │
+                   ▼
+    ┌──────────────────────────────────┐
+    │  handle 包装器 (users.go 路由)  │
+    │  ├─ 设置 Cache-Control 头       │
+    │  ├─ store.Settings.Get()        │  从 DB 读取 settings
+    │  ├─ 构造 &data{settings,...}    │  第一层上下文装配
+    │  ├─ 调用 fn (即 userPutHandler) │
+    │  └─ 统一错误处理 + 响应输出      │
+    └──────────────┬───────────────────┘
+                   │  stripPrefix("", handler) = 透传
+                   ▼
+    ┌──────────────────────────────────┐
+    │  withSelfOrAdmin 装饰器         │  users.go#L57-L71
+    │  └─ 嵌套 withUser               │
+    │     ├─ 提取 JWT (X-Auth/Cookie) │
+    │     ├─ 解析验证 HS256 签名      │
+    │     ├─ 检查是否提示 X-Renew-Token│
+    │     ├─ store.Users.Get(id=2)    │  加载当前用户 d.user
+    │     └─ 返回 withSelfOrAdmin 体  │
+    │        ├─ 解析路径 id = 5       │
+    │        ├─ 判断: 2≠5 且 非Admin  │
+    │        └─ return 403, nil       │  ← 命中无权限分支
+    └──────────────┬───────────────────┘
+                   │  返回 (403, nil)
+                   ▼
+    ┌──────────────────────────────────┐
+    │  handle 统一出口                │
+    │  ├─ status=403 >= 400 → 打日志 │
+    │  ├─ status != 0 → 输出响应      │
+    │  │   txt = "Forbidden"          │
+    │  │   status≠400 → 不附加 err    │
+    │  └─ http.Error(w, "403 Forbidden", 403)
+    └──────────────────────────────────┘
 ```
-
-### 5.3 路径前缀的三层结构
-
-整个系统中有**三层**路径前缀处理：
-
-| 层级 | 位置 | 前缀 | 作用 |
-|------|------|------|------|
-| 第 1 层 | `NewHandler` 返回值 | `server.BaseURL` | 整个应用的基础 URL |
-| 第 2 层 | `handle` 返回值 | 各路由前缀（如 `/api/resources`） | 剥离路由前缀，让 handler 看到相对路径 |
-| 第 3 层 | `withHashFile` 内部 | `link.Path`（分享根路径） | 将文件系统限定到分享目录 |
 
 ---
 
@@ -317,12 +624,14 @@ publicShareHandler
 
 | 文件 | 核心职责 |
 |------|----------|
-| [http/http.go](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/http.go) | 路由注册、NewHandler 入口 |
-| [http/data.go](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/data.go) | data 上下文、handle 包装器、规则检查 |
-| [http/auth.go](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/auth.go) | JWT 认证、withUser/withAdmin 装饰器、登录/注册 |
-| [http/utils.go](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/utils.go) | errToStatus 错误码转换、stripPrefix、renderJSON |
-| [http/public.go](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/public.go) | 公开分享、withHashFile 装饰器 |
-| [http/share.go](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/share.go) | 分享管理 API、withPermShare 装饰器 |
-| [http/headers.go](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/headers.go) | 全局响应头（Cache-Control） |
-| [http/static.go](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/static.go) | 静态资源和 SPA 页面处理 |
-| [errors/errors.go](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/errors/errors.go) | 领域错误定义 |
+| [http/http.go](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/http.go) | 路由注册、NewHandler 入口、monkey 包装函数 |
+| [http/data.go](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/data.go) | data 上下文结构、handle 包装器（统一错误出口）、Check 规则检查 |
+| [http/auth.go](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/auth.go) | JWT Token 提取解析、withUser/withAdmin 装饰器、renewHandler 续期入口、printToken 签发、renewableErr 过期特判 |
+| [http/users.go](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/users.go) | withSelfOrAdmin 本人/管理员权限、5 个用户管理 handler 及字段级权限控制 |
+| [http/share.go](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/share.go) | withPermShare 分享权限装饰器、分享 CRUD handler |
+| [http/public.go](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/public.go) | withHashFile 分享鉴权 + 文件系统重绑定、健康检查 |
+| [http/utils.go](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/utils.go) | errToStatus 错误码映射、stripPrefix 前缀剥离、renderJSON 成功响应 |
+| [http/headers.go](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/headers.go) | 全局响应头（Cache-Control: no-cache） |
+| [http/static.go](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/static.go) | 静态资源和 SPA index.html 处理器构造 |
+| [http/commands.go](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/commands.go) | WebSocket 命令执行及 wsErr 独立错误处理 |
+| [errors/errors.go](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/errors/errors.go) | 领域错误变量及 ErrShortPassword 自定义类型 |

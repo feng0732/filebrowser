@@ -345,11 +345,11 @@ if link.Expire != 0 && link.Expire <= time.Now().Unix() { ... }
 ```
 （`Expire == 0` 代表永久分享，永远不清理）
 
-### 4.2 ⚠️ 批量列表场景下的边界问题：range 遍历删除导致数据错乱 + panic
+### 4.2 ⚠️ 批量列表场景下的边界问题：range 遍历 + 原地修改切片导致 DB 漏删 + 返回错乱 + panic
 
 #### 问题描述
 
-**`All()`、`FindByUserID()`、`Gets()` 三个批量方法存在「原地修改切片 + range 遍历」的严重 bug。**
+**`All()`、`FindByUserID()`、`Gets()` 三个批量方法存在「range 遍历 + append 原地修改切片」的严重 bug，包含 DB 漏删、返回切片错乱、runtime panic 三个层面的问题。**
 
 当前实现 [share/storage.go#L39-L46](share/storage.go#L39-L46)：
 
@@ -364,65 +364,220 @@ for i, link := range links {
 }
 ```
 
-#### 根本原因（Go range 语义精确分析）
+#### 根本原因（Go 切片内存模型精确分析）
 
-Go 语言规范中 `for i, v := range slice` 的行为：
+##### Go 切片的三字段结构
 
-1. **循环开始时求值一次**：`range links` 在循环开始时对 `links` 求值，得到一个**临时切片副本**（含底层数组指针、长度、容量）
-2. **迭代次数固定**：循环次数 = 临时副本的初始 `len(links)`，后续修改 `links` 变量不影响迭代次数
-3. **`link` 来自临时副本**：每次迭代的 `link = temp_slice[i]`，始终是原始切片的元素
-4. **切片操作使用修改后的 `links`**：`links = append(links[:i], links[i+1:]...)` 修改的是 `links` 变量本身，后续的切片操作使用修改后的长度
+一个切片在内存中是一个 24 字节结构体（64 位），由 `Data`（指针）、`Len`（长度）、`Cap`（容量）组成：
 
-**矛盾点**：`i` 按原始长度递增，但 `links[:i]` 的切片边界检查使用修改后的长度。
+```
+links 变量: [ Data = &arr[0], Len = 4, Cap = 4 ]
+                     │
+                     ▼
+底层数组 arr:     [ A ][ B ][ C ][ D ]
+                   0    1    2    3
+```
 
-#### 复现场景（精确到每一步）
+##### `for range slice` 的精确定义（Go 语言规范）
 
-场景：`links = [A(过期), B(过期), C(正常), D(过期)]`，初始 len=4
+```go
+for i, v := range links { ... }
+```
 
-range 开始：临时副本 `temp = [A, B, C, D]`，迭代次数固定为 4
+等价于：
 
-| i | link (temp[i]) | 过期 | DB 删除 | 切片操作（使用修改后的 links） | 结果 links | 问题 |
-|---|---------------|------|---------|-----------------------------|-----------|------|
-| 0 | A | ✅ 是 | Delete(A.Hash) ✅ | `append(links[:0], links[1:])` | `[B, C, D]` <br> len=3 | 正确 |
-| 1 | B | ✅ 是 | Delete(B.Hash) ✅ | 当前 links=`[B,C,D]` <br> `links[:1]` = `[B]` <br> `links[2:]` = `[D]` <br> → `[B, D]` | `[B, D]` <br> len=2 | ❌ C 被误删！<br>（C 是正常的但被移除）<br> ❌ B 残留！<br>（DB 已删但切片中还在） |
-| 2 | C | ❌ 否 | - | 无操作 | `[B, D]` | - |
-| 3 | D | ✅ 是 | Delete(D.Hash) ✅ | 当前 links=`[B,D]`, len=2 <br> `links[:3]` → **越界！** | 💥 | **Runtime Panic** <br> `slice bounds out of range [:3] with length 2` |
+```go
+// 第 0 步：在循环开始前，对 range 表达式求值 ONE TIME
+_temp_range := links          // 复制切片头：3 个字段
+_len := _temp_range.Len       // 固定迭代次数 = 初始 Len = 4
 
-**最终结果**：
-- ✅ DB 删除是正确的（A、B、D 都从 DB 删除了）
-- ❌ 返回切片 = `[B, D]`（但 B、D 在 DB 中已不存在）
-- ❌ 正常元素 C 被错误地从返回切片中移除
-- 💥 大概率触发 runtime panic
+for i := 0; i < _len; i++ {
+    v := *(*Link)(unsafe.Pointer(_temp_range.Data + uintptr(i)*unsafe.Sizeof(Link{})))
+    // ↳ 从共享的底层数组偏移 i 处直接读！不是从 temp 副本读元素值！
+    
+    ... // 循环体，可修改 links 变量本身
+}
+```
 
-#### 全部连续过期场景
+**四个关键结论**：
 
-`links = [A(过期), B(过期), C(过期)]`, len=3
+| # | 机制 | 说明 | 后果 |
+|---|------|------|------|
+| 1 | **切片头副本** | `_temp_range` 复制了 `(Data, Len, Cap)` 三个字段 | `links.Len` 后续变化不影响迭代次数 |
+| 2 | **底层数组共享** | `_temp_range.Data == links.Data`，指针指向同一块内存 | `append` 原地修改时，**后续迭代读到的元素值已被改写** |
+| 3 | **`v` 从共享数组读** | `v = arr[i]` 是每次迭代时从当前底层数组**实时读取** | 删除操作会移动数组元素 → 后续 `v` 读到"跑过来"的新值 |
+| 4 | **切片操作用新 `Len`** | `links[:i]` 边界检查用当前 `links.Len`（可能已缩短） | `i` 继续递增 → 边界越界 → **panic** |
 
-| i | link | DB 删除 | 切片操作 | 结果 links |
-|---|------|---------|----------|-----------|
-| 0 | A | ✅ | `append(links[:0], links[1:])` | `[B, C]`, len=2 |
-| 1 | B | ✅ | `append(links[:1], links[2:])` <br> links[:1]=`[B]`, links[2:]=`[]` → `[B]` | `[B]`, len=1 |
-| 2 | C | ✅ | `links[:3]` → len=1, 越界 | 💥 panic |
+---
 
-#### 非连续过期场景（中间有正常元素）
+#### 复现场景 A：连续过期（精确到每一行代码执行）
 
-`links = [A(过期), B(正常), C(过期)]`, len=3
+**准备**：`links = [A(过期), B(过期), C(正常), D(过期)]`，底层数组初始 Len=4, Cap=4
 
-| i | link | 过期 | DB 删除 | 切片操作 | 结果 links |
-|---|------|------|---------|----------|-----------|
-| 0 | A | ✅ | ✅ | `append(links[:0], links[1:])` | `[B, C]`, len=2 |
-| 1 | B | ❌ | - | 无 | `[B, C]` |
-| 2 | C | ✅ | ✅ | `links[:3]` → len=2, 越界 | 💥 panic |
+```
+内存初始状态:
+  links: [Data=&arr[0], Len=4, Cap=4]
+  arr:   [ A ][ B ][ C ][ D ]
+           0    1    2    3
+          (过)  (过)  (正)  (过)
+```
 
-**即使非连续也会 panic！** 只要有过期元素导致切片缩短，后续 i 超过新长度就会越界。
+```go
+// ===== 循环开始前 =====
+_temp_range = links   // Data=&arr[0], Len=4, Cap=4
+_len = 4              // 迭代次数固定为 4 次
+```
+
+---
+
+##### ▶️ 第 1 次迭代：`i=0`
+
+```go
+// Step 1: 读 link
+link = *(_temp_range.Data + 0*Size) = arr[0] = A
+// link.Expire → 过期 ✅
+
+// Step 2: DB 删除 (正确)
+s.Delete(A.Hash)   // ✅ A 从 DB 删除
+
+// Step 3: 切片操作 —— 关键点！
+// links[:0] = [Data=&arr[0], Len=0, Cap=4] → 空切片，头在 arr[0]
+// links[1:] = [Data=&arr[1], Len=3, Cap=3] → [B, C, D]
+// append → 容量足够，将 [B,C,D] 拷贝到 arr[0..2]
+links = append(links[:0], links[1:]...)
+```
+
+**内存写入后**：
+
+```
+arr:   [ B ][ C ][ D ][ D ]
+         0    1    2    3   ← arr[3] 是旧值，未被覆盖
+links: [Data=&arr[0], Len=3, Cap=4]   ← Len 从 4 变成 3
+```
+
+**本步总结**：DB 正确删 A，切片正确变 [B,C,D]，无异常
+
+---
+
+##### ▶️ 第 2 次迭代：`i=1`
+
+```go
+// Step 1: 读 link —— ⚠️ 从共享数组实时读！
+link = *(_temp_range.Data + 1*Size) = arr[1] = C
+//                       ↑ 不是 B！是 C！
+// arr[1] 已经在上一步被 B→C 的拷贝覆盖了
+// link.Expire → C 是正常的 ❌，不进入删除分支
+```
+
+**什么都没做！** B（原本应该被删）在 arr[0]，但 `i` 已经走到了 1，**B 永远不会被检查到了**。
+
+**内存保持不变**：`arr=[B,C,D,D]`, `links=[B,C,D]`, `Len=3`
+
+**本步总结**：
+- ❌ **DB 漏删 B**（B 移到了 arr[0]，但 i=1 跳过了它）
+- ❌ **C 被当作正常**（实际读到的是 arr[1]=C，但原 B 已跳过）
+
+---
+
+##### ▶️ 第 3 次迭代：`i=2`
+
+```go
+// Step 1: 读 link
+link = *(_temp_range.Data + 2*Size) = arr[2] = D
+// link.Expire → 过期 ✅
+
+// Step 2: DB 删除
+s.Delete(D.Hash)   // ✅ D 从 DB 删除
+
+// Step 3: 切片操作
+// 当前 links.Len = 3, i = 2
+// links[:2] = [B, C]   (Len=2)
+// links[3:] = [Data=&arr[3], Len=0, ...] → 空切片 (Len=3, start=3)
+links = append(links[:2], links[3:]...)  // 追加空 → [B, C]
+```
+
+**内存写入后**：
+
+```
+arr:   [ B ][ C ][ D ][ D ]   (不变)
+links: [Data=&arr[0], Len=2, Cap=4]   ← Len 从 3 变成 2
+```
+
+**本步总结**：DB 正确删 D，切片变 [B,C]，无异常
+
+---
+
+##### ▶️ 第 4 次迭代：`i=3`
+
+```go
+// Step 1: 读 link
+link = *(_temp_range.Data + 3*Size) = arr[3] = D
+// link.Expire → 过期 ✅ (D 的指针值还在，字段未变)
+
+// Step 2: DB 删除
+s.Delete(D.Hash)   // 没问题，Delete 是幂等的，不会报错
+
+// Step 3: 切片操作 —— 💥 BOOM!
+// 当前 links.Len = 2, i = 3
+links[:3]   // ⚠️ 切片上界 3 > 当前 Len 2
+            // → runtime panic: slice bounds out of range [:3] with length 2
+```
+
+---
+
+##### 📊 场景 A 最终结果汇总
+
+| 检查项 | 结果 | 说明 |
+|--------|------|------|
+| DB 中 A | ✅ 已删 | 正确 |
+| DB 中 B | ❌ **残留** | 移到 arr[0] 后被跳过，**DB 漏删** |
+| DB 中 C | ✅ 保留 | 正确（C 未过期） |
+| DB 中 D | ✅ 已删 | 正确 |
+| 返回切片 | `[B, C]` | B 在 DB 中不存在 → 后续访问时 404 |
+| 运行状态 | 💥 **panic** | `i=3` 时 `links[:3]` 越界 |
+
+**核心问题链**：
+1. `i=0` 删 A → `[B,C,D]` 拷入 `arr[0..2]` → **B 移到 arr[0]**
+2. `i=1` 读 `arr[1]=C`（正常）→ **跳过 B** → **DB 漏删**
+3. 切片 Len 从 4→3→2，但 `i` 继续递增到 3 → **`links[:3]` 越界 panic**
+
+---
+
+#### 复现场景 B：全部连续过期
+
+`links = [A(过期), B(过期), C(过期)]`, Len=3, Cap=3
+
+| i | link = arr[i] | 过期 | DB 删除 | 操作后 arr | 操作后 links.Len | 异常 |
+|---|--------------|------|---------|-----------|-----------------|------|
+| 0 | A | ✅ | Delete(A) ✅ | `[B,C,C]` | 2 | - |
+| 1 | arr[1] = **C** (原本是 B，被覆盖了) | ✅ | Delete(C) ✅ | `[B,C,C]` | 1 | ❌ **DB 漏删 B** |
+| 2 | arr[2] = C | ✅ | Delete(C) (幂等) | - | 1 | 💥 `links[:2]` 越界 |
+
+最终：B 在 DB 残留，返回 `[B]`，panic 或 返回错误数据。
+
+---
+
+#### 复现场景 C：非连续过期（中间有正常元素）
+
+`links = [A(过期), B(正常), C(过期)]`, Len=3, Cap=3
+
+| i | link = arr[i] | 过期 | DB 删除 | 操作后 arr | 操作后 links.Len | 异常 |
+|---|--------------|------|---------|-----------|-----------------|------|
+| 0 | A | ✅ | Delete(A) ✅ | `[B,C,C]` | 2 | - |
+| 1 | arr[1] = **C** (原本是 B，被覆盖了！) | ✅ | Delete(C) ✅ | `[B,C,C]` | 1 | ❌ **本应检查 B，实际检查了 C**<br>❌ **C 的过期判断结果被用于了原本 B 的位置** |
+| 2 | arr[2] = C | ✅ | Delete(C) | - | 1 | 💥 `links[:2]` 越界 |
+
+**非连续过期同样出问题**：即使中间有正常元素，`i=1` 读到的也是 `arr[1]=C` 而非原本的 B。
+
+---
 
 #### 受影响的 API
 
 | API 端点 | 调用的方法 | 影响程度 |
 |----------|-----------|---------|
-| `GET /api/shares` | `All()` [share/storage.go#L32-L49](share/storage.go#L32-L49) | 🔴 严重 - 可能 panic + 返回数据错乱 |
+| `GET /api/shares` | `All()` [share/storage.go#L32-L49](share/storage.go#L32-L49) | 🔴 严重 - DB 漏删 + 返回数据错乱 + 可能 panic |
 | `GET /api/share/{path}` | `Gets()` [share/storage.go#L94-L111](share/storage.go#L94-L111) | 🔴 严重 - 同上 |
-| `GetsByPath()` | 内部调用 `All()` | 🔴 严重 - 同上 |
+| `GetsByPath()` [share/storage.go#L113-L128](share/storage.go#L113-L128) | 内部调用 `All()` | 🔴 严重 - 同上 |
 | `GET /api/public/share/{hash}` | `GetByHash()` [share/storage.go#L72-L86](share/storage.go#L72-L86) | 🟢 安全 - 单条查询无循环 |
 | 删除文件级联 | `DeleteWithPathPrefix()` [storage/bolt/share.go#L80-L104](storage/bolt/share.go#L80-L104) | 🟢 安全 - Bolt 底层实现，不经过 Storage 包装层 |
 
@@ -430,16 +585,17 @@ range 开始：临时副本 `temp = [A, B, C, D]`，迭代次数固定为 4
 
 | 现象 | 说明 |
 |------|------|
-| ✅ DB 删除 | 总是正确（`link` 来自原始切片） |
-| ❌ 返回切片 | 可能缺失正常元素 + 残留已删除元素 |
-| 💥 Runtime Panic | 只要有过期元素且迭代 i 超过新长度就会发生 |
-| 🔄 最终一致性 | 如果没 panic，下次调用重新从 DB 读取，会得到正确结果（因为 DB 已删） |
+| ❌ **DB 漏删** | 连续过期时第 2、4、6… 个元素会被跳过（移动到已检查的索引位置） |
+| ❌ **DB 误删** | 非连续时正常元素的位置可能被过期元素覆盖，导致用错对象判断 |
+| ❌ **返回切片错乱** | 返回切片中可能包含 DB 中已删除的元素，或漏掉本应保留的元素 |
+| 💥 **Runtime Panic** | 只要发生过删除（Len 缩短），后续 `i >= links.Len` 就会触发 `slice bounds out of range` |
+| 🔄 **最终一致性** | 如果没 panic，下次调用重新从 DB 读取，可能进一步清理部分残留，但仍可能漏删 |
 
 #### 修复方案
 
 **方案 A：收集而非原地删除（推荐，最清晰，无副作用）**
 
-构建新切片，永远不修改正在遍历的切片：
+构建新切片，**永远不修改正在遍历的切片**：
 
 ```go
 var filtered []*Link
@@ -457,7 +613,7 @@ return filtered, nil
 
 **方案 B：反向遍历（最小改动）**
 
-从后往前遍历，删除元素不影响未检查的索引：
+从后往前遍历，删除元素只影响未检查的索引（因为它们在已检查索引的前面）：
 
 ```go
 for i := len(links) - 1; i >= 0; i-- {
@@ -471,9 +627,9 @@ for i := len(links) - 1; i >= 0; i-- {
 }
 ```
 
-**方案 C：使用普通 for 循环 + 手动索引控制**
+**方案 C：普通 for 循环 + 手动索引控制**
 
-不使用 range，动态检查 `len(links)`，删除后回退索引：
+不使用 range，动态检查 `len(links)`，删除后回退索引确保不跳过：
 
 ```go
 for i := 0; i < len(links); i++ {
@@ -483,7 +639,7 @@ for i := 0; i < len(links); i++ {
             return nil, err
         }
         links = append(links[:i], links[i+1:]...)
-        i--  // 回退，下次继续检查当前位置
+        i--  // 回退，下次循环继续检查当前位置
     }
 }
 ```
@@ -558,7 +714,7 @@ type Link struct {
 | 8 | checkerPrefix 规则补偿 | [http/data.go#L42-L43](http/data.go#L42-L43) | 分享子目录绕过所有者 deny 规则 |
 | 9 | 删除分享只能本人或 Admin | [http/share.go#L92-L93](http/share.go#L92-L93) | 普通用户删别人的分享 |
 | 10 | DeleteWithPathPrefix 精确路径 + UserID 过滤 | [storage/bolt/share.go#L93-L99](storage/bolt/share.go#L93-L99) | 删除级联误删他人链接 |
-| 11 | ⚠️ range 遍历删除导致数据错乱 + panic | [share/storage.go#L39-L46](share/storage.go#L39-L46) | 返回切片数据错乱 + runtime panic（待修复） |
+| 11 | ⚠️ range 遍历 + 原地修改切片 | [share/storage.go#L39-L46](share/storage.go#L39-L46) | DB 漏删过期链接 + 返回切片错乱 + runtime panic（待修复） |
 
 ---
 

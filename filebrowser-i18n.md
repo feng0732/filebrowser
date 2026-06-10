@@ -707,3 +707,537 @@ i18n.global.t("buttons.reportIssue")
 4. **持久化存储**：用户语言偏好通过 JWT Token 下发，保存在后端 BoltDB 中
 5. **生态协同**：vue-i18n 负责界面翻译，dayjs 负责日期本地化，两者通过 `setLocale()` 统一调度
 6. **无动态导入**：dayjs locale 和语言 JSON 均为全量加载，未使用代码分割进行按需加载
+
+---
+
+## 十二、三层架构对应关系全景分析
+
+国际化系统涉及三个独立的"语言代码"来源，它们之间存在不一致甚至冲突。本节逐一拆解。
+
+### 12.1 五层数据对照表
+
+| 语言代码 | 资源文件(JSON) | detectLocale返回 | Languages下拉key | dayjs加载 | RTL列表 | 完整可达 |
+|---------|:---:|:---:|:---:|:---:|:---:|:---:|
+| ar | ✅ ar.json | ✅ "ar" | ✅ "ar" | ✅ ar | ✅ 是 | ✅ 是 |
+| bg | ✅ bg.json | ✅ "bg" | ✅ "bg" | ✅ bg | ❌ | ✅ 是 |
+| ca | ✅ ca.json | ❌ 无分支→en | ✅ "ca" | ✅ ca | ❌ | ⚠️ 仅手动 |
+| cs | ✅ cs.json | ✅ "cs" | ✅ "cs" | ✅ cs | ❌ | ✅ 是 |
+| de | ✅ de.json | ✅ "de" | ✅ "de" | ✅ de | ❌ | ✅ 是 |
+| el | ✅ el.json | ✅ "el" | ✅ "el" | ✅ el | ❌ | ✅ 是 |
+| en | ✅ en.json | ✅ "en" | ✅ "en" | ✅ en | ❌ | ✅ 是 |
+| es | ✅ es.json | ✅ "es" | ✅ "es" | ✅ es | ❌ | ✅ 是 |
+| **fa** | ✅ fa.json | ❌ 无分支→en | ❌ 不存在 | ❌ 未加载 | ❌ 不在列表 | ❌ 完全不可达 |
+| fr | ✅ fr.json | ✅ "fr" | ✅ "fr" | ✅ fr | ❌ | ✅ 是 |
+| he | ✅ he.json | ✅ "he" | ✅ "he" | ✅ he | ✅ 是 | ✅ 是 |
+| hr | ✅ hr.json | ✅ "hr" | ✅ "hr" | ✅ hr | ❌ | ✅ 是 |
+| hu | ✅ hu.json | ✅ "hu" | ✅ "hu" | ✅ hu | ❌ | ✅ 是 |
+| is | ✅ is.json | ✅ "is" | ✅ "is" | ✅ is | ❌ | ✅ 是 |
+| it | ✅ it.json | ✅ "it" | ✅ "it" | ✅ it | ❌ | ✅ 是 |
+| ja | ✅ ja.json | ✅ "ja" | ✅ "ja" | ✅ ja | ❌ | ✅ 是 |
+| ko | ✅ ko.json | ✅ "ko" | ✅ "ko" | ✅ ko | ❌ | ✅ 是 |
+| lv | ✅ lv.json | ✅ "lv" | ✅ "lv" | ✅ lv | ❌ | ✅ 是 |
+| nl | ✅ nl.json | ✅ "nl" | ✅ "nl" | ✅ nl | ❌ | ✅ 是 |
+| **nl-be** | ✅ nl-be.json | ⚠️ 被nl截断 | ✅ "nl-be" | ✅ nl-be | ❌ | ⚠️ 仅手动 |
+| no | ✅ no.json | ✅ "no"(nb/no) | ✅ "no" | ✅ nb | ❌ | ⚠️ 部分(dayjs不匹配) |
+| pl | ✅ pl.json | ✅ "pl" | ✅ "pl" | ✅ pl | ❌ | ✅ 是 |
+| **pt** | ✅ pt.json | ⚠️ 映射到pt-pt | ❌ 不存在 | ✅ pt | ❌ | ❌ 不可达 |
+| pt-br | ✅ pt-br.json | ✅ "pt-br" | ✅ "pt-br" | ✅ pt-br | ❌ | ✅ 是 |
+| pt-pt | ✅ pt-pt.json | ✅ "pt-pt" | ✅ "pt-pt" | ❌ 未加载 | ❌ | ⚠️ 日期不本地化 |
+| ro | ✅ ro.json | ✅ "ro" | ✅ "ro" | ✅ ro | ❌ | ✅ 是 |
+| ru | ✅ ru.json | ✅ "ru" | ✅ "ru" | ✅ ru | ❌ | ✅ 是 |
+| sk | ✅ sk.json | ✅ "sk" | ✅ "sk" | ✅ sk | ❌ | ✅ 是 |
+| **sv-se** | ✅ sv-se.json | ⚠️ 返回"sv"不匹配 | ✅ "sv-se" | ✅ sv(而非sv-se) | ❌ | ⚠️ 复杂错位 |
+| tr | ✅ tr.json | ✅ "tr" | ✅ "tr" | ✅ tr | ❌ | ✅ 是 |
+| uk | ✅ uk.json | ✅ "uk" | ✅ "uk" | ✅ uk | ❌ | ✅ 是 |
+| vi | ✅ vi.json | ✅ "vi" | ✅ "vi" | ✅ vi | ❌ | ✅ 是 |
+| zh-cn | ✅ zh-cn.json | ✅ "zh-cn" | ✅ "zh-cn" | ✅ zh-cn | ❌ | ✅ 是 |
+| zh-tw | ✅ zh-tw.json | ✅ "zh-tw" | ✅ "zh-tw" | ✅ zh-tw | ❌ | ✅ 是 |
+
+**可达性说明**：
+- ✅ 是：浏览器自动检测 + 手动下拉 + dayjs本地化 + RTL(如适用) 全部正常
+- ⚠️ 部分：某个环节存在缺陷但仍可部分使用
+- ❌ 不可达：翻译资源存在但没有任何入口可以触发
+
+---
+
+### 12.2 messages 对象的 key 生成机制
+
+`@intlify/unplugin-vue-i18n` 插件根据 JSON 文件名生成 messages 的 key。
+
+以 [vite.config.ts](file:///d:/fz/0601/solo-dogfeeding/code/178-filebrowser/frontend/vite.config.ts#L10-L12) 的配置为例：
+
+```typescript
+VueI18nPlugin({
+  include: [path.resolve(__dirname, "./src/i18n/**/*.json")],
+})
+```
+
+对于 `src/i18n/` 下的文件，key 规则为 **文件名（去扩展名）**：
+
+| 文件名 | messages 中的 key |
+|--------|-------------------|
+| en.json | "en" |
+| zh-cn.json | "zh-cn" |
+| sv-se.json | "sv-se" |
+| nl-be.json | "nl-be" |
+| fa.json | "fa" |
+
+这意味着：**setLocale() 传入的 locale 参数必须与 JSON 文件名完全一致**，否则 vue-i18n 找不到该语言的翻译字典，触发 fallbackLocale 回退到英语。
+
+---
+
+## 十三、重点边界语言深度分析
+
+### 13.1 瑞典语（sv / sv-se）——四层错位
+
+#### 13.1.1 各层代码值对比
+
+| 层级 | 位置 | 值 | 代码依据 |
+|------|------|----|---------|
+| 资源文件 | `frontend/src/i18n/sv-se.json` | `"sv-se"` | 文件名即 messages key |
+| 浏览器检测 | [detectLocale() L129-L132](file:///d:/fz/0601/solo-dogfeeding/code/178-filebrowser/frontend/src/i18n/index.ts#L129-L132) | `"sv"` | `/^sv-se\b/` 或 `/^sv\b/` 均返回 `"sv"` |
+| 下拉选项 | [Languages.vue L44](file:///d:/fz/0601/solo-dogfeeding/code/178-filebrowser/frontend/src/components/settings/Languages.vue#L44) | `"sv-se"` | `locales["sv-se"] = "Swedish (Sweden)"` |
+| dayjs locale | [i18n/index.ts L30](file:///d:/fz/0601/solo-dogfeeding/code/178-filebrowser/frontend/src/i18n/index.ts#L30) | `"sv"` | `import("dayjs/locale/sv")` |
+
+#### 13.1.2 可达入口分析
+
+**入口 1：浏览器自动检测**
+
+```
+navigator.language = "sv-SE" 或 "sv"
+    │
+    ▼
+detectLocale():
+    /^sv-se\b/.test("sv-se")  → true  → locale = "sv"   // ← 注意是"sv"不是"sv-se"
+    /^sv\b/.test("sv")        → true  → locale = "sv"
+    │
+    ▼
+setLocale("sv"):
+    ├─ dayjs.locale("sv")        → ✅ 正常，dayjs/sv 已加载
+    └─ i18n.global.locale = "sv" → ❌ messages 中只有 key "sv-se"，没有 "sv"
+         │
+         ▼
+    vue-i18n fallback 到 fallbackLocale = "en"
+         │
+         ▼
+    界面显示英语，但日期显示为瑞典语格式
+```
+
+**实际效果**：用户浏览器语言为瑞典语时，界面显示英语，日期却是瑞典语格式，造成不一致。
+
+**入口 2：用户手动下拉选择**
+
+```
+用户选择 "Swedish (Sweden)"
+    │
+    ▼
+Profile.vue → api.update(data, ["locale", ...])
+    │
+    ▼
+authStore.updateUser({ locale: "sv-se", ... })
+    │
+    ▼
+setLocale("sv-se"):
+    ├─ dayjs.locale("sv-se")    → ❌ dayjs 中没有 "sv-se"，只有 "sv"
+    │                           →   dayjs 静默回退到英语日期格式
+    └─ i18n.global.locale = "sv-se" → ✅ 匹配 messages key，翻译正常
+```
+
+**实际效果**：用户手动选择后界面翻译正常（瑞典语），但日期格式退化为英语，造成另一种不一致。
+
+#### 13.1.3 切换影响总结
+
+| 切换方式 | 界面翻译 | 日期格式 | 一致性 |
+|---------|:---:|:---:|:---:|
+| 浏览器检测 sv/sv-SE | ❌ 英语 | ✅ 瑞典语 | ❌ 错位 |
+| 手动选择 Swedish (Sweden) | ✅ 瑞典语 | ❌ 英语 | ❌ 错位 |
+
+**根因**：四层代码使用了三个不同的标识符 —— `sv-se`（资源/下拉）、`sv`（检测/dayjs），互不统一。
+
+---
+
+### 13.2 荷兰语比利时（nl-be）——正则顺序 BUG
+
+#### 13.2.1 正则匹配顺序分析
+
+关键代码位于 [i18n/index.ts L133-L138](file:///d:/fz/0601/solo-dogfeeding/code/178-filebrowser/frontend/src/i18n/index.ts#L133-L138)：
+
+```typescript
+case /^nl\b/.test(locale):      // ← 先匹配
+    locale = "nl";
+    break;
+case /^nl-be\b/.test(locale):   // ← 后匹配（永远不会执行）
+    locale = "nl-be";
+    break;
+```
+
+**问题核心**：`switch(true)` 是按 `case` 顺序依次判断的，第一个匹配的 case 执行后 `break` 跳出。
+
+正则 `/^nl\b/` 的含义是"以 nl 开头且 nl 后是单词边界"。对于字符串 `"nl-be"`：
+- `^nl` 匹配开头的 "nl"
+- `\b` 匹配 "nl" 和 "-" 之间的位置（连字符属于非单词字符，`\w` 与 `\W` 之间存在单词边界）
+- 因此 **`/^nl\b/.test("nl-be")` 返回 `true`**
+
+**匹配结果**：
+
+| navigator.language | 命中的 case | 返回值 | 期望返回 |
+|-------------------|:---:|:---:|:---:|
+| `"nl"` | `/^nl\b/` | `"nl"` | ✅ `"nl"` |
+| `"nl-NL"` | `/^nl\b/` | `"nl"` | ✅ `"nl"` |
+| `"nl-be"` | `/^nl\b/` ← 错误命中 | `"nl"` | ❌ 应为 `"nl-be"` |
+| `"nl-BE"` | `/^nl\b/` ← 错误命中 | `"nl"` | ❌ 应为 `"nl-be"` |
+
+#### 13.2.2 可达入口分析
+
+**入口 1：浏览器自动检测**
+
+比利时荷兰语用户的 `navigator.language` 通常是 `"nl-BE"` 或 `"nl-be"`，会被错误归类为 `"nl"`（荷兰本土荷兰语），自动加载 `nl.json` 而非 `nl-be.json`。
+
+两种荷兰语翻译存在差异（如 `nl-be.json` 中部分词汇使用比利时惯用表达），用户看到的是错误的地域变体。
+
+**入口 2：用户手动下拉选择**
+
+下拉中存在 `"nl-be": "Nederlands (België)"` 选项，用户可以手动选择，此时：
+
+```
+setLocale("nl-be"):
+    ├─ dayjs.locale("nl-be")     → ✅ dayjs/locale/nl-be 已加载
+    └─ i18n.global.locale = "nl-be" → ✅ 匹配 nl-be.json
+         │
+         ▼
+    界面和日期都正常显示比利时荷兰语
+```
+
+#### 13.2.3 切换影响总结
+
+| 切换方式 | 界面翻译 | 日期格式 | 地域正确性 |
+|---------|:---:|:---:|:---:|
+| 浏览器检测 nl-BE | ⚠️ 荷兰本土荷兰语 | ⚠️ 荷兰本土格式 | ❌ 错误 |
+| 手动选择 Nederlands (België) | ✅ 比利时荷兰语 | ✅ 比利时格式 | ✅ 正确 |
+
+**根因**：正则匹配顺序错误——更具体的 `nl-be` 分支应该放在更通用的 `nl` 分支之前。这与同文件中的 `pt-br` 放在 `pt` 之前、`zh-tw` 放在 `zh-cn` 之前的正确模式形成鲜明对比（见 [L85-L91](file:///d:/fz/0601/solo-dogfeeding/code/178-filebrowser/frontend/src/i18n/index.ts#L85-L91) 和 [L95-L101](file:///d:/fz/0601/solo-dogfeeding/code/178-filebrowser/frontend/src/i18n/index.ts#L95-L101)）。
+
+---
+
+### 13.3 波斯语（fa）——翻译资源存在但完全不可达
+
+#### 13.3.1 各层检查结果
+
+波斯语（فارسی，Farsi）是伊朗的官方语言，属于 RTL（从右到左）书写系统。
+
+| 检查项 | 状态 | 证据 |
+|-------|:---:|-----|
+| JSON 翻译资源 | ✅ 存在 | [frontend/src/i18n/fa.json](file:///d:/fz/0601/solo-dogfeeding/code/178-filebrowser/frontend/src/i18n/fa.json)，翻译完整（按钮、设置等均有波斯语译文） |
+| detectLocale 分支 | ❌ 完全缺失 | [i18n/index.ts L45-L146](file:///d:/fz/0601/solo-dogfeeding/code/178-filebrowser/frontend/src/i18n/index.ts#L45-L146) 的 switch 中无任何 `/^fa\b/` 分支 |
+| Languages 下拉选项 | ❌ 完全缺失 | [Languages.vue L17-L50](file:///d:/fz/0601/solo-dogfeeding/code/178-filebrowser/frontend/src/components/settings/Languages.vue#L17-L50) 的 locales 对象中无 `"fa"` 键 |
+| dayjs locale 加载 | ❌ 未加载 | [i18n/index.ts L4-L35](file:///d:/fz/0601/solo-dogfeeding/code/178-filebrowser/frontend/src/i18n/index.ts#L4-L35) 的 import 列表中无 `dayjs/locale/fa` |
+| RTL 语言列表 | ❌ 未包含 | [i18n/index.ts L164](file:///d:/fz/0601/solo-dogfeeding/code/178-filebrowser/frontend/src/i18n/index.ts#L164)：`rtlLanguages = ["he", "ar"]`，fa 不在其中 |
+
+#### 13.3.2 可达入口分析
+
+**入口 1：浏览器自动检测**
+
+伊朗用户 `navigator.language = "fa-IR"` 或 `"fa"`：
+
+```
+detectLocale():
+    遍历所有 case，无一匹配 /^fa\b/
+        │
+        ▼
+    default: locale = "en"
+        │
+        ▼
+    界面显示英语
+```
+
+**入口 2：设置页手动选择**
+
+下拉框中根本没有波斯语选项，用户无法选择。
+
+**入口 3：管理员设置用户默认语言**
+
+全局设置 → 用户默认值 → UserForm 中使用同一个 Languages 组件，同样没有 fa 选项。
+
+**入口 4：直接调用 API 修改用户 locale**
+
+即使通过 API 直接将用户的 locale 设为 `"fa"`（绕过前端），登录后：
+
+```
+setLocale("fa"):
+    ├─ dayjs.locale("fa")          → ❌ dayjs/fa 未加载，日期退化为英语
+    └─ i18n.global.locale = "fa"   → ✅ fa.json 存在，翻译正常
+         │
+         ▼
+    setHtmlLocale("fa"):
+        isRtl("fa") → rtlLanguages.includes("fa") → false
+            │
+            ▼
+        html.dir = "ltr"   ← ❌ 波斯语应该是 RTL，但实际是 LTR
+```
+
+**结果**：翻译显示为波斯语，但布局是从左到右（文字方向错误，阅读困难），日期也是英语格式。
+
+#### 13.3.3 切换影响总结
+
+| 场景 | 界面翻译 | 日期格式 | 文字方向 |
+|-----|:---:|:---:|:---:|
+| 正常访问（检测/手动均不可达） | ❌ 英语 | ❌ 英语 | ❌ LTR（英语方向） |
+| 强制API设置 locale="fa" | ✅ 波斯语 | ❌ 英语 | ❌ LTR（应为RTL） |
+
+**根因**：fa.json 翻译文件被贡献者提交，但后续的四个集成点（检测分支、下拉选项、dayjs加载、RTL列表）均未同步添加，形成"孤立资源"。
+
+---
+
+### 13.4 葡萄牙语系列（pt / pt-br / pt-pt）——三叉戟错位
+
+葡萄牙语有三个资源文件，但三者在各层的支持程度不一致。
+
+#### 13.4.1 资源文件对比
+
+| 资源文件 | 代表地区 | 翻译特点示例（buttons.cancel） |
+|---------|---------|---------|
+| [pt.json](file:///d:/fz/0601/solo-dogfeeding/code/178-filebrowser/frontend/src/i18n/pt.json#L3) | 通用/欧洲葡萄牙语 | "Cancelar" |
+| [pt-br.json](file:///d:/fz/0601/solo-dogfeeding/code/178-filebrowser/frontend/src/i18n/pt-br.json) | 巴西葡萄牙语 | （有独立翻译） |
+| [pt-pt.json](file:///d:/fz/0601/solo-dogfeeding/code/178-filebrowser/frontend/src/i18n/pt-pt.json) | 葡萄牙（欧洲）葡萄牙语 | （有独立翻译） |
+
+注意：`pt.json` 的翻译内容（如 `"Cancelar"`, `"Eliminar"`, `"Alterar nome"`）使用的是欧洲葡萄牙语拼写，与 `pt-pt.json` 应基本一致。
+
+#### 13.4.2 detectLocale 映射分析
+
+关键代码 [i18n/index.ts L85-L91](file:///d:/fz/0601/solo-dogfeeding/code/178-filebrowser/frontend/src/i18n/index.ts#L85-L91)：
+
+```typescript
+case /^pt-br\b/.test(locale):    // 巴西，必须放在前面
+    locale = "pt-br";
+    break;
+case /^pt-pt\b/.test(locale):    // 葡萄牙（欧洲）
+case /^pt\b/.test(locale):       // 其他所有 pt 变体（如 pt-AO 安哥拉、pt-MZ 莫桑比克）
+    locale = "pt-pt";            // ← 都强制映射到 pt-pt
+    break;
+```
+
+**映射结果**：
+
+| navigator.language | 返回 locale | 实际使用的翻译文件 |
+|-------------------|:---:|:---:|
+| `"pt-BR"` / `"pt-br"` | `"pt-br"` | ✅ pt-br.json |
+| `"pt-PT"` / `"pt-pt"` | `"pt-pt"` | ✅ pt-pt.json |
+| `"pt"` / `"pt-AO"` / `"pt-MZ"` / ... | `"pt-pt"` | ⚠️ pt-pt.json（而非 pt.json） |
+
+**关键发现**：`pt.json` 虽然存在，但浏览器自动检测永远不会返回 `"pt"`——所有非巴西的葡萄牙语都被强制映射到 `"pt-pt"`。
+
+#### 13.4.3 下拉选项分析
+
+[Languages.vue L39-L40](file:///d:/fz/0601/solo-dogfeeding/code/178-filebrowser/frontend/src/components/settings/Languages.vue#L39-L40)：
+
+```javascript
+"pt-br": "Português (Brasil)",
+"pt-pt": "Português (Portugal)",
+```
+
+下拉中只有两个选项，没有单独的 `"pt"`。因此 `pt.json` 在手动选择场景下也不可达。
+
+#### 13.4.4 dayjs 加载分析
+
+[i18n/index.ts L25-L26](file:///d:/fz/0601/solo-dogfeeding/code/178-filebrowser/frontend/src/i18n/index.ts#L25-L26)：
+
+```typescript
+import("dayjs/locale/pt-br");   // ✅ 巴西葡萄牙语
+import("dayjs/locale/pt");      // ⚠️ 这是通用葡萄牙语（即欧洲葡萄牙语）
+// ❌ 没有 import("dayjs/locale/pt-pt")
+```
+
+dayjs 库中：
+- `dayjs/locale/pt` = 欧洲葡萄牙语（葡萄牙）
+- `dayjs/locale/pt-br` = 巴西葡萄牙语
+- dayjs **不存在** `pt-pt` 这个 locale（欧洲葡萄牙语用 `pt` 即可）
+
+#### 13.4.5 可达入口与切换影响
+
+**入口 1：巴西用户浏览器检测 pt-BR**
+
+```
+setLocale("pt-br"):
+    ├─ dayjs.locale("pt-br")  → ✅ 已加载，日期使用巴西格式
+    └─ i18n: "pt-br"          → ✅ pt-br.json，翻译正常
+```
+
+✅ 完全正常。
+
+**入口 2：葡萄牙用户浏览器检测 pt-PT**
+
+```
+setLocale("pt-pt"):
+    ├─ dayjs.locale("pt-pt")  → ❌ dayjs 中无 pt-pt 这个 locale
+    │                          →   dayjs 静默回退到英语格式
+    └─ i18n: "pt-pt"          → ✅ pt-pt.json，翻译正常
+```
+
+**结果**：界面翻译正确（欧洲葡萄牙语），但日期显示为英语格式，不一致。
+
+**入口 3：用户手动选择 "Português (Portugal)"**
+
+与入口 2 相同，dayjs 日期格式退化为英语。
+
+**入口 4：安哥拉/莫桑比克等其他葡语国家用户**
+
+浏览器语言 `pt-AO` → 被检测映射到 `"pt-pt"`，结果同入口 2（翻译正确，日期英语）。
+
+**pt.json 的命运**：
+
+无论自动检测还是手动选择，都无法触发 `pt.json`。它与 `pt-pt.json` 内容可能重复（都是欧洲葡萄牙语），属于冗余文件。
+
+#### 13.4.6 切换影响总结
+
+| 场景 | 返回 locale | 界面翻译 | 日期格式 | 一致性 |
+|-----|:---:|:---:|:---:|:---:|
+| 浏览器 pt-BR | "pt-br" | ✅ 巴西葡语 | ✅ 巴西格式 | ✅ 一致 |
+| 浏览器 pt-PT | "pt-pt" | ✅ 欧洲葡语 | ❌ 英语 | ❌ 不一致 |
+| 浏览器 pt（其他） | "pt-pt" | ✅ 欧洲葡语 | ❌ 英语 | ❌ 不一致 |
+| 手动选 Português (Brasil) | "pt-br" | ✅ 巴西葡语 | ✅ 巴西格式 | ✅ 一致 |
+| 手动选 Português (Portugal) | "pt-pt" | ✅ 欧洲葡语 | ❌ 英语 | ❌ 不一致 |
+| pt.json（通用） | — | ❌ 不可达 | ❌ 不可达 | — |
+
+**根因**：vue-i18n 使用 `pt-pt` 作为欧洲葡萄牙语的标识，而 dayjs 使用 `pt`，两者命名约定不同但未做映射。
+
+---
+
+## 十四、边界语言问题汇总与修复建议
+
+### 14.1 问题总表
+
+| 语言 | 问题类型 | 严重程度 | 影响范围 |
+|-----|---------|:---:|---------|
+| fa 波斯语 | 完全不可达（4处缺失） | 🔴 高 | 所有伊朗/波斯语用户 |
+| nl-be 荷兰语比利时 | 正则顺序BUG（自动检测失效） | 🟠 中 | 比利时荷兰语用户（自动检测） |
+| sv-se 瑞典语 | 四层代码标识符错位 | 🟠 中 | 所有瑞典语用户 |
+| pt-pt 葡萄牙语(葡萄牙) | dayjs locale名称不匹配 | 🟡 低 | 欧洲葡语用户的日期显示 |
+| pt 通用葡萄牙语 | 翻译文件不可达 | 🟡 低 | 冗余文件，无用户影响 |
+| ca 加泰罗尼亚语 | 缺少detectLocale分支 | 🟡 低 | 仅手动可选，无法自动检测 |
+
+### 14.2 具体修复建议
+
+**修复 1：瑞典语统一标识符（sv vs sv-se）**
+
+建议方案：统一使用 `"sv-se"`（与资源文件名和下拉选项一致）
+
+```typescript
+// i18n/index.ts
+- case /^sv-se\b/.test(locale):
+- case /^sv\b/.test(locale):
+-     locale = "sv";
++ case /^sv-se\b/.test(locale):
++ case /^sv\b/.test(locale):
++     locale = "sv-se";
+
+- import("dayjs/locale/sv");
++ import("dayjs/locale/sv");  // 保留（dayjs无sv-se）
+// 在 setLocale 中增加映射
++ const dayjsLocaleMap: Record<string, string> = {
++   "sv-se": "sv",
++   "pt-pt": "pt",
++ };
+  export function setLocale(locale: string) {
++   dayjs.locale(dayjsLocaleMap[locale] || locale);
+-   dayjs.locale(locale);
+    i18n.global.locale.value = locale;
+  }
+```
+
+**修复 2：荷兰语比利时正则顺序**
+
+```typescript
+// i18n/index.ts  - 调换两个 case 的顺序
+- case /^nl\b/.test(locale):
+-     locale = "nl";
+-     break;
+  case /^nl-be\b/.test(locale):
+      locale = "nl-be";
+      break;
++ case /^nl\b/.test(locale):
++     locale = "nl";
++     break;
+```
+
+**修复 3：波斯语集成（4处同步添加）**
+
+```typescript
+// i18n/index.ts - 增加检测分支（放在default之前）
++ case /^fa\b/.test(locale):
++     locale = "fa";
++     break;
+
+// i18n/index.ts - 增加 dayjs 加载
++ import("dayjs/locale/fa");
+
+// i18n/index.ts - RTL 列表添加波斯语
+- export const rtlLanguages = ["he", "ar"];
++ export const rtlLanguages = ["he", "ar", "fa"];
+
+// Languages.vue - locales 对象中增加
++ fa: "فارسی",
+```
+
+**修复 4：葡萄牙语 dayjs 映射**
+
+见修复 1 中的 `dayjsLocaleMap` 方案，将 `"pt-pt"` 映射到 dayjs 的 `"pt"`。
+
+**修复 5：检测分支补充（加泰罗尼亚语等）**
+
+```typescript
+// i18n/index.ts
++ case /^ca\b/.test(locale):
++     locale = "ca";
++     break;
+```
+
+---
+
+## 十五、三层架构完整代码流程对照
+
+以下是将语言代码从用户浏览器到最终界面渲染的完整数据流，标注了每层的输入输出和可能的丢失/错位点。
+
+```
+用户访问
+    │
+    │ navigator.language (RFC 5646, e.g. "sv-SE", "nl-BE", "fa-IR")
+    ▼
+┌───────────────────────────────────────────────────┐
+│ 第1层: detectLocale() [i18n/index.ts L41-L149]      │
+│   输入: navigator.language                          │
+│   逻辑: switch(true) + 正则匹配（顺序敏感！）        │
+│   输出: 规范化 locale code                          │
+│   ❌ 丢失风险: fa/ca无分支、nl-be被nl截断、          │
+│              sv→"sv"与资源不匹配                    │
+└───────────────────────┬───────────────────────────┘
+                        │
+                        ▼
+┌───────────────────────────────────────────────────┐
+│ 第2层: i18n 实例初始化 [i18n/index.ts L166-L172]    │
+│   messages key = JSON文件名（如 sv-se.json→"sv-se"） │
+│   ❌ 不匹配风险: detectLocale输出与文件名不一致时，   │
+│                fallback到 en                       │
+└───────────────────────┬───────────────────────────┘
+                        │
+                        ▼
+┌───────────────────────────────────────────────────┐
+│ 第3层: setLocale() 触发                           │
+│   a) dayjs.locale(locale)                          │
+│      ❌ 风险: dayjs无对应locale（如pt-pt、sv-se）    │
+│   b) i18n.global.locale.value = locale             │
+│      ✅ 与 messages key 一致则正常翻译               │
+└───────────────────────┬───────────────────────────┘
+                        │
+                        ▼
+┌───────────────────────────────────────────────────┐
+│ 第4层: App.vue watch(locale) → setHtmlLocale()     │
+│   html.lang = locale                               │
+│   html.dir = isRtl(locale) ? "rtl" : "ltr"         │
+│   ❌ 风险: fa不在rtlLanguages，dir错误为ltr         │
+└───────────────────────┬───────────────────────────┘
+                        │
+                        ▼
+              界面渲染 + Toast RTL + 日期格式
+```
+
+用户手动设置语言时（通过 Profile.vue），跳过第1层（detectLocale），从 Languages.vue 下拉选项的 key 开始进入第2层，因此问题表现与自动检测场景有所不同（如瑞典语手动选择反而能正确翻译，但日期出问题）。

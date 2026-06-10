@@ -7,14 +7,16 @@ File Browser 的文件系统抽象层由三大核心模块协同工作：
 ```
 HTTP 请求层
     ↓
-[权限检查] rules.Checker → data.Check()
+[路径标准化] stripPrefix → path.Clean → checkerPrefix 修正
     ↓
-[路径归一] path.Clean / filepath.EvalSymlinks
+[权限控制]   粗粒度 Perm → 细粒度 rules.Check (data.Check)
     ↓
-[作用域约束] ScopedFs (封装 afero.BasePathFs)
+[作用域约束] ScopedFs.guard/within → afero.BasePathFs
     ↓
 [本地文件操作] afero.OsFs → 操作系统文件系统
 ```
+
+> **关键认识**：路径标准化、权限控制、作用域约束并非只在入口处各执行一次，而是**贯穿整条调用链、在不同层次以不同形式重复出现**，每层都使用前一层输出的路径作为输入。
 
 核心文件分布：
 - [files/scoped.go](files/scoped.go) — 作用域文件系统
@@ -22,6 +24,8 @@ HTTP 请求层
 - [users/permissions.go](users/permissions.go) — 用户权限定义
 - [rules/rules.go](rules/rules.go) — 规则匹配引擎
 - [http/data.go](http/data.go) — 请求上下文与权限检查实现
+- [http/resource.go](http/resource.go) — 资源增删改查 Handler
+- [http/utils.go](http/utils.go) — stripPrefix 等路径工具
 - [fileutils/](fileutils/) — 高级文件操作（复制/移动）
 
 ---
@@ -54,7 +58,7 @@ type Fs interface {
 
 ### 2.2 ScopedFs — 作用域文件系统
 
-[ScopedFs](files/scoped.go) 是核心安全层，封装了 `afero.BasePathFs`，确保所有操作都限制在用户的根目录（Scope）内。
+[ScopedFs](files/scoped.go#L19-L184) 是核心安全层，封装了 `afero.BasePathFs`，确保所有操作都限制在用户的根目录（Scope）内。
 
 **构造方式**（[users/users.go:92-96](users/users.go#L92-L96)）：
 
@@ -74,11 +78,11 @@ u.Fs = files.NewScopedFs(afero.NewOsFs(), scope)
 func (s *ScopedFs) within(p string) (bool, error) {
     // 1. 解析作用域根目录的真实路径（跟随所有符号链接）
     root, err := filepath.EvalSymlinks(afero.FullBaseFsPath(s.base, "/"))
-    
+
     // 2. 解析目标路径的真实路径
     target := afero.FullBaseFsPath(s.base, p)
     resolved, err := filepath.EvalSymlinks(target)
-    
+
     // 3. 若目标不存在，递归向上找最近存在的父目录
     for errors.Is(err, fs.ErrNotExist) {
         parent := filepath.Dir(target)
@@ -86,7 +90,7 @@ func (s *ScopedFs) within(p string) (bool, error) {
         target = parent
         resolved, err = filepath.EvalSymlinks(target)
     }
-    
+
     // 4. 前缀比较：确保 resolved 以 root 为前缀
     prefix := root
     if !strings.HasSuffix(prefix, string(filepath.Separator)) {
@@ -96,7 +100,9 @@ func (s *ScopedFs) within(p string) (bool, error) {
 }
 ```
 
-多数会解引用符号链接或创建新节点的操作（Create/Open/Stat/Chmod/Mkdir/Rename 等）会先调用 `guard()` 检查，失败则返回 `os.ErrPermission`；`Remove` 和 `RemoveAll` 直接委托给底层 BasePathFs，仍受词法作用域约束，但不额外解析符号链接目标。
+**哪些操作会走 guard()**：
+- ✅ 走 guard：`Create`、`Mkdir`、`MkdirAll`、`Open`、`OpenFile`、`Rename`、`Stat`、`Chmod`、`Chown`、`Chtimes`、`LstatIfPossible` — 涉及创建、读内容、改元数据、跟随符号链接
+- ❌ 不走 guard：`Remove`、`RemoveAll`、`Name` — 删除不跟随符号链接，且已受 BasePathFs 词法约束
 
 ### 2.3 FileInfo — 文件信息模型
 
@@ -146,11 +152,11 @@ func NewFileInfo(opts *FileOptions) (*FileInfo, error) {
 
 ---
 
-## 三、权限检查机制
+## 三、权限控制机制
 
 ### 3.1 两层权限模型
 
-权限检查分为**粗粒度操作权限**和**细粒度路径规则**两层。
+权限控制分为**粗粒度操作权限**和**细粒度路径规则**两层，二者按顺序依次检查。
 
 **粗粒度操作权限**（[Permissions](users/permissions.go#L4-L13)）：
 
@@ -167,7 +173,7 @@ type Permissions struct {
 }
 ```
 
-这些在 HTTP Handler 层直接判断，例如 [resourceDeleteHandler](http/resource.go#L84-L88)：
+这些在 HTTP Handler **最开头**直接判断，例如 [resourceDeleteHandler](http/resource.go#L84-L88)：
 
 ```go
 if r.URL.Path == "/" || !d.user.Perm.Delete {
@@ -207,7 +213,8 @@ HTTP 请求上下文 [data](http/data.go#L20-L34) 实现了该接口，完整流
 
 ```go
 func (d *data) Check(path string) bool {
-    // 1. 路径前缀修正（公共分享场景下，FS被二次rebase，需要还原到用户原始作用域）
+    // 1. 路径前缀修正（这也是一次"路径标准化"）
+    //    公共分享场景下，FS被二次rebase，需要还原到用户原始作用域
     if d.checkerPrefix != "" {
         path = gopath.Join(d.checkerPrefix, path)
     }
@@ -236,65 +243,75 @@ func (d *data) Check(path string) bool {
 
 ---
 
-## 四、路径归一化逻辑
+## 四、路径标准化逻辑
 
-### 4.1 归一化的三个层次
+### 4.1 标准化的四个层次
 
-| 层次 | 方法 | 作用 | 位置 |
-|------|------|------|------|
-| 路径字符串清理 | `path.Clean("/" + p)` | 移除 `../`、`./`、多余斜杠，确保以 `/` 开头 | HTTP Handler 入口 |
-| 路径拼接 | `path.Join(...)` / `filepath.Join(...)` | 正确处理多段路径合并 | 多处 |
-| 符号链接解析 | `filepath.EvalSymlinks(...)` | 跟随所有符号链接，得到磁盘上的真实路径 | ScopedFs.within() |
+路径标准化不是一次性操作，而是贯穿整条链路的多层处理：
 
-### 4.2 HTTP 入口处的路径归一
+| 层次 | 方法 | 作用 | 发生位置 |
+|------|------|------|----------|
+| L1 路由前缀剥离 | `stripPrefix()` | 移除 `/api/resources` 等路由前缀，得到资源相对路径 | [http/utils.go:55-80](http/utils.go#L55-L80) |
+| L2 虚拟路径归一 | `path.Clean("/" + p)` | 移除 `../`、`./`、多余斜杠，确保以 `/` 开头 | 各 Handler 入口（PATCH/搜索等） |
+| L3 规则路径修正 | `gopath.Join(checkerPrefix, path)` | 分享场景下还原到用户原始作用域路径 | [http/data.go:42-44](http/data.go#L42-L44) |
+| L4 真实路径解析 | `afero.FullBaseFsPath + filepath.EvalSymlinks` | 虚拟路径→真实磁盘路径→跟随符号链接 | [files/scoped.go:65-94](files/scoped.go#L65-L94) |
 
-HTTP 层并不是所有入口都显式清理路径：读文件等常规入口直接使用路由剥离后的 `r.URL.Path`，写入、移动、复制、搜索等会在各自流程里按需要归一化，确保权限判断和文件系统调用使用一致的虚拟路径。
+### 4.2 L1：路由层前缀剥离 stripPrefix
 
-**示例：重命名/移动操作**（[resourcePatchHandler](http/resource.go#L212-L262)）：
+路由注册时（[http/http.go:60-65](http/http.go#L60-L65)）：
 
 ```go
-src := r.URL.Path
-dst := r.URL.Query().Get("destination")
-dst, err := url.QueryUnescape(dst)
-dst = path.Clean("/" + dst)   // ← 归一化：加前缀"/"，清理 ".."
-src = path.Clean("/" + src)   // ← 同上
-if !d.Check(src) || !d.Check(dst) {  // ← 归一后再做权限检查
-    return http.StatusForbidden, nil
+api.PathPrefix("/resources").Handler(monkey(resourceGetHandler, "/api/resources")).Methods("GET")
+```
+
+`handle()` → `stripPrefix(prefix, handler)` 将 `/api/resources/docs/file.txt` 剥离为 `/docs/file.txt`，存入 `r.URL.Path`。这是所有资源 Handler 收到的原始路径。
+
+### 4.3 L2：Handler 内显式归一化 slashClean / path.Clean
+
+**并不是所有 Handler 都显式做 L2**：
+- **GET /resources**、**DELETE /resources**、**POST /resources**、**PUT /resources**：直接使用路由剥离后的 `r.URL.Path`，主要依赖后续规则检查和文件系统作用域兜底
+- **PATCH /resources**（重命名/复制）：显式 `path.Clean("/" + src)` 和 `path.Clean("/" + dst)`（因为 dst 来自 query 参数，不可信）
+- **搜索**：`filepath.ToSlash + filepath.Clean + path.Join("/", scope)` 三重归一
+- **raw 下载子文件选择**：`slashClean()` 工具函数（[http/raw.go:19-24](http/raw.go#L19-L24)）
+
+```go
+func slashClean(name string) string {
+    if name == "" || name[0] != '/' {
+        name = "/" + name
+    }
+    return gopath.Clean(name)
 }
 ```
 
-**搜索操作**（[search.Search()](search/search.go#L22-L77)）：
+### 4.4 L3：规则检查时的 checkerPrefix 修正
+
+仅公共分享场景生效。当用户 FS 被二次 rebase 到分享子目录时（[http/public.go:70-75](http/public.go#L70-L75)）：
 
 ```go
-scope = filepath.ToSlash(filepath.Clean(scope))
-scope = path.Join("/", scope)
-// 遍历中每个路径也做同样归一
-fPath = filepath.ToSlash(filepath.Clean(fPath))
-fPath = path.Join("/", fPath)
+d.user.Fs = files.NewScopedFs(d.user.Fs, basePath)   // FS 的根变成 ./shared/docs
+d.checkerPrefix = basePath                            // 例如 /shared/docs
 ```
 
-关键步骤：
-1. `filepath.Clean` — 清理原生路径（处理 Windows `\` 等）
-2. `filepath.ToSlash` — 统一转为 POSIX 斜杠 `/`
-3. `path.Join("/", ...)` — 确保绝对路径格式
+后续 `d.Check("/sub/file.txt")` 会在内部拼接为 `/shared/docs/sub/file.txt`，再去匹配用户原始规则。
 
-### 4.3 ScopedFs 内部的路径转换
+### 4.5 L4：ScopedFs 内部虚拟→真实路径转换
 
 ScopedFs 内部维护了**虚拟路径**与**真实磁盘路径**的映射：
 
-- 虚拟路径：`/docs/report.pdf`（相对于用户 Scope）
-- 真实路径：`/home/user/files/docs/report.pdf`（OS 实际路径）
+- 虚拟路径（Handler 视角）：`/docs/report.pdf`（相对于用户 Scope）
+- 真实路径（OS 视角）：`/home/user/files/docs/report.pdf`
 
-转换通过 `afero.FullBaseFsPath(baseFs, vpath)` 完成（[scoped.go:65-70](files/scoped.go#L65-L70)）：
+转换通过 `afero.FullBaseFsPath(baseFs, vpath)` 完成（[files/scoped.go:65-70](files/scoped.go#L65-L70)）：
 
 ```go
 root, err := filepath.EvalSymlinks(afero.FullBaseFsPath(s.base, "/"))  // 真实根目录
 target := afero.FullBaseFsPath(s.base, p)  // 目标文件的真实路径
+resolved, err := filepath.EvalSymlinks(target)  // 跟随所有符号链接
 ```
 
-### 4.4 GET 与目录列表中的路径构造
+### 4.6 目录列表中的路径构造
 
-GET 资源详情入口会把路由剥离后的 `r.URL.Path` 交给 `NewFileInfo`，不在该入口额外调用 `path.Clean`。目录遍历时，子路径通过 `path.Join` 构造，确保列表内子项继续保持统一的虚拟路径格式（[file.go:407](files/file.go#L407)）：
+目录遍历时，子路径通过 `path.Join` 构造（[files/file.go:407](files/file.go#L407)）：
 
 ```go
 fPath := path.Join(i.Path, name)
@@ -305,137 +322,323 @@ if !checker.Check(fPath) {
 
 ---
 
-## 五、三者协作流程
+## 五、路径标准化 → 权限控制 → 作用域约束：精确顺序关系
 
-### 5.1 典型读流程：获取文件信息
+### 5.1 通用执行顺序模型
 
-以 [resourceGetHandler](http/resource.go#L25-L82) 为例：
-
-```
-HTTP GET /api/resources/docs/report.pdf
-    │
-    ▼
-① r.URL.Path                             路由剥离后的虚拟路径
-    │
-    ▼
-② files.NewFileInfo({
-     Fs:      d.user.Fs,                  用户的 ScopedFs
-     Path:    r.URL.Path,                 当前资源虚拟路径
-     Checker: d,                          data.Check() 实现
-     Expand:  true,
-   })
-    │
-    ├─→ ③ Checker.Check(path)            rules 规则检查（隐藏文件+全局规则+用户规则）
-    │        │
-    │        └─ 不通过 → 返回 os.ErrPermission → HTTP 403
-    │
-    ├─→ ④ stat(opts)
-    │        │
-    │        ├─ ScopedFs.LstatIfPossible(path)
-    │        │      │
-    │        │      ├─→ guard(path) → within(path)
-    │        │      │        └─ filepath.EvalSymlinks 检查符号链接是否越界
-    │        │      └─→ afero.BasePathFs.LstatIfPossible → afero.OsFs.Lstat
-    │        │
-    │        └─ 构造 FileInfo（Name/Size/IsDir/Mode...）
-    │
-    └─→ ⑤ detectType(...)                MIME 检测 → 读前 512 字节 → 确定 Type
-             │
-             └─ 文本文件且 saveContent=true → ReadFile 读内容
-    │
-    ▼
-⑥ renderJSON(w, r, file)                 返回 JSON 响应
-```
-
-### 5.2 典型写流程：上传文件
-
-以 [resourcePostHandler](http/resource.go#L125-L178) 为例：
+任何一次文件操作都会按以下顺序逐层穿过抽象栈。每一层的输出是下一层的输入：
 
 ```
-HTTP POST /api/resources/upload/new.txt
+用户输入 (URL Path / Query 参数)
     │
-    ▼
-① 权限检查
-   ├─ d.user.Perm.Create ?                                  粗粒度：创建权限
-   └─ d.Check(r.URL.Path) ?                                 细粒度：路径规则
+    ▼  【L1 路由层】stripPrefix
+    │  剥离 /api/resources 等前缀
+    │  输出：/docs/../secret/./file.txt
     │
-    ▼
-② 目录则 MkdirAll，文件则继续
+    ▼  【L2 Handler 层】path.Clean("/" + p)   ← 仅部分 Handler 显式执行
+    │  清理 ../ ./ 多余斜杠
+    │  输出：/secret/file.txt
     │
-    ▼
-③ 若文件已存在且 override=false → 409 Conflict
-   若 override=true 且 !d.user.Perm.Modify → 403 Forbidden
+    ▼  【权限控制第1关】粗粒度 Perm
+    │  d.user.Perm.Delete / Create / Modify ...
+    │  不通过 → 直接返回 403
     │
-    ▼
-④ writeFile(d.user.Fs, path, body, ...)
+    ▼  【权限控制第2关】细粒度 rules.Check
+    │  d.Check(path)：
+    │    ├─ L3 标准化：gopath.Join(checkerPrefix, path)  ← 分享场景
+    │    ├─ 隐藏文件过滤
+    │    ├─ 全局规则匹配
+    │    └─ 用户规则匹配
+    │  不通过 → 返回 403 或被跳过
     │
-    ├─ MkdirAll(dir, dirMode)                               确保父目录存在
-    │      └─ ScopedFs.MkdirAll → guard → BasePathFs.MkdirAll → OsFs.MkdirAll
+    ▼  【作用域约束第1关】ScopedFs.guard()   ← 仅 Create/Open/Stat/Rename 等
+    │  within(path)：
+    │    ├─ L4 标准化：FullBaseFsPath 虚拟→真实路径
+    │    ├─ L4 标准化：EvalSymlinks 跟随符号链接
+    │    └─ 前缀比较：真实路径是否仍在作用域根下
+    │  不通过 → 返回 os.ErrPermission
     │
-    ├─ OpenFile(path, O_RDWR|O_CREATE|O_TRUNC, fileMode)    打开/创建文件
-    │      └─ ScopedFs.OpenFile → guard → BasePathFs.OpenFile → OsFs.OpenFile
+    ▼  【作用域约束第2关】afero.BasePathFs
+    │  词法层面：自动拼接 base 前缀，禁止 ../ 逃逸
     │
-    ├─ io.Copy(file, in)                                    写入内容
-    ├─ file.Sync()                                          落盘
-    └─ file.Stat()                                          获取元数据
-    │
-    ▼
-⑤ d.RunHook(..., "upload", ...)                             执行用户配置的命令钩子
+    ▼  【OS 层】afero.OsFs
+       实际系统调用
 ```
 
-### 5.3 公共分享场景：双重 ScopedFs
+**核心规律**：
+1. **路径标准化发生在每一层的入口**，并非只在最外层做一次。
+2. **权限控制分为"先粗后细"**：先判断操作类型（能不能删除），再判断具体路径（能不能删这个文件）。
+3. **作用域约束是最后一道防线**，即使上层所有检查都通过，文件系统层仍会做符号链接越界检查。
+
+### 5.2 为什么有些 Handler 不显式 path.Clean？
+
+观察代码会发现 DELETE/GET/POST/PUT 的主路径直接用 `r.URL.Path`，不额外 `path.Clean`。原因：
+
+1. 路由剥离后 `r.URL.Path` 已经是应用资源路径，普通入口直接把它交给后续权限和文件系统层处理
+2. 即便路径里包含 `../` 这类片段，后续进入 `ScopedFs` 时：
+   - BasePathFs 会做词法层面的 base 拼接，`../` 无法逃逸
+   - `guard()` → `within()` 中 `EvalSymlinks` 会再次做真实路径校验
+3. 但 **PATCH 的 dst 参数、搜索的 query 参数、raw 下载的 files 参数**来自 query string，不可信，必须显式归一化。
+
+---
+
+## 六、删除操作完整调用链（逐行追踪）
+
+以 [resourceDeleteHandler](http/resource.go#L84-L123) 为例，逐层追踪每一步：
+
+```
+HTTP DELETE /api/resources/docs/old-report.pdf
+    │
+    ▼
+【阶段 0】路由与中间件
+│
+├─ ① gorilla/mux 匹配路由：PathPrefix("/resources") + Method("DELETE")
+├─ ② stripPrefix("/api/resources") → r.URL.Path = "/docs/old-report.pdf"   [L1 标准化]
+├─ ③ withUser() 中间件：JWT 解析 → d.store.Users.Get() → 加载 d.user
+│     d.user.Fs 是已构造好的 ScopedFs，作用域为用户主目录
+│
+▼
+【阶段 1】粗粒度权限
+│
+└─ ④ [resource.go:86] 检查操作权限
+     if r.URL.Path == "/" || !d.user.Perm.Delete → 403
+     （注意：这里直接用 r.URL.Path 判断是否根目录，无需归一，因为 "/" 形式唯一）
+│
+▼
+【阶段 2】细粒度规则 + 文件存在性校验（通过 NewFileInfo 一次完成）
+│
+└─ ⑤ [resource.go:90-97] 调用 files.NewFileInfo
+     {
+       Fs:      d.user.Fs,
+       Path:    "/docs/old-report.pdf",      ← 输入路径仍为 r.URL.Path
+       Checker: d,
+       Expand:  false,
+     }
+     │
+     ├─ ⑤-1 [file.go:78] 细粒度规则检查
+     │      if !d.Check("/docs/old-report.pdf") → os.ErrPermission
+     │        │
+     │        └─ data.Check 内部：
+     │           ├─ checkerPrefix == ""，跳过 L3 修正
+     │           ├─ 隐藏文件判断
+     │           ├─ 遍历全局规则
+     │           └─ 遍历用户规则 → 返回 allow
+     │
+     └─ ⑤-2 [file.go:82] stat(opts) 取文件元信息
+            │
+            ├─ ScopedFs.LstatIfPossible("/docs/old-report.pdf")
+            │     │
+            │     ├─ guard("/docs/old-report.pdf")   [作用域约束第1关]
+            │     │     └─ within()
+            │     │          ├─ FullBaseFsPath → "/home/user/files/docs/old-report.pdf"
+            │     │          ├─ EvalSymlinks → "/home/user/files/docs/old-report.pdf"
+            │     │          └─ 前缀比较：仍在 scope 内 → OK
+            │     │
+            │     └─ BasePathFs.LstatIfPossible     [作用域约束第2关 + OS 调用]
+            │          └─ afero.OsFs.Lstat
+            │
+            └─ 构造 FileInfo{ Path:"/docs/old-report.pdf", IsDir:false, ... }
+│
+▼
+【阶段 3】清理关联数据
+│
+├─ ⑥ [resource.go:102] 删除关联分享记录
+│     d.store.Share.DeleteWithPathPrefix(file.Path, d.user.ID)
+│
+└─ ⑦ [resource.go:108] 删除缩略图缓存
+      delThumbs(ctx, fileCache, file)
+│
+▼
+【阶段 4】实际文件删除
+│
+└─ ⑧ [resource.go:113-115] d.RunHook 中执行删除
+     d.user.Fs.RemoveAll("/docs/old-report.pdf")
+     │
+     └─ ScopedFs.RemoveAll()
+          │  ⚠️  RemoveAll 不走 guard()（见 2.2 节说明）
+          │
+          └─ BasePathFs.RemoveAll()     [词法约束：拼接 base，../ 无法逃逸]
+               └─ afero.OsFs.RemoveAll → 操作系统调用
+│
+▼
+返回 HTTP 204 No Content
+```
+
+**删除操作的关键特征**：
+- 粗粒度权限（Perm.Delete）在最前面，挡住无删除权的用户
+- `NewFileInfo` 同时完成了「规则校验」和「作用域校验」，并确认文件真实存在
+- 最终的 `RemoveAll` 不做符号链接 guard，但 BasePathFs 的词法约束仍在
+
+---
+
+## 七、保存/上传操作完整调用链（逐行追踪）
+
+保存操作有两个入口：
+- **POST /api/resources/path** — 创建新文件（或覆盖上传）
+- **PUT /api/resources/path** — 修改已有文件内容
+
+以下以 **POST 上传新文件** 为例（[resourcePostHandler](http/resource.go#L125-L178)）：
+
+```
+HTTP POST /api/resources/uploads/new-photo.jpg
+Body: <二进制文件内容>
+    │
+    ▼
+【阶段 0】路由与中间件
+│
+├─ ① stripPrefix("/api/resources") → r.URL.Path = "/uploads/new-photo.jpg"
+├─ ② withUser() → 加载 d.user 和 d.user.Fs(ScopedFs)
+│
+▼
+【阶段 1】粗粒度 + 细粒度权限
+│
+└─ ③ [resource.go:127] 双重权限检查（与删除不同，两个检查并列在最开头）
+     if !d.user.Perm.Create || !d.Check(r.URL.Path) → 403
+        │              │
+        │              └─ data.Check("/uploads/new-photo.jpg")   [细粒度规则]
+        │                    ├─ checkerPrefix == "" → 跳过
+        │                    ├─ 隐藏文件判断
+        │                    ├─ 全局规则
+        │                    └─ 用户规则
+        │
+        └─ d.user.Perm.Create == true ?   [粗粒度操作权限]
+│
+▼
+【阶段 2】分支：目录 vs 文件
+│
+├─ 若路径以 "/" 结尾 → 直接 MkdirAll（略，简单场景）
+│
+└─ 文件上传场景继续 ↓
+│
+▼
+【阶段 3】文件存在性 & 覆盖权限
+│
+└─ ④ [resource.go:137-159] 尝试 NewFileInfo 检测冲突
+     files.NewFileInfo({ Path: "/uploads/new-photo.jpg", Checker: d, Expand: false })
+     │
+     ├─ 4-1 Checker.Check(path) → 规则 OK
+     ├─ 4-2 stat(opts)
+     │     ├─ ScopedFs.LstatIfPossible
+     │     │    ├─ guard() → within() → EvalSymlinks → OK   [作用域约束]
+     │     │    └─ BasePathFs.LstatIfPossible → OsFs.Lstat
+     │     │
+     │     └─ 两种结果：
+     │        ├─ 文件不存在（err != nil）→ 视为新上传，跳过覆盖检查
+     │        └─ 文件已存在（err == nil）→ 继续检查：
+     │              ├─ override != true → 返回 409 Conflict
+     │              └─ override == true 且 !d.user.Perm.Modify → 返回 403
+     │
+     └─ 文件已存在且允许覆盖 → delThumbs() 清旧缩略图
+│
+▼
+【阶段 4】实际写入文件
+│
+└─ ⑤ [resource.go:161-170] d.RunHook 中执行 writeFile
+     writeFile(d.user.Fs, "/uploads/new-photo.jpg", r.Body, fileMode, dirMode)
+     │
+     ├─ 5-1 [resource.go:298] 确保父目录存在
+     │      dir, _ := path.Split(dst)   → "/uploads/"
+     │      err := afs.MkdirAll(dir, dirMode)
+     │        │
+     │        └─ ScopedFs.MkdirAll("/uploads/", dirMode)
+     │             ├─ guard("/uploads/")     [作用域约束 ①]
+     │             │    └─ within(): FullBaseFsPath + EvalSymlinks + 前缀比较
+     │             └─ BasePathFs.MkdirAll → OsFs.MkdirAll
+     │
+     ├─ 5-2 [resource.go:303] 打开/创建目标文件
+     │      afs.OpenFile(dst, O_RDWR|O_CREATE|O_TRUNC, fileMode)
+     │        │
+     │        └─ ScopedFs.OpenFile("/uploads/new-photo.jpg", ...)
+     │             ├─ guard("/uploads/new-photo.jpg")   [作用域约束 ②]
+     │             │    └─ within(): FullBaseFsPath + EvalSymlinks + 前缀比较
+     │             └─ BasePathFs.OpenFile → OsFs.OpenFile → 返回文件句柄
+     │
+     ├─ 5-3 [resource.go:309] io.Copy(file, in)        写入请求体
+     ├─ 5-4 [resource.go:316] file.Sync()               强制落盘
+     └─ 5-5 [resource.go:321] file.Stat()               获取最终元信息（生成 ETag）
+│
+▼
+【阶段 5】回滚 & 响应
+│
+├─ ⑥ 写入失败 → d.user.Fs.RemoveAll(path) 清理半写入文件
+└─ ⑦ 成功 → 响应头写入 ETag，返回状态码
+```
+
+**PUT 修改已有文件**的流程更简洁（[resourcePutHandler](http/resource.go#L180-L210)）：
+- 权限检查用 `Perm.Modify`（不是 `Perm.Create`）
+- 用 `afero.Exists()` 检查文件是否存在，不存在返回 404
+- 后续 `writeFile` 流程完全相同
+
+**保存操作的关键特征**：
+- 权限检查是「粗粒度 Perm.Create + 细粒度 d.Check」并列在 Handler 最开头
+- `writeFile` 内部会触发**两次** ScopedFs.guard：一次 MkdirAll、一次 OpenFile
+- 每次 guard 内部都会走完整的 L4 路径标准化（FullBaseFsPath + EvalSymlinks + 前缀比较）
+
+---
+
+## 八、其他协作场景
+
+### 8.1 公共分享：双重 ScopedFs + checkerPrefix
 
 [public.go](http/public.go#L17-L98) 展示了更复杂的嵌套：
 
 ```
-原始用户作用域: /home/user/files
-分享链接路径:   /home/user/files/shared/docs
-                        ↑
-               分享的基准路径 basePath
+用户原始配置：
+  Scope = /home/user/files
+
+分享链接配置：
+  link.Path = /shared/docs
 
 嵌套结构：
 afero.OsFs
-  └─ ScopedFs (用户作用域 /home/user/files)    ← 用户原始 Fs
-       └─ ScopedFs (分享作用域 ./shared/docs)  ← withHashFile 中再次 NewScopedFs
+  └─ ScopedFs (作用域 /home/user/files)          ← 用户原始 Fs
+       └─ ScopedFs (作用域 /home/user/files/shared/docs)  ← withHashFile 中再次 NewScopedFs
 ```
 
-同时设置 `d.checkerPrefix = basePath`，确保规则检查仍基于用户原始作用域的路径进行匹配，避免分享场景下规则失效。
+同时设置 `d.checkerPrefix = "/shared/docs"`，确保后续 `d.Check("/sub/file.txt")` 会被还原为 `/shared/docs/sub/file.txt` 再匹配规则，避免分享场景下用户规则失效。
 
-### 5.4 重命名/移动：双向检查
+### 8.2 重命名/移动：双向路径检查
 
-[resourcePatchHandler](http/resource.go#L212-L262) 中，源和目标路径都要检查：
+[resourcePatchHandler](http/resource.go#L212-L262) 中，源和目标路径都要经过完整链路：
 
 ```go
-dst = path.Clean("/" + dst)
-src = path.Clean("/" + src)
-if !d.Check(src) || !d.Check(dst) {      // 两条路径都要过规则
+dst = path.Clean("/" + dst)   // L2 标准化（dst 来自 query，必须显式归一）
+src = path.Clean("/" + src)   // L2 标准化
+if !d.Check(src) || !d.Check(dst) {      // 两条路径都过细粒度规则
     return http.StatusForbidden, nil
 }
 // ...
-return d.user.Fs.Rename(oldname, newname)  // ScopedFs.Rename 对两个路径都做 guard()
+return d.user.Fs.Rename(oldname, newname)  // ScopedFs.Rename 对两条路径都做 guard()
 ```
 
-ScopedFs.Rename 的实现（[scoped.go:139-147](files/scoped.go#L139-L147)）：
+ScopedFs.Rename 的实现（[files/scoped.go:139-147](files/scoped.go#L139-L147)）：
 
 ```go
 func (s *ScopedFs) Rename(oldname, newname string) error {
-    if err := s.guard(oldname); err != nil { return err }  // 源路径越界检查
-    if err := s.guard(newname); err != nil { return err }  // 目标路径越界检查
+    if err := s.guard(oldname); err != nil { return err }  // 源作用域检查
+    if err := s.guard(newname); err != nil { return err }  // 目标作用域检查
     return s.base.Rename(oldname, newname)
 }
 ```
 
 ---
 
-## 六、关键安全设计总结
+## 九、关键安全设计总结
 
-| 安全机制 | 实现位置 | 防护目标 |
-|----------|----------|----------|
-| 作用域词法隔离 | afero.BasePathFs | 防止 `../` 路径遍历攻击 |
-| 符号链接越界防护 | ScopedFs.within() | 阻止作用域内的符号链接指向外部目录 |
-| 规则访问控制 | data.Check() | 按路径黑白名单控制可见性 |
-| 操作权限门控 | HTTP Handler 入口 | 防止未授权的创建/修改/删除/分享 |
-| 路径归一化 | path.Clean + path.Join | 消除歧义路径，统一比较基准 |
-| 分享路径二次约束 | public.go 嵌套 ScopedFs | 分享链接只能访问被分享的子树 |
+| 安全机制 | 实现位置 | 执行阶段 | 防护目标 |
+|----------|----------|----------|----------|
+| 路由前缀剥离 | `stripPrefix()` | L1 路径标准化 | 隔离路由命名空间与资源路径 |
+| 路径歧义清理 | `path.Clean` + `slashClean` | L2 路径标准化 | 消除 `../` `./` 等路径遍历载体 |
+| 粗粒度权限门控 | `d.user.Perm.*` | 权限控制第1关 | 按操作类型（创建/删除/修改）快速拒绝 |
+| 细粒度规则检查 | `data.Check()` | 权限控制第2关 | 按路径黑白名单控制可见性与可操作性 |
+| 规则路径修正 | `checkerPrefix` + `Join` | L3 路径标准化 | 分享场景下保持规则语义正确 |
+| 作用域词法隔离 | `afero.BasePathFs` | 作用域约束 | 从字符串层面防止 `../` 越界 |
+| 符号链接越界防护 | `ScopedFs.within()` | 作用域约束 | 阻止作用域内符号链接指向外部目录 |
+| 真实路径解析 | `FullBaseFsPath + EvalSymlinks` | L4 路径标准化 | 获取磁盘上真实位置，作为作用域判断依据 |
+| 分享路径二次约束 | `public.go` 嵌套 `ScopedFs` | 作用域约束 | 分享链接只能访问被分享的子树 |
 
-这几层机制层层递进，从底层文件系统到上层业务规则形成完整的安全防护链。
+**多层防护的执行顺序口诀**：
+
+> **先剥离前缀，再归一形式；先判断能不能做，再判断能不能对这个路径做；最后让文件系统自己再把一次关。**
+
+即：L1/L2 路径标准化 → Perm 粗粒度 → rules 细粒度（含 L3 标准化）→ ScopedFs 作用域（含 L4 标准化）→ BasePathFs 词法 → 操作系统调用。

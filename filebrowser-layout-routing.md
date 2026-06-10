@@ -47,7 +47,7 @@ frontend/src/
 
 ## 二、路由配置详解
 
-路由配置定义在 [router/index.ts](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/router/index.ts)。
+路由配置定义在 `frontend/src/router/index.ts`。
 
 ### 2.1 路由层级结构
 
@@ -80,7 +80,7 @@ frontend/src/
 
 ### 2.3 全局路由守卫 `beforeResolve`
 
-路由守卫在 [router/index.ts#L183-L222](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/router/index.ts#L183-L222) 中定义，执行以下流程：
+路由守卫在 `frontend/src/router/index.ts` 第 183–222 行中定义，执行以下流程：
 
 1. **设置页面标题**：根据路由名称查找 i18n key，设置 `document.title`
 2. **首次访问初始化认证**：`from.name == null` 时调用 `initAuth()`
@@ -92,7 +92,7 @@ frontend/src/
 
 ### 2.4 通配重定向策略
 
-未匹配路径统一重定向到 `/files/` 前缀，见 [router/index.ts#L147-L153](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/router/index.ts#L147-L153)：
+未匹配路径统一重定向到 `/files/` 前缀，见 `frontend/src/router/index.ts` 第 147–153 行：
 
 ```ts
 {
@@ -111,7 +111,7 @@ frontend/src/
 
 ### 3.1 根组件 App.vue
 
-[App.vue](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/App.vue) 极其简洁，只包含一个 `<router-view>`，处理主题和语言初始化，**不承担任何布局职责**。
+`frontend/src/App.vue` 极其简洁，只包含一个 `<router-view>`，处理主题和语言初始化，**不承担任何布局职责**。
 
 ```vue
 <template>
@@ -123,7 +123,7 @@ frontend/src/
 
 ### 3.2 主布局组件 Layout.vue
 
-[Layout.vue](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/views/Layout.vue) 是**所有需要导航的页面的外壳**，结构如下：
+`frontend/src/views/Layout.vue` 是**所有需要导航的页面的外壳**，结构如下：
 
 ```
 Layout.vue
@@ -138,12 +138,12 @@ Layout.vue
 
 关键逻辑：
 
-- **路由切换监听**（[Layout.vue#L47-L53](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/views/Layout.vue#L47-L53)）：每次路由变化清空文件选择、关闭非 success 弹窗
+- **路由切换监听**（`frontend/src/views/Layout.vue` 第 47–53 行）：每次路由变化清空文件选择、关闭非 success 弹窗
 - **条件渲染 Shell**：需同时满足 `enableExec` 常量、已登录、用户有 `execute` 权限
 
 ### 3.3 登录页 Login.vue（独立布局）
 
-[Login.vue](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/views/Login.vue) 不嵌套在 Layout 中，直接渲染登录表单，包含：
+`frontend/src/views/Login.vue` 不嵌套在 Layout 中，直接渲染登录表单，包含：
 - 用户名/密码输入
 - 注册模式切换（signup 启用时）
 - reCAPTCHA 验证
@@ -151,7 +151,7 @@ Layout.vue
 
 ### 3.4 文件视图容器 Files.vue
 
-[Files.vue](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/views/Files.vue) 是 `/files/:path*` 的实际渲染组件，结构：
+`frontend/src/views/Files.vue` 是 `/files/:path*` 的实际渲染组件，结构：
 
 ```
 Files.vue
@@ -165,7 +165,7 @@ Files.vue
 └── 加载中 Spinner
 ```
 
-**动态视图选择逻辑**（[Files.vue#L65-L86](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/views/Files.vue#L65-L86)）：
+**动态视图选择逻辑**（`frontend/src/views/Files.vue` 第 65–86 行）：
 
 ```
 req.type === undefined → null（加载中）
@@ -179,7 +179,7 @@ type === text / textImmutable → Editor
 
 ### 3.5 设置视图容器 Settings.vue
 
-[Settings.vue](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/views/Settings.vue) 是 `/settings/*` 的容器，含**二级子导航**：
+`frontend/src/views/Settings.vue` 是 `/settings/*` 的容器，含**二级子导航**：
 
 ```
 Settings.vue
@@ -197,7 +197,7 @@ Settings.vue
 
 ### 3.6 共享视图 Share.vue
 
-[Share.vue](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/views/Share.vue) 渲染公开共享链接，结构类似 Files.vue 但更简单，不包含操作菜单，只有下载/预览功能和密码保护输入。
+`frontend/src/views/Share.vue` 渲染公开共享链接，结构类似 Files.vue 但更简单，不包含操作菜单，只有下载/预览功能和密码保护输入。
 
 ---
 
@@ -205,11 +205,11 @@ Settings.vue
 
 ### 4.1 面包屑：由当前路径生成层级
 
-[Breadcrumbs.vue](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/components/Breadcrumbs.vue) 通过 **响应式计算属性** 从 `route.path` 自动生成面包屑层级。
+`frontend/src/components/Breadcrumbs.vue` 通过 **响应式计算属性** 从 `route.path` 自动生成面包屑层级。
 
 #### 4.1.1 核心计算逻辑
 
-`items` 计算属性（[Breadcrumbs.vue#L35-L72](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/components/Breadcrumbs.vue#L35-L72)）的生成流程：
+`items` 计算属性（`frontend/src/components/Breadcrumbs.vue` 第 35–72 行）的生成流程：
 
 ```
 route.path (如 /files/documents/work/report/)
@@ -235,7 +235,7 @@ parts = ["documents", "work", "report"]
 | **Base 路径** | `props.base` 作为根路径前缀 | 支持在 Files (`/files`) 和 Share (`/share/:hash`) 等不同场景复用 |
 | **自动解码** | `decodeURIComponent(parts[i])` | 正确显示中文或特殊字符文件名 |
 | **层级截断** | 超过 3 层时首项显示为 "..." | 避免深层级目录面包屑过长溢出 |
-| **无链接模式** | `noLink` prop 控制渲染 `span` 或 `router-link` | 用于只读展示场景 |
+| **无链接模式** | `noLink` prop 控制渲染 `span` 或 `router-link` | 用于只读展示场景（如编辑器顶部） |
 | **首页图标** | 首项为 home 图标，链接到 `base` | 提供快速返回根目录的入口 |
 
 #### 4.1.3 与路由的响应式联动
@@ -248,7 +248,7 @@ parts = ["documents", "work", "report"]
 
 #### 4.2.1 弹窗栈核心状态
 
-[stores/layout.ts](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/stores/layout.ts) 中的 `prompts` 数组是弹窗栈的核心：
+`frontend/src/stores/layout.ts` 中的 `prompts` 数组是弹窗栈的核心：
 
 ```ts
 state: () => ({
@@ -272,22 +272,22 @@ actions: {
 
 **打开侧栏（HeaderBar → Sidebar）**：
 
-1. HeaderBar 的菜单按钮点击 → 调用 `layoutStore.showHover('sidebar')`（[HeaderBar.vue#L8-L10](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/components/header/HeaderBar.vue#L8-L10)）
+1. HeaderBar 的菜单按钮点击 → 调用 `layoutStore.showHover('sidebar')`（`frontend/src/components/header/HeaderBar.vue` 第 8–10 行）
 2. `showHover('sidebar')` 向 `prompts` 栈压入 `{ prompt: "sidebar", ... }`
-3. Sidebar 组件通过 `currentPromptName === 'sidebar'` 判断是否激活 → 添加 `active` 类（[Sidebar.vue#L155-L157](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/components/Sidebar.vue#L155-L157)）
+3. Sidebar 组件通过 `currentPromptName === 'sidebar'` 判断是否激活 → 添加 `active` 类（`frontend/src/components/Sidebar.vue` 第 155–157 行）
 4. CSS 过渡动画使侧边栏从左侧滑入
 
 **关闭侧栏（多种触发方式）**：
 
 | 触发方式 | 实现位置 | 效果 |
 |----------|----------|------|
-| 点击遮罩层 | [Sidebar.vue#L2](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/components/Sidebar.vue#L2) | 点击 `.overlay` → `closeHovers()` |
-| 点击菜单项跳转 | [Sidebar.vue#L193-L201](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/components/Sidebar.vue#L193-L201) | `toRoot/toAccountSettings` 等方法内调用 `closeHovers()` |
-| 路由切换 | [Layout.vue#L47-L53](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/views/Layout.vue#L47-L53) | Layout 的 `watch(route)` → `closeHovers()`（非 success 弹窗） |
+| 点击遮罩层 | `frontend/src/components/Sidebar.vue` 第 2 行 | 点击 `.overlay` → `closeHovers()` |
+| 点击菜单项跳转 | `frontend/src/components/Sidebar.vue` 第 193–201 行 | `toRoot/toAccountSettings` 等方法内调用 `closeHovers()` |
+| 路由切换 | `frontend/src/views/Layout.vue` 第 47–53 行 | Layout 的 `watch(route)` → `closeHovers()`（非 success 弹窗） |
 
 #### 4.2.3 顶部"更多"菜单的同一机制
 
-HeaderBar 右侧的 `more_vert` 按钮也使用弹窗栈机制（[HeaderBar.vue#L14-L33](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/components/header/HeaderBar.vue#L14-L33)）：
+HeaderBar 右侧的 `more_vert` 按钮也使用弹窗栈机制（`frontend/src/components/header/HeaderBar.vue` 第 14–33 行）：
 
 ```
 点击 more 按钮
@@ -298,7 +298,7 @@ HeaderBar 右侧的 `more_vert` 按钮也使用弹窗栈机制（[HeaderBar.vue#
 
 #### 4.2.4 Action 组件的 show 属性
 
-[Action.vue](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/components/header/Action.vue) 封装了按钮 + 弹窗触发的通用逻辑：
+`frontend/src/components/header/Action.vue` 封装了按钮 + 弹窗触发的通用逻辑：
 
 ```ts
 const action = () => {
@@ -320,11 +320,11 @@ const action = () => {
 
 ### 4.3 侧栏跳转与用量刷新：响应路由变化
 
-[Sidebar.vue](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/components/Sidebar.vue) 既是导航的发起者，也是路由变化的响应者。
+`frontend/src/components/Sidebar.vue` 既是导航的发起者，也是路由变化的响应者。
 
 #### 4.3.1 侧栏菜单项的跳转行为
 
-各菜单项点击后执行路由跳转并关闭侧栏（[Sidebar.vue#L191-L205](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/components/Sidebar.vue#L191-L205)）：
+各菜单项点击后执行路由跳转并关闭侧栏（`frontend/src/components/Sidebar.vue` 第 191–205 行）：
 
 ```ts
 toRoot() {
@@ -349,7 +349,7 @@ toGlobalSettings() {
 
 #### 4.3.2 磁盘用量的路由响应式刷新
 
-侧栏底部显示磁盘使用量，该数据**只在文件页面才获取**，通过 `watch.$route` 实现（[Sidebar.vue#L208-L217](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/components/Sidebar.vue#L208-L217)）：
+侧栏底部显示磁盘使用量，该数据**只在文件页面才获取**，通过 `watch.$route` 实现（`frontend/src/components/Sidebar.vue` 第 208–217 行）：
 
 ```
 watch: {
@@ -374,7 +374,7 @@ watch: {
 
 #### 4.3.3 菜单项的权限控制
 
-侧栏菜单项根据用户权限动态显示/隐藏（[Sidebar.vue#L19-L51](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/components/Sidebar.vue#L19-L51)）：
+侧栏菜单项根据用户权限动态显示/隐藏（`frontend/src/components/Sidebar.vue` 第 19–51 行）：
 
 ```
 已登录状态显示：
@@ -399,15 +399,15 @@ watch: {
 
 | 层级 | 触发位置 | 重置内容 | 时机 |
 |------|----------|----------|------|
-| **布局层** | [Layout.vue#L47-L53](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/views/Layout.vue#L47-L53) | `selected = []`, 关闭非 success 弹窗 | 任意路由切换 |
-| **视图层** | [Files.vue#L146-L148](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/views/Files.vue#L146-L148) `fetchData()` | `selected = []`, `multiple = false`, 关闭 hover | 路径变化需重新获取数据时 |
-| **视图层** | [Share.vue#L394-L397](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/views/Share.vue#L394-L397) `fetchData()` | `selected = []`, `multiple = false`, 关闭 hover | 共享路径变化时 |
-| **列表层** | [FileListing.vue#L392-L394](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/views/files/FileListing.vue#L392-L394) `onBeforeRouteUpdate` | 隐藏右键菜单 | 路由更新前 |
-| **数据层** | [stores/file.ts#L41-L54](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/stores/file.ts#L41-L54) `updateRequest()` | `selected = []` 后尝试恢复同名项 | 请求数据更新时 |
+| **布局层** | `frontend/src/views/Layout.vue` 第 47–53 行 | `selected = []`, 关闭非 success 弹窗 | 任意路由切换 |
+| **视图层** | `frontend/src/views/Files.vue` 第 146–148 行 `fetchData()` | `selected = []`, `multiple = false`, 关闭 hover | 路径变化需重新获取数据时 |
+| **视图层** | `frontend/src/views/Share.vue` 第 394–397 行 `fetchData()` | `selected = []`, `multiple = false`, 关闭 hover | 共享路径变化时 |
+| **列表层** | `frontend/src/views/files/FileListing.vue` 第 392–394 行 `onBeforeRouteUpdate` | 隐藏右键菜单 | 路由更新前 |
+| **数据层** | `frontend/src/stores/file.ts` 第 41–54 行 `updateRequest()` | `selected = []` 后尝试恢复同名项 | 请求数据更新时 |
 
 #### 4.4.2 Layout 层：全局路由监听重置
 
-最顶层的重置在 Layout.vue 的 `watch(route)` 中（[Layout.vue#L47-L53](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/views/Layout.vue#L47-L53)）：
+最顶层的重置在 Layout.vue 的 `watch(route)` 中（`frontend/src/views/Layout.vue` 第 47–53 行）：
 
 ```ts
 watch(route, () => {
@@ -425,7 +425,7 @@ watch(route, () => {
 
 #### 4.4.3 Files 视图层：数据获取时重置
 
-Files.vue 的 `fetchData()` 函数在每次获取数据前重置选择状态（[Files.vue#L143-L149](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/views/Files.vue#L143-L149)）：
+Files.vue 的 `fetchData()` 函数在每次获取数据前重置选择状态（`frontend/src/views/Files.vue` 第 143–149 行）：
 
 ```ts
 const fetchData = async () => {
@@ -444,7 +444,7 @@ const fetchData = async () => {
 
 #### 4.4.4 File Store 层：数据更新时的选择保留
 
-[stores/file.ts](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/stores/file.ts) 的 `updateRequest` 方法有一个巧妙的设计：**先清空再尝试按 URL 恢复选择**（[file.ts#L41-L54](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/stores/file.ts#L41-L54)）：
+`frontend/src/stores/file.ts` 的 `updateRequest` 方法有一个巧妙的设计：**先清空再尝试按 URL 恢复选择**（`frontend/src/stores/file.ts` 第 41–54 行）：
 
 ```ts
 updateRequest(value: Resource | null) {
@@ -466,7 +466,7 @@ updateRequest(value: Resource | null) {
 
 #### 4.4.5 目录切换后的预选（Preselection）
 
-Files.vue 的 `applyPreSelection` 函数（[Files.vue#L117-L141](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/views/Files.vue#L117-L141)）在目录切换后会预选一个文件，提供两种预选逻辑：
+Files.vue 的 `applyPreSelection` 函数（`frontend/src/views/Files.vue` 第 117–141 行）在目录切换后会预选一个文件，提供两种预选逻辑：
 
 ```
 场景一：有 preselect 目标（操作后指定选中）
@@ -484,7 +484,7 @@ Files.vue 的 `applyPreSelection` 函数（[Files.vue#L117-L141](file:///d:/fz/0
 
 #### 4.4.6 FileListing 内的右键菜单重置
 
-[FileListing.vue](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/views/files/FileListing.vue) 使用 `onBeforeRouteUpdate` 钩子在路由更新前隐藏右键菜单（[FileListing.vue#L392-L394](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/views/files/FileListing.vue#L392-L394)）：
+`frontend/src/views/files/FileListing.vue` 使用 `onBeforeRouteUpdate` 钩子在路由更新前隐藏右键菜单（`frontend/src/views/files/FileListing.vue` 第 392–394 行）：
 
 ```ts
 onBeforeRouteUpdate(() => {
@@ -494,13 +494,248 @@ onBeforeRouteUpdate(() => {
 
 这是更细粒度的重置，确保路由变化前上下文菜单被正确收起。
 
+### 4.5 编辑器未保存内容拦截路由更新
+
+`frontend/src/views/files/Editor.vue` 实现了**两道拦截**：组件内路由守卫拦截 Vue Router 的同组件路径切换，浏览器事件拦截页面关闭/刷新。
+
+#### 4.5.1 拦截入口一：`onBeforeRouteUpdate`
+
+当用户在编辑器中打开了另一个文件（同组件内路由更新），`onBeforeRouteUpdate` 守卫会检查编辑器是否有未保存的修改（`frontend/src/views/files/Editor.vue` 第 201–219 行）：
+
+```ts
+onBeforeRouteUpdate((to, from, next) => {
+  if (editor.value?.session.getUndoManager().isClean()) {
+    next();          // 无修改，直接放行
+    return;
+  }
+
+  layoutStore.showHover({     // 有修改，弹出确认对话框
+    prompt: "discardEditorChanges",
+    confirm: (event: Event) => {
+      event.preventDefault();
+      next();                 // 用户选择"放弃修改"→ 放行
+    },
+    saveAction: async () => {
+      await save();           // 用户选择"保存修改"→ 先保存再放行
+      next();
+    },
+  });
+});
+```
+
+**判断依据**：Ace Editor 的 `UndoManager.isClean()` 方法——当 `markClean()` 被调用（保存成功后）之后，`isClean()` 返回 `true`，表示没有未保存的修改。
+
+**弹窗交互**：`discardEditorChanges` 弹窗（`frontend/src/components/prompts/DiscardEditorChanges.vue`）提供三个按钮：
+
+| 按钮 | 触发回调 | 效果 |
+|------|----------|------|
+| **取消** | `closeHovers()` | 关闭弹窗，路由更新被阻止，用户留在当前编辑状态 |
+| **保存修改** | `currentPrompt.saveAction()` | 调用 `save()` 保存文件 → `markClean()` → `next()` 放行 |
+| **放弃修改** | `currentPrompt.confirm()` | 直接 `next()` 放行，不保存 |
+
+**关键点**：`next()` 是 Vue Router 传入的回调，只有在用户做出选择后才调用。如果不调用 `next()`，路由更新就会被阻止——这正是拦截的核心机制。
+
+#### 4.5.2 拦截入口二：`beforeunload` 浏览器事件
+
+当用户关闭浏览器标签页或刷新页面时，`beforeunload` 事件提供浏览器原生拦截（`frontend/src/views/files/Editor.vue` 第 260–267 行）：
+
+```ts
+const handlePageChange = (event: BeforeUnloadEvent) => {
+  if (!editor.value?.session.getUndoManager().isClean()) {
+    event.preventDefault();
+    event.returnValue = true;  // 兼容旧浏览器
+  }
+};
+```
+
+这个事件在 `onMounted` 中注册（`frontend/src/views/files/Editor.vue` 第 158–159 行），在 `onBeforeUnmount` 中移除（`frontend/src/views/files/Files.vue` 第 196–197 行），确保只在编辑器存活期间生效。
+
+**与 Vue Router 拦截的区别**：
+- `beforeunload`：浏览器级拦截，只能弹出浏览器原生确认框，无法自定义 UI
+- `onBeforeRouteUpdate`：Vue Router 级拦截，可以使用自定义弹窗（DiscardEditorChanges）
+
+#### 4.5.3 关闭按钮的独立拦截
+
+编辑器的关闭按钮（`<action icon="close" @action="close()" />`）也有独立的未保存检查（`frontend/src/views/files/Editor.vue` 第 298–317 行）：
+
+```ts
+const close = () => {
+  if (!editor.value?.session.getUndoManager().isClean()) {
+    layoutStore.showHover({
+      prompt: "discardEditorChanges",
+      confirm: (event: Event) => {
+        event.preventDefault();
+        editor.value?.session.getUndoManager().reset();  // 重置 undo 栈
+        finishClose();
+      },
+      saveAction: async () => {
+        try { await save(true); finishClose(); }
+        catch {}
+      },
+    });
+    return;
+  }
+  finishClose();
+};
+
+const finishClose = () => {
+  const uri = url.removeLastDir(route.path) + "/";
+  router.push({ path: uri });  // 跳转到父目录
+};
+```
+
+**与 `onBeforeRouteUpdate` 的区别**：关闭按钮的"放弃修改"回调会额外调用 `UndoManager.reset()`，彻底清空撤销历史，而路由守卫中的 `confirm` 只调用 `next()` 直接放行。这是因为关闭按钮主动退出编辑器时需要重置状态，而路由守卫放行后编辑器组件会被复用并重新初始化。
+
+#### 4.5.4 完整拦截流程图
+
+```
+用户触发离开编辑器的操作
+  │
+  ├── 点击关闭按钮 → close()
+  │     ├── isClean() → finishClose() → router.push(父目录)
+  │     └── !isClean() → DiscardEditorChanges 弹窗
+  │           ├── 取消 → closeHovers()（留在编辑器）
+  │           ├── 保存 → save() + markClean() + finishClose()
+  │           └── 放弃 → reset() + finishClose()
+  │
+  ├── 在同组件内切换文件（如面包屑导航）
+  │     └── onBeforeRouteUpdate
+  │           ├── isClean() → next()（直接放行）
+  │           └── !isClean() → DiscardEditorChanges 弹窗
+  │                 ├── 取消 → closeHovers()（路由不更新）
+  │                 ├── 保存 → save() + markClean() + next()
+  │                 └── 放弃 → next()
+  │
+  └── 关闭/刷新浏览器标签
+        └── beforeunload 事件
+              ├── isClean() → 无拦截
+              └── !isClean() → 浏览器原生确认框
+```
+
+### 4.6 文件页离开时的清理：键盘监听与请求状态
+
+文件浏览涉及的组件在离开时会**主动清理**事件监听器和网络请求，防止内存泄漏和幽灵回调。
+
+#### 4.6.1 Files.vue：请求中断与状态重置
+
+`frontend/src/views/Files.vue` 在组件卸载时执行三步清理（第 95–106 行）：
+
+```ts
+onUnmounted(() => {
+  fileStore.isFiles = false;             // 1. 重置文件页标识
+  if (layoutStore.showShell) {
+    layoutStore.toggleShell();           // 2. 关闭 Shell 终端
+  }
+  fileStore.updateRequest(null);         // 3. 清空当前文件资源
+  fetchDataController.abort();           // 4. 中止进行中的 API 请求
+});
+```
+
+**请求中止机制**（`fetchDataController`）：
+
+```ts
+let fetchDataController = new AbortController();  // 组件级控制器
+
+const fetchData = async () => {
+  fetchDataController.abort();                     // 中止上次请求
+  fetchDataController = new AbortController();     // 创建新控制器
+  try {
+    const res = await api.fetch(url, fetchDataController.signal);
+    // ...
+  } catch (err) {
+    if (err instanceof StatusError && err.is_canceled) {
+      return;   // 主动取消的请求不视为错误
+    }
+  }
+};
+```
+
+**双重保障**：
+1. 路由切换时 `fetchData()` 被重新调用，会 `abort()` 上次请求
+2. 组件卸载时 `onUnmounted` 再次 `abort()`，确保离开页面后不会有残留请求
+
+**键盘监听**：Files.vue 在 `onMounted` 注册 `keyEvent`（F1 打开帮助），在 `onBeforeUnmount` 中移除（第 95–97 行）。
+
+#### 4.6.2 Editor.vue：键盘监听 + 浏览器事件 + Ace 销毁
+
+`frontend/src/views/files/Editor.vue` 在组件卸载时清理三个资源（第 195–199 行）：
+
+```ts
+onBeforeUnmount(() => {
+  window.removeEventListener("keydown", keyEvent);           // 1. 移除快捷键监听（Ctrl+S 保存、Esc 关闭）
+  window.removeEventListener("beforeunload", handlePageChange); // 2. 移除浏览器关闭拦截
+  editor.value?.destroy();                                    // 3. 销毁 Ace Editor 实例
+});
+```
+
+**如果不清理会发生什么**：
+- `keydown` 监听残留：离开编辑器后按 Ctrl+S 仍会尝试调用已销毁的 `editor.value` 方法
+- `beforeunload` 监听残留：在其他页面关闭浏览器时仍弹出"未保存修改"提示
+- Ace Editor 实例残留：DOM 节点和定时器不被释放，导致内存泄漏
+
+#### 4.6.3 Preview.vue：键盘监听清理
+
+`frontend/src/views/files/Preview.vue` 同样注册了键盘监听（方向键切换前后文件、Esc 关闭），在卸载时清理（第 344 行）：
+
+```ts
+onMounted(async () => {
+  window.addEventListener("keydown", key);
+  // ...
+});
+
+onBeforeUnmount(() => window.removeEventListener("keydown", key));
+```
+
+Preview 的 `key` 事件处理函数还会检查弹窗状态（第 383–384 行）：
+
+```ts
+const key = (event: KeyboardEvent) => {
+  if (layoutStore.currentPrompt !== null) {
+    return;   // 有弹窗时不响应快捷键，避免冲突
+  }
+  // ...
+};
+```
+
+#### 4.6.4 FileListing.vue：多重事件监听器的清理
+
+`frontend/src/views/files/FileListing.vue` 注册了大量事件监听器，卸载时逐一清理（第 538–549 行）：
+
+```ts
+onBeforeUnmount(() => {
+  window.removeEventListener("keydown", keyEvent);     // 快捷键（Delete/F2/Ctrl+A 等）
+  window.removeEventListener("scroll", scrollEvent);   // 无限滚动加载
+  window.removeEventListener("resize", windowsResize); // 窗口大小变化
+
+  if (authStore.user && !authStore.user?.perm.create) return;
+  document.removeEventListener("dragover", preventDefault); // 拖放
+  document.removeEventListener("dragenter", dragEnter);
+  document.removeEventListener("dragleave", dragLeave);
+  document.removeEventListener("drop", drop);
+});
+```
+
+#### 4.6.5 Share.vue：请求清理
+
+`frontend/src/views/Share.vue` 的 `fetchData` 函数同样使用 `AbortController` 来管理请求生命周期。虽然 Share 页面不像 Files 那样在组件卸载时显式调用 `abort()`，但路由切换时 Layout 的 `watch(route)` 会先关闭弹窗，且 Share 组件卸载后回调即使触发也不会有副作用（因为组件已销毁，状态更新无效）。
+
+#### 4.6.6 各组件清理对照表
+
+| 组件 | 清理内容 | 清理时机 |
+|------|----------|----------|
+| **Files.vue** | `keydown` 监听、`isFiles` 重置、Shell 关闭、`fileStore.req` 清空、`AbortController` 中止 | `onBeforeUnmount` + `onUnmounted` |
+| **Editor.vue** | `keydown` 监听、`beforeunload` 监听、Ace Editor 实例销毁 | `onBeforeUnmount` |
+| **Preview.vue** | `keydown` 监听 | `onBeforeUnmount` |
+| **FileListing.vue** | `keydown` + `scroll` + `resize` + 拖放系列监听 | `onBeforeUnmount` |
+| **Sidebar.vue** | `fetchUsage` 的 `AbortController` | `unmounted` |
+
 ---
 
 ## 五、状态管理与路由布局的配合
 
 ### 5.1 Pinia 注入 Router
 
-在 [stores/index.ts](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/stores/index.ts) 中，Pinia 通过插件把 `router` 实例注入到每个 store：
+在 `frontend/src/stores/index.ts` 中，Pinia 通过插件把 `router` 实例注入到每个 store：
 
 ```ts
 pinia.use(({ store }) => {
@@ -512,7 +747,7 @@ pinia.use(({ store }) => {
 
 ### 5.2 Layout Store 控制全局 UI
 
-[stores/layout.ts](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/stores/layout.ts) 管理跨页面共享的 UI 状态：
+`frontend/src/stores/layout.ts` 管理跨页面共享的 UI 状态：
 
 | 状态 | 作用 | 相关组件 |
 |------|------|----------|
@@ -528,11 +763,11 @@ pinia.use(({ store }) => {
 
 ### 5.3 Auth Store 控制路由守卫
 
-[stores/auth.ts](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/stores/auth.ts) 的 `isLoggedIn` getter 和 `user.perm.admin` 是路由守卫判断的核心依据。
+`frontend/src/stores/auth.ts` 的 `isLoggedIn` getter 和 `user.perm.admin` 是路由守卫判断的核心依据。
 
 ### 5.4 File Store 驱动视图切换
 
-[stores/file.ts](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/stores/file.ts) 的 `req` 字段存储当前请求的文件资源对象。Files.vue 的 `currentView` computed 完全依赖 `req` 的属性（`isDir`、`type`、`extension`）决定渲染哪个子视图。
+`frontend/src/stores/file.ts` 的 `req` 字段存储当前请求的文件资源对象。Files.vue 的 `currentView` computed 完全依赖 `req` 的属性（`isDir`、`type`、`extension`）决定渲染哪个子视图。
 
 ---
 
@@ -665,6 +900,21 @@ prompts 栈弹出 → currentPromptName 变化
 Sidebar: active = false → 侧边栏滑出
 ```
 
+### 6.6 场景六：编辑器中未保存修改时切换文件
+
+```
+用户在编辑 /files/notes/readme.md 时通过面包屑点击 /files/notes/config.json
+  ↓
+onBeforeRouteUpdate 触发
+  ├── editor.session.getUndoManager().isClean() → false（有修改）
+  └── layoutStore.showHover({ prompt: "discardEditorChanges" })
+  ↓
+DiscardEditorChanges 弹窗显示
+  ├── 用户点"取消" → closeHovers()，next() 不被调用 → 路由不更新
+  ├── 用户点"保存" → save() → markClean() → next() → 路由更新，编辑器重新初始化
+  └── 用户点"放弃" → next() → 路由更新，编辑器重新初始化（修改丢失）
+```
+
 ---
 
 ## 七、关键设计模式总结
@@ -708,22 +958,33 @@ Files.vue、Share.vue、Sidebar.vue 均使用 `watch(route)` 触发数据重新�
 
 面包屑完全通过 `computed` 从 `route.path` 派生，无需任何手动同步逻辑，天然响应式且无副作用。
 
+### 7.8 双层编辑器拦截（路由级 + 浏览器级）
+
+编辑器通过 `onBeforeRouteUpdate` 拦截 Vue Router 导航（自定义弹窗），通过 `beforeunload` 拦截浏览器关闭/刷新（原生确认框），两层拦截互补，确保未保存修改在任何离开场景下都不会静默丢失。
+
+### 7.9 组件卸载时的完备清理
+
+每个注册了 `window.addEventListener` 的组件都在 `onBeforeUnmount` / `onUnmounted` 中移除监听；每个发起网络请求的组件都使用 `AbortController` 在路由切换或组件卸载时中止请求。这避免了内存泄漏、幽灵回调和请求竞态。
+
 ---
 
 ## 八、核心文件速查
 
 | 文件 | 作用 |
 |------|------|
-| [router/index.ts](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/router/index.ts) | 路由定义 + 全局守卫 |
-| [views/Layout.vue](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/views/Layout.vue) | 主布局框架（Sidebar + Main + Prompts） |
-| [views/Files.vue](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/views/Files.vue) | 文件浏览容器，动态切换 Listing/Editor/Preview |
-| [views/Settings.vue](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/views/Settings.vue) | 设置页容器 + 二级导航 |
-| [components/Breadcrumbs.vue](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/components/Breadcrumbs.vue) | 面包屑路径生成 |
-| [components/Sidebar.vue](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/components/Sidebar.vue) | 侧边栏导航，根据权限显示菜单项，响应路由刷新用量 |
-| [components/header/HeaderBar.vue](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/components/header/HeaderBar.vue) | 顶部操作栏，菜单按钮触发侧栏 |
-| [components/header/Action.vue](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/components/header/Action.vue) | 通用按钮组件，支持 show 属性触发弹窗 |
-| [components/prompts/Prompts.vue](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/components/prompts/Prompts.vue) | 全局弹窗渲染容器 |
-| [views/files/FileListing.vue](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/views/files/FileListing.vue) | 文件列表，包含选择/多选/右键菜单逻辑 |
-| [stores/layout.ts](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/stores/layout.ts) | 全局 UI 状态（弹窗栈、加载、Shell） |
-| [stores/file.ts](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/stores/file.ts) | 当前文件资源状态，驱动视图切换，管理选择状态 |
-| [stores/auth.ts](file:///d:/fz/0601/solo-dogfeeding/code/176-filebrowser/frontend/src/stores/auth.ts) | 用户认证状态，驱动权限守卫 |
+| `frontend/src/router/index.ts` | 路由定义 + 全局守卫 |
+| `frontend/src/views/Layout.vue` | 主布局框架（Sidebar + Main + Prompts） |
+| `frontend/src/views/Files.vue` | 文件浏览容器，动态切换 Listing/Editor/Preview，管理请求生命周期 |
+| `frontend/src/views/Settings.vue` | 设置页容器 + 二级导航 |
+| `frontend/src/views/files/Editor.vue` | 文件编辑器，未保存拦截（onBeforeRouteUpdate + beforeunload），快捷键与 Ace 销毁 |
+| `frontend/src/views/files/Preview.vue` | 文件预览，前后切换，键盘导航与监听清理 |
+| `frontend/src/views/files/FileListing.vue` | 文件列表，选择/多选/右键菜单/拖放，多重事件监听清理 |
+| `frontend/src/components/Breadcrumbs.vue` | 面包屑路径生成 |
+| `frontend/src/components/Sidebar.vue` | 侧边栏导航，根据权限显示菜单项，响应路由刷新用量 |
+| `frontend/src/components/header/HeaderBar.vue` | 顶部操作栏，菜单按钮触发侧栏 |
+| `frontend/src/components/header/Action.vue` | 通用按钮组件，支持 show 属性触发弹窗 |
+| `frontend/src/components/prompts/Prompts.vue` | 全局弹窗渲染容器 |
+| `frontend/src/components/prompts/DiscardEditorChanges.vue` | 编辑器未保存修改确认弹窗 |
+| `frontend/src/stores/layout.ts` | 全局 UI 状态（弹窗栈、加载、Shell） |
+| `frontend/src/stores/file.ts` | 当前文件资源状态，驱动视图切换，管理选择状态 |
+| `frontend/src/stores/auth.ts` | 用户认证状态，驱动权限守卫 |

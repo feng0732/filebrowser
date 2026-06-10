@@ -1241,3 +1241,488 @@ setLocale("pt-pt"):
 ```
 
 用户手动设置语言时（通过 Profile.vue），跳过第1层（detectLocale），从 Languages.vue 下拉选项的 key 开始进入第2层，因此问题表现与自动检测场景有所不同（如瑞典语手动选择反而能正确翻译，但日期出问题）。
+
+---
+
+## 十六、视频播放控件语言包分析
+
+Video.js 播放器拥有独立的语言包加载机制，不依赖 vue-i18n，而是直接从 `document.documentElement.lang` 读取当前语言。
+
+### 16.1 加载流程
+
+**文件**：[VideoPlayer.vue](file:///d:/fz/0601/solo-dogfeeding/code/178-filebrowser/frontend/src/components/files/VideoPlayer.vue#L59-L91)
+
+```typescript
+const initVideoPlayer = async () => {
+  const lang = document.documentElement.lang;  // 从 HTML 标签读取，由 setHtmlLocale() 设置
+  const languagePack = await (
+    languageImports[lang] || languageImports.en
+  )?.();
+  const code = languageImports[lang] ? lang : "en";
+  videojs.addLanguage(code, languagePack.default);  // 动态注册到 videojs
+  
+  const langOpt = { language: code };
+  const options = getOptions(props.options, langOpt, ...);
+  player.value = videojs(videoPlayer.value!, options, () => {});
+};
+```
+
+**关键逻辑**：
+1. 语言代码来源是 `document.documentElement.lang`，即 `setHtmlLocale()` 设置的值
+2. 如果 `languageImports` 中没有对应 key，则回退到 `en`
+3. 调用 `videojs.addLanguage()` 注册语言包
+4. 初始化播放器时传入 `{ language: code }`
+
+### 16.2 languageImports 映射表
+
+[VideoPlayer.vue L149-L179](file:///d:/fz/0601/solo-dogfeeding/code/178-filebrowser/frontend/src/components/files/VideoPlayer.vue#L149-L179) 定义了 29 种语言的动态导入映射：
+
+| locale 代码 | video.js 语言包路径 | 说明 |
+|------------|-------------------|------|
+| ar | `video.js/dist/lang/ar.json` | ✅ 匹配 |
+| bg | `video.js/dist/lang/bg.json` | ✅ 匹配 |
+| cs | `video.js/dist/lang/cs.json` | ✅ 匹配 |
+| de | `video.js/dist/lang/de.json` | ✅ 匹配 |
+| el | `video.js/dist/lang/el.json` | ✅ 匹配 |
+| en | `video.js/dist/lang/en.json` | ✅ 匹配 |
+| es | `video.js/dist/lang/es.json` | ✅ 匹配 |
+| fr | `video.js/dist/lang/fr.json` | ✅ 匹配 |
+| he | `video.js/dist/lang/he.json` | ✅ 匹配 |
+| hr | `video.js/dist/lang/hr.json` | ✅ 匹配 |
+| hu | `video.js/dist/lang/hu.json` | ✅ 匹配 |
+| it | `video.js/dist/lang/it.json` | ✅ 匹配 |
+| ja | `video.js/dist/lang/ja.json` | ✅ 匹配 |
+| ko | `video.js/dist/lang/ko.json` | ✅ 匹配 |
+| lv | `video.js/dist/lang/lv.json` | ✅ 匹配 |
+| nb | `video.js/dist/lang/nb.json` | ⚠️ 用于 locale "no"（挪威语） |
+| nl | `video.js/dist/lang/nl.json` | ✅ 匹配 |
+| **nl-be** | `video.js/dist/lang/nl.json` | ⚠️ 回退到 nl（比利时荷兰语无独立包） |
+| pl | `video.js/dist/lang/pl.json` | ✅ 匹配 |
+| pt-br | `video.js/dist/lang/pt-BR.json` | ⚠️ 大小写不同 |
+| pt-pt | `video.js/dist/lang/pt-PT.json` | ⚠️ 大小写不同 |
+| ro | `video.js/dist/lang/ro.json` | ✅ 匹配 |
+| ru | `video.js/dist/lang/ru.json` | ✅ 匹配 |
+| sk | `video.js/dist/lang/sk.json` | ✅ 匹配 |
+| tr | `video.js/dist/lang/tr.json` | ✅ 匹配 |
+| uk | `video.js/dist/lang/uk.json` | ✅ 匹配 |
+| vi | `video.js/dist/lang/vi.json` | ✅ 匹配 |
+| zh-cn | `video.js/dist/lang/zh-CN.json` | ⚠️ 大小写不同 |
+| zh-tw | `video.js/dist/lang/zh-TW.json` | ⚠️ 大小写不同 |
+
+### 16.3 缺失的语言
+
+以下 5 种语言在 VideoPlayer 中完全没有语言包支持，播放视频时控件将显示英语：
+
+| 语言代码 | 缺失原因 | 实际效果 |
+|---------|---------|---------|
+| **ca** | `languageImports` 无 ca 键 | 视频控件英语 |
+| **fa** | `languageImports` 无 fa 键 | 视频控件英语 |
+| **is** | `languageImports` 无 is 键 | 视频控件英语 |
+| **pt** | `languageImports` 无 pt 键 | （但 pt 本身也不可达） |
+| **sv-se** | `languageImports` 无 sv-se 键 | 视频控件英语 |
+
+### 16.4 特殊映射说明
+
+1. **挪威语（no）**：video.js 中挪威语的代码是 `nb`（挪威书面语），而非 `no`。但由于 `document.documentElement.lang` 会是 `"no"`（detectLocale 返回值），查找 `languageImports["no"]` 不存在 → 回退英语。
+
+   **问题**：挪威用户播放视频时，界面是挪威语，但视频控件显示英语。
+
+2. **荷兰语比利时（nl-be）**：video.js 没有独立的 nl-be 语言包，代码中显式映射到 `nl.json`（荷兰本土）。这是合理的，因为两种变体在视频控件的简单术语上差异极小。
+
+3. **大小写问题**：video.js 的语言包文件名使用大写地区代码（如 `pt-BR.json`、`zh-CN.json`），而 `languageImports` 的 key 是小写（如 `"pt-br"`、`"zh-cn"`）。由于文件系统在 Windows/macOS 上不区分大小写，这在运行时不会出错，但在 Linux 上可能失败。
+
+---
+
+## 十七、日期本地化映射核对
+
+dayjs 语言包与 vue-i18n locale 代码之间存在命名不一致问题，且 `setLocale()` 中没有映射层。
+
+### 17.1 dayjs 语言包加载清单
+
+**文件**：[i18n/index.ts L4-L35](file:///d:/fz/0601/solo-dogfeeding/code/178-filebrowser/frontend/src/i18n/index.ts#L4-L35)
+
+dayjs 预加载了 33 种语言包（按导入顺序）：
+
+| dayjs locale 代码 | 对应 vue-i18n locale | 匹配状态 |
+|------------------|---------------------|:---:|
+| ar | ar | ✅ 匹配 |
+| bg | bg | ✅ 匹配 |
+| ca | ca | ⚠️ 加载了但 detectLocale 无分支 |
+| cs | cs | ✅ 匹配 |
+| de | de | ✅ 匹配 |
+| el | el | ✅ 匹配 |
+| en | en | ✅ 匹配 |
+| es | es | ✅ 匹配 |
+| fr | fr | ✅ 匹配 |
+| he | he | ✅ 匹配 |
+| hr | hr | ✅ 匹配 |
+| hu | hu | ✅ 匹配 |
+| is | is | ✅ 匹配 |
+| it | it | ✅ 匹配 |
+| ja | ja | ✅ 匹配 |
+| ko | ko | ✅ 匹配 |
+| lv | lv | ✅ 匹配 |
+| nb | no | ⚠️ dayjs 用 nb，vue-i18n 用 no |
+| nl | nl | ✅ 匹配 |
+| nl-be | nl-be | ✅ 匹配 |
+| pl | pl | ✅ 匹配 |
+| pt-br | pt-br | ✅ 匹配 |
+| **pt** | pt-pt | ⚠️ dayjs 用 pt，vue-i18n 用 pt-pt |
+| ro | ro | ✅ 匹配 |
+| ru | ru | ✅ 匹配 |
+| sk | sk | ✅ 匹配 |
+| **sv** | sv-se | ⚠️ dayjs 用 sv，vue-i18n 用 sv-se |
+| tr | tr | ✅ 匹配 |
+| uk | uk | ✅ 匹配 |
+| vi | vi | ✅ 匹配 |
+| zh-cn | zh-cn | ✅ 匹配 |
+| zh-tw | zh-tw | ✅ 匹配 |
+| **（无 fa）** | fa | ❌ dayjs 未加载 fa |
+
+### 17.2 setLocale() 调用链
+
+**文件**：[i18n/index.ts L180-L186](file:///d:/fz/0601/solo-dogfeeding/code/178-filebrowser/frontend/src/i18n/index.ts#L180-L186)
+
+```typescript
+export function setLocale(locale: string) {
+  dayjs.locale(locale);  // ← 直接传入，无映射
+  i18n.global.locale.value = locale;
+}
+```
+
+**问题核心**：`dayjs.locale(locale)` 直接传入 vue-i18n 的 locale 代码，没有任何映射转换。
+
+### 17.3 不匹配场景的实际行为
+
+| 场景 | 传入 setLocale 的 locale | dayjs.locale() 实际行为 | 日期显示效果 |
+|-----|-------------------------|------------------------|:---:|
+| 浏览器检测瑞典语 | `"sv"` | ✅ dayjs/sv 已加载 | 瑞典语格式 |
+| 手动选瑞典语 | `"sv-se"` | ❌ dayjs 无 sv-se locale | 回退英语格式 |
+| 浏览器/手动选 pt-pt | `"pt-pt"` | ❌ dayjs 无 pt-pt locale | 回退英语格式 |
+| 浏览器/手动选 no | `"no"` | ❌ dayjs 无 no locale（只有 nb） | 回退英语格式 |
+| 强制API设置 fa | `"fa"` | ❌ dayjs 未加载 fa | 回退英语格式 |
+
+**dayjs 回退机制**：当 `dayjs.locale("xxx")` 传入未加载的 locale 时，dayjs 不会报错，而是**静默回退到英语**（默认 locale）。这与 vue-i18n 显式的 `fallbackLocale` 配置不同，dayjs 的回退是隐式的。
+
+### 17.4 修复建议
+
+在 `setLocale()` 中增加一个映射表，将 vue-i18n 的 locale 代码转换为 dayjs 的对应代码：
+
+```typescript
+// i18n/index.ts
+const DAYJS_LOCALE_MAP: Record<string, string> = {
+  "sv-se": "sv",      // 瑞典语
+  "pt-pt": "pt",      // 欧洲葡萄牙语
+  "no": "nb",         // 挪威语（书面语）
+  "fa": "fa",         // 需先添加 import("dayjs/locale/fa")
+};
+
+export function setLocale(locale: string) {
+  const dayjsLocale = DAYJS_LOCALE_MAP[locale] || locale;
+  dayjs.locale(dayjsLocale);
+  i18n.global.locale.value = locale;
+}
+```
+
+---
+
+## 十八、RTL 样式选择器深度分析
+
+项目中存在**两套** RTL 样式选择器系统，但其中一套从未被激活。
+
+### 18.1 两套选择器对比
+
+| 选择器模式 | CSS 规则数量 | 设置位置 | 是否生效 |
+|-----------|:---:|---------|:---:|
+| `html[dir="rtl"]` | 24 处 | [setHtmlLocale()](file:///d:/fz/0601/solo-dogfeeding/code/178-filebrowser/frontend/src/i18n/index.ts#L188-L193) 设置 `html.dir = "rtl"` | ✅ 正常生效 |
+| `body.rtl` | 2 处 | **从未设置** | ❌ 死代码 |
+
+### 18.2 html[dir="rtl"] 生效样式分布
+
+| CSS 文件 | 规则位置 | 样式效果 |
+|---------|---------|---------|
+| [base.css](file:///d:/fz/0601/solo-dogfeeding/code/178-filebrowser/frontend/src/css/base.css#L61-L79) | L61-L64 | `nav` 从左侧固定变为右侧固定 |
+| [base.css](file:///d:/fz/0601/solo-dogfeeding/code/178-filebrowser/frontend/src/css/base.css#L61-L79) | L77-L79 | `nav .action` 文本右对齐 |
+| [base.css](file:///d:/fz/0601/solo-dogfeeding/code/178-filebrowser/frontend/src/css/base.css#L117-L119) | L117-L119 | `.breadcrumbs a` 左移 16em |
+| [styles.css](file:///d:/fz/0601/solo-dogfeeding/code/178-filebrowser/frontend/src/css/styles.css#L361-L363) | L361-L363 | `.breadcrumbs .chevron` 水平翻转 + 右移 |
+| [styles.css](file:///d:/fz/0601/solo-dogfeeding/code/178-filebrowser/frontend/src/css/styles.css#L450-L463) | L450-L453 | `.card-content textarea` 强制 LTR + 左对齐 |
+| [styles.css](file:///d:/fz/0601/solo-dogfeeding/code/178-filebrowser/frontend/src/css/styles.css#L450-L463) | L455-L458 | `.card-content .small + input` 强制 LTR + 左对齐 |
+| [styles.css](file:///d:/fz/0601/solo-dogfeeding/code/178-filebrowser/frontend/src/css/styles.css#L450-L463) | L460-L463 | `.card.floating .file-list` 强制 LTR + 左对齐 |
+| [header.css](file:///d:/fz/0601/solo-dogfeeding/code/178-filebrowser/frontend/src/css/header.css#L145-L158) | L145-L158 | `#search #result` 定位调整 |
+| [header.css](file:///d:/fz/0601/solo-dogfeeding/code/178-filebrowser/frontend/src/css/header.css#L248-L249) | L248-L249 | `#search .boxes h3` 方向调整 |
+| [listing.css](file:///d:/fz/0601/solo-dogfeeding/code/178-filebrowser/frontend/src/css/listing.css#L1-L3) | L1-L3 | `#listing` 方向调整 |
+| [dashboard.css](file:///d:/fz/0601/solo-dogfeeding/code/178-filebrowser/frontend/src/css/dashboard.css#L11-L13) | L11-L13 | `.dashboard .row` margin 调整 |
+| [dashboard.css](file:///d:/fz/0601/solo-dogfeeding/code/178-filebrowser/frontend/src/css/dashboard.css#L67-L69) | L67-L69 | `#nav .wrapper` margin 调整 |
+| [dashboard.css](file:///d:/fz/0601/solo-dogfeeding/code/178-filebrowser/frontend/src/css/dashboard.css#L148-L150) | L148-L150 | `table tr > *` 文本右对齐 |
+| [dashboard.css](file:///d:/fz/0601/solo-dogfeeding/code/178-filebrowser/frontend/src/css/dashboard.css#L201-L203) | L201-L203 | `.card .card-title > *:first-child` 方向调整 |
+| [dashboard.css](file:///d:/fz/0601/solo-dogfeeding/code/178-filebrowser/frontend/src/css/dashboard.css#L502-L503) | L502-L503 | `.credits` 方向调整 |
+| [mobile.css](file:///d:/fz/0601/solo-dogfeeding/code/178-filebrowser/frontend/src/css/mobile.css#L59-L165) | 8 处 | 移动端下拉菜单、导航、文件列表、面包屑等定位 |
+
+### 18.3 body.rtl 死代码分析
+
+以下两条规则**永远不会匹配**，因为代码中从未给 `<body>` 添加 `rtl` 类：
+
+1. **[dashboard.css L226-L228](file:///d:/fz/0601/solo-dogfeeding/code/178-filebrowser/frontend/src/css/dashboard.css#L226-L228)**：
+   ```css
+   body.rtl .card .card-action {
+     text-align: left;  /* RTL 下卡片操作按钮应左对齐 */
+   }
+   ```
+   原规则 L222-L224 是 `text-align: right`，RTL 下应翻转。
+
+2. **[_shell.css L47-L49](file:///d:/fz/0601/solo-dogfeeding/code/178-filebrowser/frontend/src/css/_shell.css#L47-L49)**：
+   ```css
+   body.rtl .shell-content {
+     direction: ltr;  /* RTL 下终端内容应保持 LTR（命令行从左到右） */
+   }
+   ```
+
+### 18.4 RTL 样式切换的完整链路
+
+```
+用户切换到 RTL 语言（he/ar）
+    │
+    ▼
+setLocale(locale)
+    │
+    ▼
+App.vue watch(locale) 触发
+    │
+    ▼
+setHtmlLocale(locale) [i18n/index.ts L188-L193]
+    ├─ html.lang = locale
+    └─ isRtl(locale) → true
+         │
+         ▼
+    html.dir = "rtl"  ← 唯一设置的属性
+         │
+         ▼
+    html[dir="rtl"] 选择器匹配（24处CSS生效）
+         │
+         ▼
+    ✅ 侧边栏右置、面包屑箭头翻转、表单输入方向调整
+    ❌ body.rtl 选择器不匹配（2处CSS不生效）
+         │
+         ▼
+    卡片操作按钮仍右对齐（应为左对齐）
+    终端内容方向未修正
+```
+
+### 18.5 修复建议
+
+方案 A（推荐）：在 `setHtmlLocale()` 中同步设置 `body.rtl` 类：
+
+```typescript
+export function setHtmlLocale(locale: string) {
+  const html = document.documentElement;
+  const body = document.body;
+  html.lang = locale;
+  if (isRtl(locale)) {
+    html.dir = "rtl";
+    body.classList.add("rtl");
+  } else {
+    html.dir = "ltr";
+    body.classList.remove("rtl");
+  }
+}
+```
+
+方案 B：将 2 处 `body.rtl` 选择器改为 `html[dir="rtl"]`，保持一致性。
+
+---
+
+## 十九、全量语言矩阵统一核对表（34 种语言 × 8 个维度）
+
+| 语言 | JSON资源 | detectLocale返回 | Languages下拉 | dayjs加载 | dayjs匹配 | videojs加载 | RTL列表 | html[dir]样式 | 综合状态 |
+|-----|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| ar | ✅ ar.json | ✅ "ar" | ✅ "ar" | ✅ ar | ✅ 匹配 | ✅ ar.json | ✅ 是 | ✅ 生效 | ✅ 完全正常 |
+| bg | ✅ bg.json | ✅ "bg" | ✅ "bg" | ✅ bg | ✅ 匹配 | ✅ bg.json | ❌ | ✅ 生效 | ✅ 正常 |
+| ca | ✅ ca.json | ❌ 无→en | ✅ "ca" | ✅ ca | ✅ 匹配 | ❌ 无 | ❌ | ✅ 生效 | ⚠️ 仅手动，视频控件英语 |
+| cs | ✅ cs.json | ✅ "cs" | ✅ "cs" | ✅ cs | ✅ 匹配 | ✅ cs.json | ❌ | ✅ 生效 | ✅ 正常 |
+| de | ✅ de.json | ✅ "de" | ✅ "de" | ✅ de | ✅ 匹配 | ✅ de.json | ❌ | ✅ 生效 | ✅ 正常 |
+| el | ✅ el.json | ✅ "el" | ✅ "el" | ✅ el | ✅ 匹配 | ✅ el.json | ❌ | ✅ 生效 | ✅ 正常 |
+| en | ✅ en.json | ✅ "en" | ✅ "en" | ✅ en | ✅ 匹配 | ✅ en.json | ❌ | ✅ 生效 | ✅ 正常 |
+| es | ✅ es.json | ✅ "es" | ✅ "es" | ✅ es | ✅ 匹配 | ✅ es.json | ❌ | ✅ 生效 | ✅ 正常 |
+| **fa** | ✅ fa.json | ❌ 无→en | ❌ 无 | ❌ 未加载 | — | ❌ 无 | ❌ 不在 | ✅ 但dir=ltr | ❌ 完全不可达 |
+| fr | ✅ fr.json | ✅ "fr" | ✅ "fr" | ✅ fr | ✅ 匹配 | ✅ fr.json | ❌ | ✅ 生效 | ✅ 正常 |
+| he | ✅ he.json | ✅ "he" | ✅ "he" | ✅ he | ✅ 匹配 | ✅ he.json | ✅ 是 | ✅ 生效 | ✅ 完全正常（含RTL） |
+| hr | ✅ hr.json | ✅ "hr" | ✅ "hr" | ✅ hr | ✅ 匹配 | ✅ hr.json | ❌ | ✅ 生效 | ✅ 正常 |
+| hu | ✅ hu.json | ✅ "hu" | ✅ "hu" | ✅ hu | ✅ 匹配 | ✅ hu.json | ❌ | ✅ 生效 | ✅ 正常 |
+| is | ✅ is.json | ✅ "is" | ✅ "is" | ✅ is | ✅ 匹配 | ❌ 无 | ❌ | ✅ 生效 | ⚠️ 视频控件英语 |
+| it | ✅ it.json | ✅ "it" | ✅ "it" | ✅ it | ✅ 匹配 | ✅ it.json | ❌ | ✅ 生效 | ✅ 正常 |
+| ja | ✅ ja.json | ✅ "ja" | ✅ "ja" | ✅ ja | ✅ 匹配 | ✅ ja.json | ❌ | ✅ 生效 | ✅ 正常 |
+| ko | ✅ ko.json | ✅ "ko" | ✅ "ko" | ✅ ko | ✅ 匹配 | ✅ ko.json | ❌ | ✅ 生效 | ✅ 正常 |
+| lv | ✅ lv.json | ✅ "lv" | ✅ "lv" | ✅ lv | ✅ 匹配 | ✅ lv.json | ❌ | ✅ 生效 | ✅ 正常 |
+| nl | ✅ nl.json | ✅ "nl" | ✅ "nl" | ✅ nl | ✅ 匹配 | ✅ nl.json | ❌ | ✅ 生效 | ✅ 正常 |
+| **nl-be** | ✅ nl-be.json | ⚠️ 被nl截断→"nl" | ✅ "nl-be" | ✅ nl-be | ✅ 匹配 | ✅ nl.json(回退) | ❌ | ✅ 生效 | ⚠️ 自动检测时用nl，手动正常 |
+| no | ✅ no.json | ✅ "no"(nb/no) | ✅ "no" | ✅ nb(挪威) | ❌ no→nb | ⚠️ nb(映射错) | ❌ | ✅ 生效 | ⚠️ 日期/视频控件英语 |
+| pl | ✅ pl.json | ✅ "pl" | ✅ "pl" | ✅ pl | ✅ 匹配 | ✅ pl.json | ❌ | ✅ 生效 | ✅ 正常 |
+| **pt** | ✅ pt.json | ⚠️ 映射到pt-pt | ❌ 无 | ✅ pt | ❌ pt→pt-pt | ❌ 无 | ❌ | ✅ 但不可达 | ❌ 不可达（冗余） |
+| pt-br | ✅ pt-br.json | ✅ "pt-br" | ✅ "pt-br" | ✅ pt-br | ✅ 匹配 | ✅ pt-BR.json | ❌ | ✅ 生效 | ✅ 正常 |
+| **pt-pt** | ✅ pt-pt.json | ✅ "pt-pt" | ✅ "pt-pt" | ✅ pt(加载) | ❌ pt-pt→pt | ✅ pt-PT.json | ❌ | ✅ 生效 | ⚠️ 日期英语 |
+| ro | ✅ ro.json | ✅ "ro" | ✅ "ro" | ✅ ro | ✅ 匹配 | ✅ ro.json | ❌ | ✅ 生效 | ✅ 正常 |
+| ru | ✅ ru.json | ✅ "ru" | ✅ "ru" | ✅ ru | ✅ 匹配 | ✅ ru.json | ❌ | ✅ 生效 | ✅ 正常 |
+| sk | ✅ sk.json | ✅ "sk" | ✅ "sk" | ✅ sk | ✅ 匹配 | ✅ sk.json | ❌ | ✅ 生效 | ✅ 正常 |
+| **sv-se** | ✅ sv-se.json | ⚠️ 返回"sv"→不匹配 | ✅ "sv-se" | ✅ sv(加载) | ❌ 双向错配 | ❌ 无 | ❌ | ✅ 生效 | ❌ 检测→界面英语，手动→日期英语 |
+| tr | ✅ tr.json | ✅ "tr" | ✅ "tr" | ✅ tr | ✅ 匹配 | ✅ tr.json | ❌ | ✅ 生效 | ✅ 正常 |
+| uk | ✅ uk.json | ✅ "uk" | ✅ "uk" | ✅ uk | ✅ 匹配 | ✅ uk.json | ❌ | ✅ 生效 | ✅ 正常 |
+| vi | ✅ vi.json | ✅ "vi" | ✅ "vi" | ✅ vi | ✅ 匹配 | ✅ vi.json | ❌ | ✅ 生效 | ✅ 正常 |
+| zh-cn | ✅ zh-cn.json | ✅ "zh-cn" | ✅ "zh-cn" | ✅ zh-cn | ✅ 匹配 | ✅ zh-CN.json | ❌ | ✅ 生效 | ✅ 正常 |
+| zh-tw | ✅ zh-tw.json | ✅ "zh-tw" | ✅ "zh-tw" | ✅ zh-tw | ✅ 匹配 | ✅ zh-TW.json | ❌ | ✅ 生效 | ✅ 正常 |
+
+**状态说明**：
+- ✅ 正常：6 个维度全部匹配
+- ⚠️ 部分缺陷：某个维度存在问题，但整体仍可用
+- ❌ 严重缺陷：完全不可达或多个维度不匹配
+
+---
+
+## 二十、重点边界语言可达性与显示效果汇总
+
+### 20.1 瑞典语（sv / sv-se）完整效果矩阵
+
+| 场景 | 触发方式 | locale值 | 界面翻译 | 日期格式 | 视频控件 | RTL样式 | 综合体验 |
+|-----|---------|:---:|:---:|:---:|:---:|:---:|:---:|
+| 浏览器检测 sv-SE | 自动 | `"sv"` | ❌ 英语（messages无"sv"key） | ✅ 瑞典语（dayjs/sv） | ❌ 英语（无sv-se映射） | N/A | 混乱：界面英语但日期瑞典语 |
+| 浏览器检测 sv | 自动 | `"sv"` | ❌ 英语 | ✅ 瑞典语 | ❌ 英语 | N/A | 同上 |
+| 手动选 "Swedish (Sweden)" | 设置页 | `"sv-se"` | ✅ 瑞典语 | ❌ 英语（dayjs无sv-se） | ❌ 英语（无sv-se映射） | N/A | 部分可用：翻译正确但日期/视频英语 |
+| 管理员设用户locale=sv-se | API | `"sv-se"` | ✅ 瑞典语 | ❌ 英语 | ❌ 英语 | N/A | 同上 |
+
+**根因**：四层代码使用了三个不同标识符 —— `sv-se`（资源/下拉）、`sv`（检测/dayjs）。
+
+### 20.2 荷兰语比利时（nl-be）完整效果矩阵
+
+| 场景 | 触发方式 | locale值 | 界面翻译 | 日期格式 | 视频控件 | RTL样式 | 综合体验 |
+|-----|---------|:---:|:---:|:---:|:---:|:---:|:---:|
+| 浏览器检测 nl-BE | 自动 | `"nl"`（被正则截断） | ⚠️ 荷兰本土语 | ⚠️ 荷兰本土格式 | ⚠️ 荷兰本土语 | N/A | 地域错误：显示荷兰而非比利时变体 |
+| 浏览器检测 nl-be | 自动 | `"nl"`（被正则截断） | ⚠️ 荷兰本土语 | ⚠️ 荷兰本土格式 | ⚠️ 荷兰本土语 | N/A | 同上 |
+| 手动选 "Nederlands (België)" | 设置页 | `"nl-be"` | ✅ 比利时荷兰语 | ✅ 比利时格式（dayjs/nl-be） | ⚠️ 荷兰本土语（回退nl） | N/A | 基本可用：翻译/日期正确，视频用荷兰本土语 |
+
+**根因**：`/^nl\b/` 放在 `/^nl-be\b/` 之前，前者匹配 `"nl-be"` 后 break，后者永远不执行。
+
+### 20.3 波斯语（fa）完整效果矩阵
+
+| 场景 | 触发方式 | locale值 | 界面翻译 | 日期格式 | 视频控件 | RTL样式 | 综合体验 |
+|-----|---------|:---:|:---:|:---:|:---:|:---:|:---:|
+| 浏览器检测 fa-IR | 自动 | `"en"`（无分支） | ❌ 英语 | ❌ 英语 | ❌ 英语 | ⚠️ LTR（应为RTL） | 完全不可用 |
+| 浏览器检测 fa | 自动 | `"en"`（无分支） | ❌ 英语 | ❌ 英语 | ❌ 英语 | ⚠️ LTR | 完全不可用 |
+| 手动选择 | 设置页 | — | ❌ 下拉无fa选项 | — | — | — | 无法选择 |
+| 强制API设locale=fa | API | `"fa"` | ✅ 波斯语 | ❌ 英语（dayjs/fa未加载） | ❌ 英语（无fa映射） | ⚠️ LTR（fa不在rtl列表） | 严重缺陷：翻译正确但文字方向错误，日期/视频英语 |
+
+**根因**：fa.json 翻译文件被贡献，但四个集成点（检测分支、下拉选项、dayjs加载、RTL列表）均未同步。
+
+### 20.4 葡萄牙语系列完整效果矩阵
+
+| 场景 | 触发方式 | locale值 | 界面翻译 | 日期格式 | 视频控件 | RTL样式 | 综合体验 |
+|-----|---------|:---:|:---:|:---:|:---:|:---:|:---:|
+| 浏览器检测 pt-BR | 自动 | `"pt-br"` | ✅ 巴西葡语 | ✅ 巴西格式 | ✅ 巴西葡语 | N/A | ✅ 完全正常 |
+| 浏览器检测 pt-PT | 自动 | `"pt-pt"` | ✅ 欧洲葡语 | ❌ 英语（dayjs无pt-pt） | ✅ 欧洲葡语 | N/A | 部分可用：翻译/视频正确，日期英语 |
+| 浏览器检测 pt | 自动 | `"pt-pt"`（被映射） | ✅ 欧洲葡语 | ❌ 英语 | ✅ 欧洲葡语 | N/A | 同上 |
+| 浏览器检测 pt-AO(安哥拉) | 自动 | `"pt-pt"`（被映射） | ✅ 欧洲葡语 | ❌ 英语 | ✅ 欧洲葡语 | N/A | 同上 |
+| 手动选 "Português (Brasil)" | 设置页 | `"pt-br"` | ✅ 巴西葡语 | ✅ 巴西格式 | ✅ 巴西葡语 | N/A | ✅ 完全正常 |
+| 手动选 "Português (Portugal)" | 设置页 | `"pt-pt"` | ✅ 欧洲葡语 | ❌ 英语 | ✅ 欧洲葡语 | N/A | 部分可用：日期英语 |
+| pt.json（通用） | 任何方式 | — | ❌ 不可达 | ❌ 不可达 | ❌ 不可达 | — | 冗余文件 |
+
+**根因**：vue-i18n 使用 `pt-pt` 表示欧洲葡语，dayjs 使用 `pt`，两者命名约定不同且无映射。
+
+### 20.5 RTL 语言效果对比（he vs fa）
+
+| 语言 | RTL列表 | html.dir | 24处 html[dir] 样式 | 2处 body.rtl 样式 | 文字方向 | 卡片按钮对齐 | 终端内容方向 |
+|-----|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| he（希伯来语） | ✅ 在列表 | ✅ "rtl" | ✅ 全部生效 | ❌ 不匹配 | ✅ RTL | ❌ 仍右对齐（应为左） | ❌ 未强制LTR |
+| ar（阿拉伯语） | ✅ 在列表 | ✅ "rtl" | ✅ 全部生效 | ❌ 不匹配 | ✅ RTL | ❌ 仍右对齐 | ❌ 未强制LTR |
+| fa（波斯语） | ❌ 不在列表 | ❌ "ltr" | ❌ 不匹配 | ❌ 不匹配 | ❌ LTR（错误） | ❌ 右对齐 | ❌ 未强制LTR |
+
+**RTL 缺陷影响**：
+- ✅ 生效的：侧边栏右置、面包屑箭头翻转、搜索框定位、表格右对齐
+- ❌ 不生效的：卡片操作按钮左对齐、终端内容保持 LTR（命令行应为左到右）
+
+---
+
+## 二十一、全链路问题汇总与修复优先级
+
+| 优先级 | 问题 | 影响语言 | 修复复杂度 | 涉及文件 |
+|:---:|-----|---------|:---:|---------|
+| 🔴 高 | 波斯语 fa 完全不可达（4处缺失） | fa | 低（四处添加） | i18n/index.ts ×3, Languages.vue |
+| 🔴 高 | body.rtl 样式选择器永不生效 | he, ar | 极低（一行代码） | i18n/index.ts |
+| 🟠 中 | 瑞典语四层标识符错位 | sv-se | 低（映射表） | i18n/index.ts |
+| 🟠 中 | 荷兰语比利时正则顺序BUG | nl-be | 极低（调换两行） | i18n/index.ts |
+| 🟠 中 | dayjs 无映射层导致日期不本地化 | sv-se, pt-pt, no, fa | 低（映射表） | i18n/index.ts |
+| 🟡 低 | 挪威语 no 与 dayjs nb 不匹配 | no | 低（映射表） | i18n/index.ts |
+| 🟡 低 | VideoPlayer 缺少 5 种语言包 | ca, fa, is, pt, sv-se | 中（按需导入） | VideoPlayer.vue |
+| 🟡 低 | 加泰罗尼亚语 ca 无 detectLocale 分支 | ca | 极低（加一行case） | i18n/index.ts |
+| 🟡 低 | pt.json 冗余不可达 | pt | 低（删除或映射） | 资源文件 |
+| 🟡 低 | video.js 语言包大小写可能在 Linux 失败 | pt-br, pt-pt, zh-cn, zh-tw | 低（修正大小写） | VideoPlayer.vue |
+
+### 21.1 建议一次性修复代码
+
+```typescript
+// i18n/index.ts - 完整版修复
+
+// 1. 增加缺失的 dayjs locale 导入
+import("dayjs/locale/fa");  // 波斯语
+
+// 2. 修正 detectLocale()
+//    a) 调换 nl-be 和 nl 的顺序
+//    b) 增加 fa 和 ca 分支
+//    c) 瑞典语返回 "sv-se" 而非 "sv"
+//    d) 挪威语保持 "no"（在映射表处理）
+
+// 3. 增加 dayjs 映射表
+const DAYJS_LOCALE_MAP: Record<string, string> = {
+  "sv-se": "sv",      // 瑞典语
+  "pt-pt": "pt",      // 欧洲葡萄牙语
+  "no": "nb",         // 挪威语（书面语）
+  "fa": "fa",         // 波斯语
+};
+
+// 4. 修正 setLocale() 使用映射表
+export function setLocale(locale: string) {
+  const dayjsLocale = DAYJS_LOCALE_MAP[locale] || locale;
+  dayjs.locale(dayjsLocale);
+  i18n.global.locale.value = locale;
+}
+
+// 5. 修正 RTL 列表
+export const rtlLanguages = ["he", "ar", "fa"];  // 增加波斯语
+
+// 6. 修正 setHtmlLocale() 增加 body.rtl 类
+export function setHtmlLocale(locale: string) {
+  const html = document.documentElement;
+  const body = document.body;
+  html.lang = locale;
+  if (isRtl(locale)) {
+    html.dir = "rtl";
+    body.classList.add("rtl");
+  } else {
+    html.dir = "ltr";
+    body.classList.remove("rtl");
+  }
+}
+```
+
+```javascript
+// Languages.vue - 增加 fa 和 ca 选项
+const locales = {
+  // ... 现有语言 ...
++ ca: "Català",
++ fa: "فارسی",
+  // ...
+};
+```
+
+```typescript
+// VideoPlayer.vue - 增加缺失的语言包映射
+const languageImports: LanguageImports = {
+  // ... 现有语言 ...
++ ca: () => import("video.js/dist/lang/ca.json"),
++ fa: () => import("video.js/dist/lang/fa.json"),
++ is: () => import("video.js/dist/lang/is.json"),
++ "sv-se": () => import("video.js/dist/lang/sv.json"),  // 回退到瑞典语
++ no: () => import("video.js/dist/lang/nb.json"),       // 挪威语
+  // 修正大小写（Linux 兼容性）
+- "pt-br": () => import("video.js/dist/lang/pt-BR.json"),
++ "pt-br": () => import("video.js/dist/lang/pt-br.json"),
+  // ... 其他大小写修正 ...
+};
+```

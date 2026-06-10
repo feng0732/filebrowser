@@ -444,12 +444,42 @@ Check() 不仅在 handler 中显式调用，还在 `files.NewFileInfo` 内部被
 
 **checkerPrefix 的作用**：阶段 4 将 Fs 重新绑定到 `basePath` 后，后续传入 Check 的路径是相对于新 Fs 根的路径（如 `/subdir/file.txt`）。但用户的 Rules 是基于原始 Scope 的完整路径编写的（如 `/docs/secret/subdir/file.txt`）。checkerPrefix 将 `basePath` 拼接回去，确保规则匹配使用的是 `/docs/secret/subdir/file.txt` 而非 `/subdir/file.txt`，否则拒绝规则会被绕过。
 
-**示例**：假设用户 Scope 为 `/data`，分享路径为 `/data/docs`，用户有一条规则 `Path=/data/docs/secret, Allow=false`：
-- 访问者请求 `/api/public/share/<hash>/secret/file.txt`
-- 阶段 5 中 filePath = `/secret/file.txt`，checkerPrefix = `/docs`
-- Check 内还原路径 = `/docs/secret/file.txt`（相对于 Scope 根 `/data`，即绝对路径 `/data/docs/secret/file.txt`）
-- 规则 `/data/docs/secret` 匹配成功 → Allow=false → 403
-- 若无 checkerPrefix，匹配路径仅为 `/secret/file.txt`，规则不匹配 → 被错误放行
+**关于路径基准的说明**：Rules 中的 `Path` 和 Check() 中匹配的路径，始终是**用户 Scope 内的相对路径**（即 Fs 根之下的路径），而非物理文件系统路径。用户 Scope 通过 `server.Root + user.Scope` 映射到物理路径，但 `server.Root` 不参与规则匹配。例如，若 `server.Root = /srv/fb`，`user.Scope = /users/alice`，则物理路径 `/srv/fb/users/alice/docs/secret` 在规则中对应的是 `/docs/secret`。
+
+**示例**：
+
+前提条件：
+- `server.Root = /srv/fb`（仅影响物理路径映射，不参与规则匹配）
+- 用户 Scope 为 `/users/alice`，Fs 根映射到物理路径 `/srv/fb/users/alice`
+- 用户有一条规则：`{Path: "/docs/secret", Allow: false}`
+- 用户分享了 `/docs` 目录（`link.Path = "/docs"`）
+
+访问者请求分享内的子路径 `/secret/file.txt` 时：
+
+```
+阶段 5 中的路径拼接过程：
+
+1. 访问者请求: /api/public/share/<hash>/secret/file.txt
+2. ifPathWithName 解析: ifPath = /secret/file.txt
+3. Fs 重新绑定: d.user.Fs = NewScopedFs(原始Fs, "/docs")
+4. checkerPrefix 设置: d.checkerPrefix = "/docs"
+5. filePath = /secret/file.txt (相对于重新绑定后的 Fs 根)
+6. Check 内路径还原:
+   checkerPrefix + filePath = path.Join("/docs", "/secret/file.txt")
+                            = "/docs/secret/file.txt"
+7. 规则匹配:
+   规则 Path="/docs/secret" 匹配 "/docs/secret/file.txt" (前缀匹配) → Allow=false → 拒绝
+
+路径汇总:
+  访问子路径 (Fs 相对):  /secret/file.txt
+  checkerPrefix:         /docs
+  拼接后的检查路径:       /docs/secret/file.txt    ← 规则按此路径匹配
+  规则 Path:             /docs/secret             ← 前缀匹配成功
+  物理路径 (不参与匹配):  /srv/fb/users/alice/docs/secret/file.txt
+
+若无 checkerPrefix，检查路径仅为 /secret/file.txt，
+规则 /docs/secret 无法匹配，拒绝被绕过。
+```
 
 ### 5.3 下载密码保护的分享
 

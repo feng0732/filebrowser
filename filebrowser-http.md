@@ -558,81 +558,148 @@ api.PathPrefix("/command").Handler(monkey(commandsHandler, "/api/command")).Meth
 
 ### 5.1 升级前：HTTP 协议阶段 → handle 统一错误出口
 
-在 `upgrader.Upgrade` 调用**之前**发生的所有错误，都走 **handle 函数的 HTTP 错误出口**：
+在 `upgrader.Upgrade` 调用**之前**发生的所有错误，都走 **handle 函数的 HTTP 错误出口**（即 `http.Error` 写入 HTTP 响应体）：
 
-| 错误位置 | 代码行 | 触发条件 | 返回值 | 错误出口 |
-|----------|--------|----------|--------|----------|
-| `handle` 内 settings 加载 | data.go#L72 | 数据库读取 settings 失败 | log.Fatal (进程退出) | 无，进程崩溃 |
-| `withUser` JWT 认证 | auth.go#L94 | Token 无效/过期/伪造 | `401, nil` | handle → HTTP 401 |
-| `upgrader.Upgrade` | commands.go#L42 | WebSocket 握手失败（如 Origin 不对） | `500, err` | handle → HTTP 500 |
+| 错误位置 | 代码行 | 触发条件 | 返回值 | 实际错误出口 |
+|----------|--------|----------|--------|-------------|
+| `handle` 内 settings 加载 | data.go#L72-L76 | 数据库读取 settings 失败 | `log.Fatalf`（进程退出） | 无，进程崩溃 |
+| `withUser` JWT 认证 | auth.go#L92-L94 | Token 无效、过期、签名伪造，且不满足 renewableErr 条件 | `return 401, nil` | handle → `http.Error(w, "401 Unauthorized", 401)` |
+| `upgrader.Upgrade` | commands.go#L42-L44 | WebSocket 握手失败（方法非 GET、Upgrade 头缺失、Origin 校验失败等） | `return 500, err` | handle → `http.Error(w, "500 Internal Server Error", 500)` |
 
-**调用链（升级前失败）**：
+**注意**：gorilla/websocket 的 `Upgrade` 函数失败时**只返回 error，不写入响应**（可查看其源码，错误分支均为 `return nil, err`），因此 500 响应完全由 handle 统一出口输出。
+
+**调用链（升级前 JWT 认证失败）**：
 ```
-HTTP GET /api/command
-  → handle 包装器（读 settings + 打日志）
-    → withUser（JWT 认证失败）
-      → return 401, nil
-        → handle 统一出口
-          → log.Printf(...)
-          → http.Error(w, "401 Unauthorized", 401)
+HTTP GET /api/command (带 Upgrade 头)
+  │
+  ├─ stripPrefix(BaseURL)           无变化
+  ├─ mux.Router 匹配                 /api/command 匹配
+  ├─ stripPrefix("/api/command")    路径变 ""
+  │
+  ▼
+  handle 包装器
+    ├─ 设置全局 Cache-Control 头
+    ├─ store.Settings.Get()         读 DB 成功
+    └─ 调用 fn = withUser(commandsHandler)
+           │
+           ▼
+        withUser:
+          ├─ 提取 X-Auth / Cookie 中的 JWT
+          ├─ jwt.ParseFromRequest   → 签名无效
+          └─ return 401, nil        ← 升级前就返回了
+    │
+    ▼
+  handle 统一出口
+    ├─ status=401 >= 400 → 打日志 (路径 + realip + err)
+    └─ status != 0 → http.Error(w, "401 Unauthorized", 401)
 ```
 
-### 5.2 升级后：WebSocket 协议阶段 → 两类 WebSocket 错误出口
+### 5.2 升级后：WebSocket 协议阶段 → 三类 WebSocket 错误出口
 
-`upgrader.Upgrade` 成功返回 `*websocket.Conn` 后，**所有错误不再经过 handle 函数**，而是通过 WebSocket 协议自身的通道返回。
+`upgrader.Upgrade` 成功返回 `*websocket.Conn` 后，所有分支**最终都返回 `(0, nil)`**，handle 函数中 `status != 0` 判断为 false，**不会**调用 `http.Error`。错误通过 WebSocket 协议自身的三种通道返回：
 
-此时 `commandsHandler` 内部所有 return 都是 `return 0, nil`，告知 handle 不需要再处理。
+#### 类型 A：wsErr 函数 → WebSocket Close Frame（1011 Internal Server Error）
 
-#### 第一类：wsErr 函数 → WebSocket Close Frame
-
-[wsErr](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/commands.go#L31-L39) 用于**致命错误**，发送 Close 控制帧并关闭连接：
+[wsErr](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/commands.go#L31-L39) 用于**致命错误**（管道创建失败、进程启动失败、命令非零退出等），先发送 Close 控制帧（状态码 1011），再由 `return 0, nil` 触发 `defer conn.Close()` 关闭连接：
 
 ```go
 func wsErr(ws *websocket.Conn, r *http.Request, status int, err error) {
     txt := http.StatusText(status)
-    // 日志记录（与 handle 相同的日志格式，但用 r.RemoteAddr 而非 realip）
+    // 日志记录（格式与 handle 相同，但 IP 来源不同）
     if err != nil || status >= 400 {
         log.Printf("%s: %v %s %v", r.URL.Path, status, r.RemoteAddr, err)
+        //                        注意这里用 r.RemoteAddr，而非 realip.FromRequest(r)
     }
-    // 通过 Close Frame (1011 Internal Server Error) 返回状态文本
-    if err := ws.WriteControl(websocket.CloseInternalServerErr, []byte(txt), ...); err != nil {
+    // Close Frame (1011) + 状态文本，如 "Internal Server Error"
+    if err := ws.WriteControl(websocket.CloseInternalServerErr, []byte(txt),
+                              time.Now().Add(WSWriteDeadline)); err != nil {
         log.Print(err)
     }
 }
 ```
 
-**注意**：这里用 `r.RemoteAddr` 而非 `realip.FromRequest(r)`，与 HTTP 错误日志不一致。
+**与 HTTP 出口的差异**：`wsErr` 打日志用 `r.RemoteAddr`，而 handle 统一出口用 `realip.FromRequest(r)`（穿透代理时取真实 IP）。在有反向代理的部署中两者值不同。
 
-#### 第二类：conn.WriteMessage → WebSocket Text Frame
+#### 类型 B：conn.WriteMessage → WebSocket Text Frame（业务拒绝）
 
-用于**业务拒绝**（权限不够、命令不在白名单等），通过普通数据帧返回错误文本，然后正常 return 0, nil 由 defer conn.Close() 关闭：
+用于**可恢复的业务拒绝**（权限不够、命令不在白名单、命令解析失败），通过普通数据帧（Opcode=1 Text）返回错误文本，然后正常 `return 0, nil` 由 `defer conn.Close()` 关闭连接：
 
-| 错误场景 | 代码行 | 返回给前端的内容 |
-|----------|--------|-----------------|
-| 命令执行未启用/无 Execute 权限 | commands.go#L64-L69 | `cmdNotAllowed` = `"Command not allowed."` |
-| 命令解析失败 | commands.go#L72-L78 | `err.Error()` 如 `"unknown command"` |
-| 命令不在用户白名单 | commands.go#L80-L86 | `cmdNotAllowed` = `"Command not allowed."` |
-| 运行时 stdout/stderr 写消息失败 | commands.go#L110-L112 | 仅 `log.Print(err)`，不主动关闭连接，继续尝试后续输出 |
+```go
+// 以权限拒绝为例
+if !d.server.EnableExec || !d.user.Perm.Execute {
+    if err := conn.WriteMessage(websocket.TextMessage, cmdNotAllowed); err != nil {
+        wsErr(conn, r, http.StatusInternalServerError, err)  // 写消息失败时回退到类型 A
+    }
+    return 0, nil   // 写消息成功时正常返回，前端收到 Text Frame 后等连接关闭
+}
+```
+
+| 错误场景 | 代码行 | 写成功时发送给前端的内容 |
+|----------|--------|-------------------------|
+| 命令执行未启用 / 无 Execute 权限 | commands.go#L64-L69 | Text Frame: `"Command not allowed."` |
+| `runner.ParseCommand` 命令解析失败 | commands.go#L72-L78 | Text Frame: `err.Error()` 具体描述 |
+| 命令不在用户白名单 `d.user.Commands` | commands.go#L80-L86 | Text Frame: `"Command not allowed."` |
+
+**注意**：这三个场景都有"写消息失败时回退到 wsErr"的降级逻辑——即类型 B 和类型 A 的错误点一一对应。
+
+#### 类型 C：仅 log.Print，不主动关闭连接（运行时写消息失败）
+
+命令正常执行过程中向客户端转发 stdout/stderr 时如果写失败，**不中断流程也不关闭连接**，仅记录日志后继续尝试后续输出：
+
+```go
+// commands.go#L108-L113
+s := bufio.NewScanner(io.MultiReader(stdout, stderr))
+for s.Scan() {
+    if err := conn.WriteMessage(websocket.TextMessage, s.Bytes()); err != nil {
+        log.Print(err)   // 仅日志，不 return，不关闭连接
+    }
+}
+```
+
+此时前端表现为部分输出丢失，直到命令结束后由 `cmd.Wait` 的 wsErr（如有错误）或自然 defer 关闭连接。
 
 ### 5.3 commandsHandler 全错误点分类表
 
-[commands.go#L41-L120](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/commands.go#L41-L120) 内共有 10 个错误点，分类如下：
+[commands.go#L41-L120](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/commands.go#L41-L120) 内共有 **13 个** 错误分支点。以 `upgrader.Upgrade`（L42）为界，严格区分升级前和升级后：
 
-| 行号 | 错误点 | 返回 | 错误出口类型 |
-|------|--------|------|-------------|
-| L42 | `upgrader.Upgrade` 失败 | `500, err` | **HTTP 出口**（升级前） |
-| L51 | `conn.ReadMessage` 读取命令失败 | `0, nil`（内部调 `wsErr`） | **WebSocket Close Frame** |
-| L65 | 权限拒绝写消息失败 | `0, nil`（内部调 `wsErr`） | **WebSocket Close Frame** |
-| L64 | 权限拒绝（写消息成功） | `0, nil` | **WebSocket Text Frame** |
-| L74 | 命令解析失败写消息失败 | `0, nil`（内部调 `wsErr`） | **WebSocket Close Frame** |
-| L72 | 命令解析失败（写消息成功） | `0, nil` | **WebSocket Text Frame** |
-| L81 | 命令不在白名单写消息失败 | `0, nil`（内部调 `wsErr`） | **WebSocket Close Frame** |
-| L80 | 命令不在白名单（写消息成功） | `0, nil` | **WebSocket Text Frame** |
-| L92 | `cmd.StdoutPipe` 失败 | `0, nil`（内部调 `wsErr`） | **WebSocket Close Frame** |
-| L98 | `cmd.StderrPipe` 失败 | `0, nil`（内部调 `wsErr`） | **WebSocket Close Frame** |
-| L103 | `cmd.Start` 失败 | `0, nil`（内部调 `wsErr`） | **WebSocket Close Frame** |
-| L110 | 运行时输出写消息失败 | 无 return（仅 log） | **仅日志**，不关闭连接 |
-| L115 | `cmd.Wait` 命令非零退出 | `0, nil`（内部调 `wsErr`） | **WebSocket Close Frame** |
+#### 升级前（HTTP 阶段）— 共 1 个，走 handle 统一 HTTP 出口
+
+| 行号 | 错误点 | 返回值 | 实际错误出口 |
+|------|--------|--------|-------------|
+| L42 | `upgrader.Upgrade(w, r, nil)` 返回 err | `return http.StatusInternalServerError, err` | handle → `http.Error(w, "500 Internal Server Error", 500)`（HTTP 响应体） |
+
+> 注意：此时 HTTP 响应尚未写入任何内容（Upgrade 失败时 gorilla/websocket 会自行写 403 吗？不——查看 Upgrade 源码，失败时它只返回 error，**不会**写响应。因此 500 完全由 handle 函数输出。
+
+#### 升级后（WebSocket 阶段）— 共 12 个，全部 return `0, nil`，不再经过 handle
+
+升级后所有分支最终都返回 `(0, nil)`，handle 函数中 `status != 0` 判断为 false，**不会**调用 `http.Error`。
+
+##### 类型 A：wsErr → WebSocket Close Frame（1011 Internal Server Error）— 共 8 处
+
+| 行号 | 错误点 | 返回值 | 发送给前端的内容 |
+|------|--------|--------|-----------------|
+| L53 | `conn.ReadMessage()` 失败（读取用户命令） | `return 0, nil`（内部先调 `wsErr`） | Close Frame(1011) + `"Internal Server Error"` |
+| L66 | 权限拒绝时 `conn.WriteMessage(cmdNotAllowed)` 写入失败 | `return 0, nil`（内部先调 `wsErr`） | Close Frame(1011) + `"Internal Server Error"` |
+| L75 | 解析失败时 `conn.WriteMessage(err.Error())` 写入失败 | `return 0, nil`（内部先调 `wsErr`） | Close Frame(1011) + `"Internal Server Error"` |
+| L82 | 白名单拒绝时 `conn.WriteMessage(cmdNotAllowed)` 写入失败 | `return 0, nil`（内部先调 `wsErr`） | Close Frame(1011) + `"Internal Server Error"` |
+| L93 | `cmd.StdoutPipe()` 创建管道失败 | `return 0, nil`（内部先调 `wsErr`） | Close Frame(1011) + `"Internal Server Error"` |
+| L99 | `cmd.StderrPipe()` 创建管道失败 | `return 0, nil`（内部先调 `wsErr`） | Close Frame(1011) + `"Internal Server Error"` |
+| L104 | `cmd.Start()` 启动进程失败 | `return 0, nil`（内部先调 `wsErr`） | Close Frame(1011) + `"Internal Server Error"` |
+| L116 | `cmd.Wait()` 命令非零退出 | `return 0, nil`（隐式，内部先调 `wsErr`） | Close Frame(1011) + `"Internal Server Error"` |
+
+##### 类型 B：conn.WriteMessage → WebSocket Text Frame（业务拒绝）— 共 3 处
+
+| 行号 | 错误点 | 返回值 | 发送给前端的内容 |
+|------|--------|--------|-----------------|
+| L65 | `!EnableExec` 或 `!Perm.Execute`（写消息成功） | `return 0, nil` | Text Frame: `"Command not allowed."` |
+| L74 | `runner.ParseCommand` 解析失败（写消息成功） | `return 0, nil` | Text Frame: `err.Error()` 具体错误描述 |
+| L81 | `!slices.Contains(d.user.Commands, name)` 不在白名单（写消息成功） | `return 0, nil` | Text Frame: `"Command not allowed."` |
+
+##### 类型 C：仅日志记录，不主动关闭连接 — 共 1 处
+
+| 行号 | 错误点 | 返回值 | 前端感知 |
+|------|--------|--------|---------|
+| L111 | 运行时 `conn.WriteMessage(stdout/stderr)` 写入失败 | 无 return，继续循环/后续代码 | 仅服务端打 `log.Print(err)`，连接不主动关闭 |
 
 ### 5.4 完整时序对比图
 
@@ -734,105 +801,115 @@ img/logo.svg
 
 ### 6.3 static handler 的前缀剥离：/static/
 
-路由注册时传给 `handle` 的 prefix 是 `"/static/"`（**注意末尾有斜杠**）：
+路由注册时传给 `handle` 的 prefix 是 `"/static/"`（**注意末尾有斜杠，共 8 个字符**）：
 
 [http/static.go#L178](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/static.go#L178)
 ```go
-static = handle(func(...) (int, error) {
-    // 业务 handler
+static = handle(func(w http.ResponseWriter, r *http.Request, d *data) (int, error) {
+    // 业务 handler：此处 r.URL.Path 已被 stripPrefix 处理，不带前导斜杠
+    // ...
 }, "/static/", store, server)
 ```
 
-`handle` 返回前调用 `stripPrefix("/static/", handler)` 剥离路由前缀。
+`handle` 函数在 [data.go#L66-L101](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/data.go#L66-L101) 中先构造 `http.HandlerFunc`（包含全局头、读 settings、调用 fn、错误处理），然后在 L100 调用 `stripPrefix(prefix, handler)` 将前缀剥离包装在外层。因此执行顺序是：**先 stripPrefix 剥离前缀 → 再进入 handle 的 HandlerFunc 执行全局头/读 settings/调用业务 handler**。
 
-### 6.4 完整路径变换示例（关键细节）
+### 6.4 完整路径变换示例（每一步 r.URL.Path 的精确值）
 
-请求 URL：`GET /static/js/app.js`，`server.BaseURL = ""`
+请求 URL：`GET /static/js/app.js`，假设 `server.BaseURL = ""`。
 
-#### 变换步骤（带精确的字符串值）
+下面是每一层处理后 `r.URL.Path` 的精确值：
 
-```
-原始 r.URL.Path (进入 Go net/http):
-    "/static/js/app.js"
+| 处理层 | 代码位置 | 处理逻辑 | r.URL.Path 结果 |
+|--------|----------|----------|----------------|
+| Go net/http 入口 | — | 原始请求路径 | `"/static/js/app.js"` |
+| 第 1 层剥离 | [http.go#L93](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/http.go#L93) `stripPrefix("", r)` | `BaseURL` 为空，直接透传 | `"/static/js/app.js"` |
+| mux.Router 匹配 | [http.go#L43](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/http.go#L43) | `PathPrefix("/static")` 匹配成功，调用 monkey 返回的 handler | `"/static/js/app.js"`（此时仍未变） |
+| 第 2 层剥离 | [data.go#L100](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/data.go#L100) `stripPrefix("/static/", handler)` | `prefix = "/static/"`（末尾带斜杠），`strings.TrimPrefix("/static/js/app.js", "/static/")` | `"js/app.js"`（**无前导斜杠**） |
+| 业务 handler 内 | [static.go#L116](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/static.go#L116) | 业务代码看到的路径 | `"js/app.js"` |
 
-──────── 第 1 层 stripPrefix(BaseURL="") ────────
-无变化
-r.URL.Path = "/static/js/app.js"
+**为什么结果没有前导斜杠？** 因为传给 `handle` 的 prefix 是 `"/static/"`（末尾带斜杠，共 8 个字符），`TrimPrefix` 完整剥离这 8 个字符，剩余字符串 `"js/app.js"` 自然不带前导斜杠。
 
-──────── mux.Router 匹配 ────────
-PathPrefix("/static") 匹配成功
-
-──────── 第 2 层 stripPrefix("/static/", handler) ────────
-prefix = "/static/"   (末尾有斜杠，关键！)
-p = strings.TrimPrefix("/static/js/app.js", "/static/")
-  = "js/app.js"       ← 无前导斜杠！
-
-r.URL.Path = "js/app.js"   ← 业务 handler 看到的路径
-```
-
-**为什么没有前导斜杠？** 因为 `prefix = "/static/"` 末尾带斜杠，`TrimPrefix` 会完整剥离 `"/static/"` 这 8 个字符，剩余 `"js/app.js"`。
-
-如果 prefix 是 `"/static"`（不带末尾斜杠），剥离后会是 `"/js/app.js"`（带前导斜杠），这将导致 `assetsFs.Open` 失败。
+如果 prefix 写成 `"/static"`（不带末尾斜杠），剥离结果会是 `"/js/app.js"`（带前导斜杠），这将导致 `.js` 文件分支的 `assetsFs.Open()` 失败。
 
 ### 6.5 剥离后的路径在业务 handler 中的三处使用
 
-[http/static.go#L116-L177](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/static.go#L116-L177) 中，剥离后的 `r.URL.Path`（如 `"js/app.js"`）被用于三处：
+[http/static.go#L116-L177](file:///d:/fz/0601/solo-dogfeeding/code/168-filebrowser/http/static.go#L116-L177) 中，剥离后的 `r.URL.Path = "js/app.js"`（以请求不同资源为例）被用于以下三处，每一处都假设路径**不带前导斜杠**：
 
 #### A. 品牌文件覆盖（Branding Override）
 
-当 `d.settings.Branding.Files` 不为空时，优先从文件系统加载：
+当 `d.settings.Branding.Files` 配置了自定义资源目录时，优先从该目录查找：
 
 ```go
+// 示例 1: 请求 /static/img/logo.svg
+//         r.URL.Path 剥离后 = "img/logo.svg"
 if strings.HasPrefix(r.URL.Path, "img/") {
-    // r.URL.Path = "img/logo.svg"
     fPath := filepath.Join(d.settings.Branding.Files, r.URL.Path)
-    // → "branding/img/logo.svg"
+    // filepath.Join("branding", "img/logo.svg")
+    // → "branding/img/logo.svg" （Windows 下为 "branding\\img\\logo.svg"）
     if _, err := os.Stat(fPath); err == nil {
         http.ServeFile(w, r, fPath)   // 从文件系统返回覆盖文件
         return 0, nil
     }
-} else if r.URL.Path == "custom.css" {
-    // 直接返回 branding/custom.css
-    http.ServeFile(w, r, filepath.Join(d.settings.Branding.Files, "custom.css"))
+}
+
+// 示例 2: 请求 /static/custom.css
+//         r.URL.Path 剥离后 = "custom.css"
+if r.URL.Path == "custom.css" && d.settings.Branding.Files != "" {
+    fPath := filepath.Join(d.settings.Branding.Files, "custom.css")
+    // → "branding/custom.css"
+    http.ServeFile(w, r, fPath)
     return 0, nil
 }
 ```
 
-#### B. 非 .js 文件：http.FileServer + http.FS 包装
+两处判断均使用**无前导斜杠**的字符串字面量 `"img/"` 和 `"custom.css"` 做匹配。
+
+#### B. 非 .js 文件：http.FileServer + http.FS 适配层
 
 ```go
+// 示例: 请求 /static/css/app.css
+//       r.URL.Path 剥离后 = "css/app.css"
 if !strings.HasSuffix(r.URL.Path, ".js") {
-    // r.URL.Path = "css/app.css"
     http.FileServer(http.FS(assetsFs)).ServeHTTP(w, r)
     return 0, nil
 }
 ```
 
-`http.FS(assetsFs)` 是标准库的适配层，内部 `Open` 会自动处理路径：
+`http.FS(assetsFs)` 是标准库的 `fs.FS → http.FileSystem` 适配层，内部 `Open` 会自动规范化路径：
 ```go
 // net/http/fs.go 中的 httpFS.Open 伪代码
 func (f httpFS) Open(name string) (File, error) {
     if name == "" || name[0] != '/' {
-        name = "/" + name
+        name = "/" + name     // "css/app.css" → "/css/app.css"
     }
-    name = path.Clean(name)
-    return f.fs.Open(strings.TrimPrefix(name, "/"))  // 去掉前导斜杠再查
+    name = path.Clean(name)   // "/css/app.css" → "/css/app.css"
+    return f.fs.Open(strings.TrimPrefix(name, "/"))
+    // 去掉前导斜杠再调用 fs.FS.Open: "/css/app.css" → "css/app.css" → assetsFs.Open("css/app.css")
 }
 ```
 
-所以即使 `r.URL.Path` 意外地带了前导斜杠，`http.FS` 也会修正。
+因此非 `.js` 分支对路径是否带前导斜杠有容错能力。
 
-#### C. .js 文件：直接 Open 找 .gz 压缩版本
+#### C. .js 文件：直接调用 fs.FS.Open 查找 .gz 压缩版本
 
 ```go
-// r.URL.Path = "js/app.js"
+// 示例: 请求 /static/js/app.js
+//       r.URL.Path 剥离后 = "js/app.js"
 f, err := assetsFs.Open(r.URL.Path + ".gz")
-// → assetsFs.Open("js/app.js.gz") ✓
-// 这就是为什么 prefix 末尾必须带斜杠的原因！
-// 如果路径是 "/js/app.js"，这里就会变成 assetsFs.Open("/js/app.js.gz") → 失败
+// → assetsFs.Open("js/app.js" + ".gz")
+// → assetsFs.Open("js/app.js.gz")  ✓ 查找成功
+
+// 如果剥离后路径带前导斜杠 = "/js/app.js"：
+// assetsFs.Open("/js/app.js.gz")   ✗ fs.FS 接口禁止前导斜杠，返回错误
 ```
 
-**关键依赖**：`.js` 分支直接调用 `assetsFs.Open()`，没有 `http.FS` 适配层，完全依赖 `stripPrefix` 剥离后路径**不带前导斜杠**。
+**这是对路径格式要求最严格的分支**：没有 `http.FS` 适配层做容错，完全依赖 `stripPrefix` 剥离后的路径**不带前导斜杠**。
+
+找到 `.gz` 文件后的处理：
+- 客户端支持 gzip（`Accept-Encoding: gzip`）→ 直接写入 gzip 字节流，`Content-Encoding: gzip`
+- 客户端不支持 gzip → `gzip.NewReader` 解压后写入明文 JS
+
+**注意**：这里 `.gz` 打开失败时 `return http.StatusNotFound, err`，这个 `(404, err)` 返回给 handle 函数后，handle 会输出 `http.Error(w, "404 Not Found", 404)`。但此时**响应头已经部分写入**（`Cache-Control` 已在 L126 设置），虽然技术上仍可输出 404，但如果 `io.Copy` 过程中出错返回 `(500, err)`，响应体可能已经写入了部分字节，此时 `http.Error` 追加的内容会导致响应格式混乱。
 
 ### 6.6 index handler 的特殊处理（无前缀剥离）
 
@@ -854,13 +931,16 @@ index = handle(func(w http.ResponseWriter, r *http.Request, d *data) (int, error
 
 ### 6.7 路径处理总结表
 
-| 请求 | 路由 prefix | stripPrefix 后路径 | 资源查找方式 | 最终资源路径 |
-|------|------------|-------------------|-------------|------------|
-| `GET /static/js/app.js` | `"/static/"` | `"js/app.js"` | `assetsFs.Open("js/app.js.gz")` | `dist/js/app.js.gz` |
-| `GET /static/css/app.css` | `"/static/"` | `"css/app.css"` | `http.FileServer` 间接查找 | `dist/css/app.css` |
-| `GET /static/img/logo.svg` | `"/static/"` | `"img/logo.svg"` | 先查 branding 目录，再回退 FS | `branding/img/logo.svg` 或 `dist/img/logo.svg` |
-| `GET /static/custom.css` | `"/static/"` | `"custom.css"` | 直接查 branding 目录 | `branding/custom.css` |
-| `GET /any/spa/route` | `""`（index） | 不变（不使用） | 硬编码 `"public/index.html"` | `dist/public/index.html` |
+下表中 **stripPrefix 后路径** 即业务 handler 中实际读取到的 `r.URL.Path`：
+
+| 请求 URL | 路由 prefix | stripPrefix 后 r.URL.Path | 资源查找代码 | 最终定位到的资源 |
+|----------|------------|--------------------------|-------------|-----------------|
+| `GET /static/js/app.js` | `"/static/"` | `"js/app.js"` | `assetsFs.Open(r.URL.Path + ".gz")` | `dist/js/app.js.gz` |
+| `GET /static/js/vendors.js` | `"/static/"` | `"js/vendors.js"` | `assetsFs.Open("js/vendors.js.gz")` | `dist/js/vendors.js.gz` |
+| `GET /static/css/app.css` | `"/static/"` | `"css/app.css"` | `http.FileServer(http.FS(assetsFs))` 间接查找 | `dist/css/app.css` |
+| `GET /static/img/logo.svg` | `"/static/"` | `"img/logo.svg"` | 先 `os.Stat(branding/img/logo.svg)`，命中则 `http.ServeFile`，否则回退 `http.FileServer` | `branding/img/logo.svg` 或 `dist/img/logo.svg` |
+| `GET /static/custom.css` | `"/static/"` | `"custom.css"` | `http.ServeFile(branding/custom.css)`（仅当配置了 Branding.Files） | `branding/custom.css`，未配置时走 `http.FileServer` 查 `dist/custom.css`（通常不存在 → 404） |
+| `GET /settings/users` | `""`（index NotFoundHandler） | `"/settings/users"`（**不被使用**） | 硬编码 `assetsFs, "public/index.html"` | `dist/public/index.html`（SPA 路由由前端处理） |
 
 ---
 
